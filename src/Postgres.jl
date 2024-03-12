@@ -1,4 +1,4 @@
-module Example
+module Postgres
 export hello, domath
 
 """
