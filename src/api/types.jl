@@ -1,3 +1,5 @@
+const JSONType = typeof(JSONBase.lazy("1"))
+
 @inline function juliatype(f, oid)
     if oid == 23
         return f(Int32)
@@ -9,7 +11,9 @@
         return f(Int16)
     elseif oid == 16
         return f(Bool)
-    elseif oid == 25 || oid == 1043 || oid == 1042 || oid == 114 || oid == 3802 || oid == 24 || oid == 19
+    elseif oid == 3802 || oid == 3807 || oid == 114 || oid == 199
+        return f(JSONType)
+    elseif oid == 25 || oid == 1043 || oid == 1042 || oid == 24 || oid == 19
         return f(String)
     elseif oid == 2950
         return f(UUID)
@@ -62,6 +66,8 @@ const DATETIME_OPTIONS = Parsers.Options(dateformat=dateformat"yyyy-mm-dd HH:MM:
             f(name, Parsers.parse(T, val))
         elseif T == Vector{UInt8}
             f(name, unsafe_wrap(Vector{UInt8}, pointer(val), sizeof(val)))
+        elseif T == JSONType
+            f(name, JSONBase.lazy(val))
         else
             # fallback
             f(name, val)

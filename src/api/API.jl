@@ -1,6 +1,6 @@
 module API
 
-using Dates, AwsIO, Base64, SHA, MD5, Parsers, Structs, Logging
+using Dates, AwsIO, Base64, SHA, MD5, Parsers, Structs, Logging, JSONBase
 
 struct Error <: Exception
     msg::String

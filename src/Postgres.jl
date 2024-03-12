@@ -1,6 +1,6 @@
 module Postgres
 
-using DBInterface, Dates, UUIDs, Parsers, Tables, Structs
+using DBInterface, Dates, UUIDs, Parsers, Tables, Structs, JSONBase
 
 export DBInterface
 

@@ -1,13 +1,14 @@
 name = "Postgres"
 uuid = "8f23287e-300e-4f50-bc2b-9f1dfe95da84"
-version = "1.0.0"
 manifest = "../Manifest.toml"
+version = "1.0.0"
 
 [deps]
 AwsIO = "4047365c-aa37-44ec-b1fa-4c0d5495ccf1"
 Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
 DBInterface = "a10d1c49-ce27-4219-8d33-6db1a4562965"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+JSONBase = "2e7fc8d9-e5f8-4569-a7b1-cf20c7cf9c71"
 Logging = "56ddb016-857b-54e1-b83d-db4d58db5568"
 MD5 = "6ac74813-4b46-53a4-afec-0b5dc9d7885c"
 Parsers = "69de0a69-1ddd-5017-9359-2bf0b02dc9f0"
