@@ -1,6 +1,6 @@
 module API
 
-using UUIDs, Dates, AwsIO, Base64, SHA, MD5, Parsers, Structs, Logging, JSONBase
+using UUIDs, Dates, AwsIO, Base64, SHA, MD5, Parsers, Structs, Logging, JSONBase, Random
 
 struct Error <: Exception
     msg::String
@@ -315,8 +315,7 @@ function connect(host::String, port::Integer, dbname::String, user::String, pass
 end
 
 function prepare(socket, sql::String, debug::Bool)
-    name = String(rand('a':'z', 24))
-    println("POSTGRES NAME: $name")
+    name = randstring(Random.RandomDevice(), 36)
     writemessages(socket, debug, ('P', name, sql, Int16(0)), ('S',))
     waitfor(socket, debug, '1', 'Z')
     return name
