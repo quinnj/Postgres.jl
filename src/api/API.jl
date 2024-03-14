@@ -316,6 +316,7 @@ end
 
 function prepare(socket, sql::String, debug::Bool)
     name = String(rand('a':'z', 24))
+    println("POSTGRES NAME: $name")
     writemessages(socket, debug, ('P', name, sql, Int16(0)), ('S',))
     waitfor(socket, debug, '1', 'Z')
     return name
