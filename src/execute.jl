@@ -145,6 +145,16 @@ function DBInterface.execute(stmt::Statement, params=nothing, ::Type{T}=Any; deb
 end
 
 function DBInterface.execute(conn::Connection, sql::AbstractString, params=nothing, ::Type{T}=Any; debug::Bool=false) where {T}
-    stmt = DBInterface.prepare(conn, sql; debug)
-    return DBInterface.execute(stmt, params, T; debug)
+    if count(';', sql) > 1
+        # multiple statement, execute in single exec call
+        @lock conn.lock begin
+            # check that connection is ok
+            checkconn(conn)
+            API.exec(conn.socket, sql, debug)
+            return
+        end
+    else
+        stmt = DBInterface.prepare(conn, sql; debug)
+        return DBInterface.execute(stmt, params, T; debug)
+    end
 end

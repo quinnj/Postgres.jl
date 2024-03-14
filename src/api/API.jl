@@ -449,6 +449,13 @@ function exec(socket, stmtname::String, params::Vector{Union{String, Missing}}, 
     return Exec(socket, names, typeIds, debug)
 end
 
+function exec(socket, query::String, debug::Bool)
+    writemessages(socket, debug, ('Q', query))
+    waitfor(socket, debug, 'Z')
+    #TODO: handle all the various response message types, like applyeach above + describeprepared
+    return
+end
+
 # function escape(conn::PGconn, s::AbstractString)
 #     str = C.PQescapeLiteral(ptr, s, sizeof(s))
 #     escaped = unsafe_string(str)
