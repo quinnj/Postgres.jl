@@ -367,7 +367,7 @@ struct DataRow
     typeIds::Vector{Int}
 end
 
-function Structs.applyeach(_, f, dr::DataRow)
+function Structs.applyeach(::Structs.StructStyle, f, dr::DataRow)
     ncols = Int(ntoh(read(dr.socket, Int16)))
     for i = 1:ncols
         len = Int(ntoh(read(dr.socket, Int32)))
@@ -390,7 +390,7 @@ struct Exec
     debug::Bool
 end
 
-function Structs.applyeach(_, f, e::Exec)
+function Structs.applyeach(::Structs.StructStyle, f, e::Exec)
     nrows = 0
     error = false
     error_msg = ""
