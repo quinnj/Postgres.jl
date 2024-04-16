@@ -117,9 +117,9 @@ function makeresult(e::API.Exec)
     types = Type[API.juliatype(x -> x, i) for i in typeIds]
     lookup = Dict(x => i for (i, x) in enumerate(names))
     rows = ResultRow[]
-    Structs.applyeach(e) do i, row
+    Structs.applyeach(PostgresStyle(), e) do i, row
         data = Vector{Any}(undef, length(names))
-        Structs.applyeach(RowClosure(data, types, 1), row)
+        Structs.applyeach(PostgresStyle(), RowClosure(data, types, 1), row)
         push!(rows, ResultRow(data, names, types, lookup, i))
     end
     return Result(names, types, rows)
