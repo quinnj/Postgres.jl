@@ -140,7 +140,7 @@ function DBInterface.execute(stmt::Statement, params=nothing, ::Type{T}=Any; deb
         # check that connection/statement are ok
         checkstmt(stmt)
         e = API.exec(stmt.conn.socket, stmt.name, stmt.params, stmt.names, stmt.typeIds, debug)
-        return T === Any ? makeresult(e) : Structs.arraylike(T) ? Structs.make(T, e) : only(Structs.make(Vector{T}, e))
+        return T === Any ? makeresult(e) : Structs.arraylike(T) ? Structs.make(PostgresStyle(), T, e) : only(Structs.make(PostgresStyle(), Vector{T}, e))
     end
 end
 

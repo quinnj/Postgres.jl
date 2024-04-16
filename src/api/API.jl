@@ -2,6 +2,8 @@ module API
 
 using UUIDs, Dates, AwsIO, Base64, SHA, MD5, Parsers, Structs, Logging, JSONBase, Random
 
+export PostgresStyle
+
 struct Error <: Exception
     msg::String
 end
@@ -367,7 +369,11 @@ struct DataRow
     typeIds::Vector{Int}
 end
 
-function Structs.applyeach(::Structs.StructStyle, f, dr::DataRow)
+struct PostgresStyle <: Structs.StructStyle end
+
+Structs.fieldtagkey(::Type{PostgresStyle}) = :postgres
+
+function Structs.applyeach(::PosgresStyle, f, dr::DataRow)
     ncols = Int(ntoh(read(dr.socket, Int16)))
     for i = 1:ncols
         len = Int(ntoh(read(dr.socket, Int32)))
@@ -375,6 +381,7 @@ function Structs.applyeach(::Structs.StructStyle, f, dr::DataRow)
             # null
             f(dr.names[i], nothing)
         else
+            #TODO: reuse a large buffer for reading values into then parse from
             str = Base._string_n(len)
             unsafe_read(dr.socket, pointer(str), len)
             @inbounds applycast(f, dr.names[i], dr.typeIds[i], str)
@@ -390,7 +397,7 @@ struct Exec
     debug::Bool
 end
 
-function Structs.applyeach(::Structs.StructStyle, f, e::Exec)
+function Structs.applyeach(::PosgresStyle, f, e::Exec)
     nrows = 0
     error = false
     error_msg = ""
