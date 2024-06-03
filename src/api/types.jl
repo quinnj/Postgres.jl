@@ -27,7 +27,8 @@ const JSONType = typeof(JSONBase.lazy("1"))
         return f(DateTime)
     elseif oid == 1184
         # timestamp with time zone
-        return f(DateAndTime)
+        #TODO: string for now
+        return f(String)
     elseif oid == 1082
         return f(Date)
     elseif oid == 1083
