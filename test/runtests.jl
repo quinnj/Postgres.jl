@@ -1,6 +1,6 @@
-using Test, Dates, Postgres, DBInterface, Tables, Structs
+using Test, Dates, Postgres, DBInterface, Tables, StructUtils
 
-Structs.@defaults struct Region
+StructUtils.@defaults struct Region
     region_id::Int = 0
     name::String = ""
     position::Int = 0

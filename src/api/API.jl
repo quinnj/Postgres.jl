@@ -1,6 +1,6 @@
 module API
 
-using UUIDs, Dates, AwsIO, Base64, SHA, MD5, Parsers, Structs, Logging, JSONBase, Random
+using UUIDs, Dates, AwsIO, Base64, SHA, MD5, Parsers, StructUtils, Logging, JSONBase, Random
 
 export PostgresStyle
 
@@ -288,7 +288,7 @@ function authRequest(debug, len, socket, user, password, nonce=nothing)
 end
 
 function connect(host::String, port::Integer, dbname::String, user::String, password::Union{String, Nothing}, debug::Bool)
-    socket = AwsIO.Socket(host, port)
+    socket = AwsIO.Sockets.Client(host, port)
     # send SSLRequest
     writemessage(socket, debug, '\0', Int32(80877103))
     mt = read(socket, UInt8)
@@ -364,16 +364,16 @@ function describeprepared(socket, name::String, debug::Bool)
 end
 
 struct DataRow
-    socket::AwsIO.Socket
+    socket::AwsIO.Sockets.Client
     names::Vector{Symbol}
     typeIds::Vector{Int}
 end
 
-struct PostgresStyle <: Structs.StructStyle end
+struct PostgresStyle <: StructUtils.StructStyle end
 
-Structs.fieldtagkey(::Type{PostgresStyle}) = :postgres
+StructUtils.fieldtagkey(::Type{PostgresStyle}) = :postgres
 
-function Structs.applyeach(::PostgresStyle, f, dr::DataRow)
+function StructUtils.applyeach(::PostgresStyle, f, dr::DataRow)
     ncols = Int(ntoh(read(dr.socket, Int16)))
     for i = 1:ncols
         len = Int(ntoh(read(dr.socket, Int32)))
@@ -391,13 +391,13 @@ function Structs.applyeach(::PostgresStyle, f, dr::DataRow)
 end
 
 struct Exec
-    socket::AwsIO.Socket
+    socket::AwsIO.Sockets.Client
     names::Vector{Symbol}
     typeIds::Vector{Int}
     debug::Bool
 end
 
-function Structs.applyeach(::PostgresStyle, f, e::Exec)
+function StructUtils.applyeach(::PostgresStyle, f, e::Exec)
     nrows = 0
     error = false
     error_msg = ""

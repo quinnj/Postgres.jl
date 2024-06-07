@@ -117,9 +117,9 @@ function makeresult(e::API.Exec)
     types = Type[API.juliatype(x -> x, i) for i in typeIds]
     lookup = Dict(x => i for (i, x) in enumerate(names))
     rows = ResultRow[]
-    Structs.applyeach(PostgresStyle(), e) do i, row
+    StructUtils.applyeach(PostgresStyle(), e) do i, row
         data = Vector{Any}(undef, length(names))
-        Structs.applyeach(PostgresStyle(), RowClosure(data, types, 1), row)
+        StructUtils.applyeach(PostgresStyle(), RowClosure(data, types, 1), row)
         push!(rows, ResultRow(data, names, types, lookup, i))
     end
     return Result(names, types, rows)
@@ -140,7 +140,7 @@ function DBInterface.execute(stmt::Statement, params=nothing, ::Type{T}=Any; deb
         # check that connection/statement are ok
         checkstmt(stmt)
         e = API.exec(stmt.conn.socket, stmt.name, stmt.params, stmt.names, stmt.typeIds, debug)
-        return T === Any ? makeresult(e) : Structs.arraylike(T) ? Structs.make(PostgresStyle(), T, e) : only(Structs.make(PostgresStyle(), Vector{T}, e))
+        return T === Any ? makeresult(e) : StructUtils.arraylike(T) ? StructUtils.make(PostgresStyle(), T, e) : only(StructUtils.make(PostgresStyle(), Vector{T}, e))
     end
 end
 
