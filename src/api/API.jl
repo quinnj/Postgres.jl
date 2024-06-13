@@ -294,7 +294,7 @@ function connect(host::String, port::Integer, dbname::String, user::String, pass
     mt = read(socket, UInt8)
     if mt == UInt8('S')
         # upgrade socket to tls and do handshake
-        AwsIO.tlsupgrade!(socket)
+        AwsIO.Sockets.tlsupgrade!(socket)
     else
         @assert mt == UInt8('N') "unexpected message type: $(Char(mt))"
     end
