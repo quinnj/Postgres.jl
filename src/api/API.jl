@@ -288,7 +288,7 @@ function authRequest(debug, len, socket, user, password, nonce=nothing)
 end
 
 function connect(host::String, port::Integer, dbname::String, user::String, password::Union{String, Nothing}, debug::Bool)
-    socket = AwsIO.Sockets.Client(host, port)
+    socket = AwsIO.Sockets.Client(host, port; enable_read_back_pressure=false)
     # send SSLRequest
     writemessage(socket, debug, '\0', Int32(80877103))
     mt = read(socket, UInt8)
