@@ -93,6 +93,7 @@ struct Describe
 end
 
 function Base.show(io::IO, desc::Describe)
+    resultset = desc.resultset
     # columns to print
     columns = [:column_name, :friendly_type, :is_nullable, :column_default, :is_primary_key, :foreign_key_reference]
     # Calculate maximum width for each column
