@@ -88,4 +88,54 @@ include("execute.jl")
 
 # escape(conn::Connection, s::AbstractString) = API.escape(conn.pg, s)
 
+function describe(conn::Connection, table::AbstractString; schema::String="public")
+    DBInterface.execute(conn, """
+        WITH column_info AS (
+            SELECT
+                c.column_name,
+                c.data_type,
+                c.is_nullable,
+                c.column_default,
+                tc.constraint_type,
+                kcu.constraint_name,
+                kcu.table_name AS local_table,
+                kcu.column_name AS local_column,
+                fk.table_name AS foreign_table,
+                fk.column_name AS foreign_column,
+                CASE
+                    WHEN tc.constraint_type = 'PRIMARY KEY' THEN TRUE
+                    ELSE FALSE
+                END AS is_primary_key,
+                CASE
+                    WHEN tc.constraint_type = 'FOREIGN KEY' THEN TRUE
+                    ELSE FALSE
+                END AS is_foreign_key
+            FROM
+                information_schema.columns c
+            LEFT JOIN
+                information_schema.key_column_usage kcu ON c.table_name = kcu.table_name AND c.column_name = kcu.column_name
+            LEFT JOIN
+                information_schema.table_constraints tc ON kcu.constraint_name = tc.constraint_name
+            LEFT JOIN
+                information_schema.referential_constraints rc ON tc.constraint_name = rc.constraint_name
+            LEFT JOIN
+                information_schema.key_column_usage fk ON rc.unique_constraint_name = fk.constraint_name AND fk.table_schema = c.table_schema
+            WHERE
+                c.table_name = '$table' AND c.table_schema = '$schema'
+        )
+        SELECT
+            column_name,
+            data_type AS friendly_type,
+            is_nullable,
+            column_default,
+            is_primary_key,
+            CASE
+                WHEN is_foreign_key THEN CONCAT(foreign_table, '.', foreign_column)
+                ELSE NULL
+            END AS foreign_key_reference
+        FROM
+            column_info;
+    """)
+end
+
 end
