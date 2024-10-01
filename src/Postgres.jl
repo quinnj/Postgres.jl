@@ -88,8 +88,39 @@ include("execute.jl")
 
 # escape(conn::Connection, s::AbstractString) = API.escape(conn.pg, s)
 
+struct Describe
+    resultset::Any
+end
+
+function Base.show(io::IO, desc::Describe)
+    # columns to print
+    columns = [:column_name, :friendly_type, :is_nullable, :column_default, :is_primary_key, :foreign_key_reference]
+    # Calculate maximum width for each column
+    max_widths = Dict{Symbol, Int}()
+    # Initialize with header widths
+    for col in columns
+        max_widths[col] = max(sizeof(string(col)), 0)  # Start with the sizeof of the header
+    end
+    # Calculate maximum width for each column based on data
+    for row in resultset
+        for col in columns
+            max_widths[col] = max(max_widths[col], sizeof(string(row[col])))
+        end
+    end
+    # Prepare the header row
+    header = join([lpad(string(col), max_widths[col]) for col in columns], " | ")
+    println(io, header)
+    # Print a separator line
+    println(io, "-"^(sizeof(header)))
+    # Print each row
+    for row in resultset
+        row_str = join([lpad(string(row[col]), max_widths[col]) for col in columns], " | ")
+        println(io, row_str)
+    end
+end
+
 function describe(conn::Connection, table::AbstractString; schema::String="public")
-    DBInterface.execute(conn, """
+    Describe(DBInterface.execute(conn, """
         WITH column_info AS (
             SELECT
                 c.column_name,
@@ -135,7 +166,7 @@ function describe(conn::Connection, table::AbstractString; schema::String="publi
             END AS foreign_key_reference
         FROM
             column_info;
-    """)
+    """))
 end
 
 end
