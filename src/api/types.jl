@@ -22,7 +22,8 @@ const JSONType = typeof(JSONBase.lazy("1"))
     elseif oid == 701
         return f(Float64)
     elseif oid == 1700
-        return f(Dec64)
+        # return f(Dec64)
+        return f(Float64)
     elseif oid == 1114
         return f(DateTime)
     elseif oid == 1184
