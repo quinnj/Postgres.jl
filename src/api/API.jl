@@ -1,6 +1,6 @@
 module API
 
-using UUIDs, Dates, AwsIO, Base64, SHA, MD5, Parsers, StructUtils, Logging, JSONBase, Random
+using UUIDs, Dates, AwsIO, SASLAuth, MD5, Parsers, StructUtils, Logging, JSONBase, Random
 
 export PostgresStyle
 
@@ -48,21 +48,6 @@ function errorResponse(len, socket, debug)
     end
     debug && @error msg
     return msg
-end
-
-function pbkdf2(pwd, salt, iter)
-    ctx = HMAC_CTX(SHA2_256_CTX(), Vector{UInt8}(pwd))
-    update!(ctx, salt)
-    update!(ctx, b"\x00\x00\x00\x01")
-    U = digest!(ctx)
-    T = copy(U)
-    for _ = 2:iter
-        U = hmac_sha256(pwd, U)
-        for i = 1:length(U)
-            @inbounds T[i] = xor(U[i], T[i])
-        end
-    end
-    return T
 end
 
 struct Params
@@ -164,7 +149,7 @@ function waitfor(socket, debug, codes...)
     return pid, skey
 end
 
-function authRequest(debug, len, socket, user, password, nonce=nothing)
+function authRequest(debug, len, socket, user, password, client::Union{Nothing, SASLAuth.SCRAMSHA256Client}=nothing)
     auth_code = ntoh(read(socket, Int32))
     debug && @info "auth code: $auth_code"
     if auth_code == 0
@@ -232,51 +217,38 @@ function authRequest(debug, len, socket, user, password, nonce=nothing)
         # Specifies that SSPI authentication is required.
 
     elseif auth_code == 10
-        # Specifies that SASL authentication is required.
+        # SASL Authentication Required
         data = String(read(socket, len - 4))
         mechanisms = split(data, '\0'; keepempty=false)
-        if "SCRAM-SHA-256" in mechanisms
-            # send SASLInitialResponse
-            nonce = String(rand(UInt8('a'):UInt8('z'), 18))
-            msg = codeunits("n,,n=$user,r=$nonce")
-            writemessage(socket, debug, 'p', "SCRAM-SHA-256", Int32(sizeof(msg)), msg)
-            mt, len = readheader(socket, debug)
-            @assert mt == UInt8('R')
-            return authRequest(debug, len, socket, user, password, nonce)
-        else
+
+        if "SCRAM-SHA-256" ∉ mechanisms
             close(socket)
             throw(Error("no supported SASL mechanisms: $mechanisms"))
         end
-    elseif auth_code == 11
-        # Specifies that this message contains a SASL challenge.
-        rawchallenge = String(read(socket, len - 4))
-        challenge = split(rawchallenge, ',')
-        salt = base64decode(split(challenge[2], '='; limit=2)[2])
-        itercount = parse(Int, split(challenge[3], '='; limit=2)[2])
-        saltedPassword = pbkdf2(Vector{UInt8}(password), salt, itercount)
-        clientKey = SHA.hmac_sha256(saltedPassword, "Client Key")
-        storedKey = SHA.sha256(clientKey)
-        # Example values; replace with actual messages exchanged with the server
-        clientFirstMessageBare = "n=$user,r=$nonce"
-        clientFinalMessageWithoutProof = "c=biws,$(challenge[1])"
-        authMessage = clientFirstMessageBare * "," * rawchallenge * "," * clientFinalMessageWithoutProof
-        clientSignature = SHA.hmac_sha256(storedKey, authMessage)
-        # ClientProof = ClientKey XOR ClientSignature
-        clientproof = base64encode(xor.(clientKey, clientSignature))
-        msg = codeunits("c=biws,$(challenge[1]),p=$clientproof")
-        writemessage(socket, debug, 'p', msg)
+        @show user password
+        client = SASLAuth.SCRAMSHA256Client(user, password)
+        msg, _ = SASLAuth.step!(client, nothing)
+        @show msg
+        bytes = Vector{UInt8}(msg)
+        writemessage(socket, debug, 'p', "SCRAM-SHA-256", Int32(length(bytes)), bytes)
         mt, len = readheader(socket, debug)
-        if mt == UInt8('E')
-            # error
-            close(socket)
-            throw(Error(errorResponse(len, socket, debug)))
-        end
-        @assert mt == UInt8('R') "unexpected message type: $(Char(mt))"
-        return authRequest(debug, len, socket, user, password)
+        @assert mt == UInt8('R')
+        return authRequest(debug, len, socket, user, password, client)
+    elseif auth_code == 11
+        # SASL Challenge
+        challenge = String(read(socket, len - 4))
+        msg, _ = SASLAuth.step!(client, challenge)
+        @show :challenge msg
+        writemessage(socket, debug, 'p', Vector{UInt8}(msg))
+        mt, len = readheader(socket, debug)
+        @assert mt == UInt8('R')
+        return authRequest(debug, len, socket, user, password, client)
     elseif auth_code == 12
-        # Specifies that SASL authentication has completed.
-        data = String(read(socket, len - 4))
-        #TODO: validate server signature
+        # SASL Final Message
+        final_msg = String(read(socket, len - 4))
+        _, done = SASLAuth.step!(client, final_msg)
+        @show final_msg done
+        @assert done
         mt, len = readheader(socket, debug)
         @assert mt == UInt8('R')
         @assert read(socket, Int32) == 0
