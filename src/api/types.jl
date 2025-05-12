@@ -1,4 +1,4 @@
-const JSONType = typeof(JSONBase.lazy("1"))
+const JSONType = typeof(JSON.lazy("1"))
 
 @inline function juliatype(f, oid)
     if oid == 23
@@ -69,7 +69,7 @@ const DATETIME_OPTIONS = Parsers.Options(dateformat=dateformat"yyyy-mm-dd HH:MM:
         elseif T == Vector{UInt8}
             f(name, unsafe_wrap(Vector{UInt8}, pointer(val), sizeof(val)))
         elseif T == JSONType
-            f(name, JSONBase.lazy(val))
+            f(name, JSON.lazy(val))
         else
             # fallback
             f(name, val)

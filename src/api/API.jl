@@ -1,6 +1,6 @@
 module API
 
-using UUIDs, Dates, AwsIO, SASLAuth, MD5, Parsers, StructUtils, Logging, JSONBase, Random
+using UUIDs, Dates, AwsIO, SASLAuth, MD5, Parsers, StructUtils, Logging, JSON, Random
 
 export PostgresStyle
 
