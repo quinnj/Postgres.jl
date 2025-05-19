@@ -225,10 +225,8 @@ function authRequest(debug, len, socket, user, password, client::Union{Nothing, 
             close(socket)
             throw(Error("no supported SASL mechanisms: $mechanisms"))
         end
-        @show user password
         client = SASLAuth.SCRAMSHA256Client(user, password)
         msg, _ = SASLAuth.step!(client, nothing)
-        @show msg
         bytes = Vector{UInt8}(msg)
         writemessage(socket, debug, 'p', "SCRAM-SHA-256", Int32(length(bytes)), bytes)
         mt, len = readheader(socket, debug)
@@ -238,7 +236,6 @@ function authRequest(debug, len, socket, user, password, client::Union{Nothing, 
         # SASL Challenge
         challenge = String(read(socket, len - 4))
         msg, _ = SASLAuth.step!(client, challenge)
-        @show :challenge msg
         writemessage(socket, debug, 'p', Vector{UInt8}(msg))
         mt, len = readheader(socket, debug)
         @assert mt == UInt8('R')
@@ -247,7 +244,6 @@ function authRequest(debug, len, socket, user, password, client::Union{Nothing, 
         # SASL Final Message
         final_msg = String(read(socket, len - 4))
         _, done = SASLAuth.step!(client, final_msg)
-        @show final_msg done
         @assert done
         mt, len = readheader(socket, debug)
         @assert mt == UInt8('R')
