@@ -339,7 +339,7 @@ end
 
 struct PostgresStyle <: StructUtils.StructStyle end
 
-StructUtils.fieldtagkey(::Type{PostgresStyle}) = :postgres
+StructUtils.fieldtagkey(::PostgresStyle) = :postgres
 
 function StructUtils.applyeach(::PostgresStyle, f, dr::DataRow)
     ncols = Int(ntoh(read(dr.socket, Int16)))
