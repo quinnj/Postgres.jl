@@ -1,5 +1,6 @@
 [deps]
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
+Postgres = "8f23287e-300e-4f50-bc2b-9f1dfe95da84"
 
 [compat]
 Documenter = "0.27"
