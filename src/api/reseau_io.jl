@@ -20,22 +20,10 @@ end
     return io.stop - io.next + 1
 end
 
-function _conn_read_some!(conn, buf::Vector{UInt8})::Int
-    return readbytes!(conn, buf, length(buf))
-end
-
-function _conn_read_some!(conn::Reseau.TCP.Conn, buf::Vector{UInt8})::Int
-    return Reseau.TCP._read_some!(conn, buf)
-end
-
-function _conn_read_some!(conn::Reseau.TLS.Conn, buf::Vector{UInt8})::Int
-    return Reseau.TLS._read_some!(conn, buf)
-end
-
 function fillbuffer!(io::BufferedConn)::Int
     io.eof_seen && return 0
     try
-        n = _conn_read_some!(io.conn, io.buf)
+        n = readbytes!(io.conn, io.buf, length(io.buf); all=false)
         io.next = 1
         io.stop = n
         if n == 0
