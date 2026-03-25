@@ -1,6 +1,6 @@
 module Postgres
 
-using DBInterface, Dates, UUIDs, Parsers, Tables, StructUtils, JSON, ConcurrentUtilities
+using DBInterface, Dates, UUIDs, Parsers, Tables, StructUtils, JSON, ConcurrentUtilities, Reseau
 
 export DBInterface, PostgresInterfaceError, start_transaction, commit, rollback, in_transaction, transaction, ConnectionParams, parse_dsn, get_cached_statements, clear_statement_cache!, set_statement_cache_maxsize!, get_server_parameter, get_server_parameters, Error, Notification, Numeric, PostgresRange, register_type!, register_enum!, register_composite!, register_range!, set_notice_callback!, get_notice_callback, set_notification_callback!, get_notification_callback, set_query_logger!, get_query_logger, set_statement_timeout!, get_statement_timeout, copy_from, copy_to, listen!, unlisten!, notify!, wait_for_notification, cursor, ConnectionPool, acquire, release, with_connection
 
@@ -17,6 +17,7 @@ using .ConnectionString
 
 const Pools = ConcurrentUtilities.Pools
 const NOOP_QUERY_LOGGER = (event, info) -> nothing
+const ReseauConn = Union{Reseau.TCP.Conn, Reseau.TLS.Conn}
 
 # T parameter is always Statement
 mutable struct Connection{IO, T} <: DBInterface.Connection
@@ -244,31 +245,58 @@ function update_server_parameters!(conn::Connection, buf::Vector{UInt8})
     return
 end
 
+@inline function _set_read_deadline!(socket::Reseau.TCP.Conn, deadline_ns::Int64)
+    Reseau.TCP.set_read_deadline!(socket, deadline_ns)
+    return nothing
+end
+
+@inline function _set_read_deadline!(socket::Reseau.TLS.Conn, deadline_ns::Int64)
+    Reseau.TLS.set_read_deadline!(socket, deadline_ns)
+    return nothing
+end
+
+@inline function _clear_read_deadline!(socket::ReseauConn)
+    _set_read_deadline!(socket, Int64(0))
+    return nothing
+end
+
+const NOTIFICATION_POLL_INTERVAL_NS = Int64(100_000_000)
+
 function wait_for_notification(conn::Connection; timeout::Union{Real, Nothing}=nothing)
     start_time = time()
     @lock conn.lock begin
         checkconn(conn)
         while true
-            if timeout !== nothing && (time() - start_time) >= timeout
-                return nothing
-            end
-            bytesavailable(conn.socket) < 5 && (sleep(0.01); continue)
-            mt, len = API.readheader(conn.socket, conn.debug)
-            if mt == UInt8('A')
-                notification = API.notificationResponse(len, conn.socket)
-                conn.notification_callback(notification)
-                return notification
-            elseif mt == UInt8('N')
-                notice = API.noticeResponse(len, conn.socket)
-                conn.notice_callback(notice)
-            elseif mt == UInt8('S')
-                buf = read(conn.socket, len)
-                update_server_parameters!(conn, buf)
-            elseif mt == UInt8('E')
-                err = API.errorResponse(len, conn.socket, conn.debug)
-                throw(err)
+            deadline_ns = if timeout === nothing
+                Int64(time_ns()) + NOTIFICATION_POLL_INTERVAL_NS
             else
-                skip(conn.socket, len)
+                remaining_s = timeout - (time() - start_time)
+                remaining_s <= 0 && return nothing
+                Int64(time_ns()) + min(NOTIFICATION_POLL_INTERVAL_NS, round(Int64, remaining_s * 1_000_000_000))
+            end
+            _set_read_deadline!(conn.socket, deadline_ns)
+            try
+                mt, len = API.readheader(conn.socket, conn.debug)
+                if mt == UInt8('A')
+                    notification = API.notificationResponse(len, conn.socket)
+                    conn.notification_callback(notification)
+                    return notification
+                elseif mt == UInt8('N')
+                    notice = API.noticeResponse(len, conn.socket)
+                    conn.notice_callback(notice)
+                elseif mt == UInt8('S')
+                    buf = read(conn.socket, len)
+                    update_server_parameters!(conn, buf)
+                elseif mt == UInt8('E')
+                    err = API.errorResponse(len, conn.socket, conn.debug)
+                    throw(err)
+                else
+                    API.skipbytes!(conn.socket, len)
+                end
+            catch err
+                err isa Reseau.IOPoll.DeadlineExceededError || rethrow()
+            finally
+                _clear_read_deadline!(conn.socket)
             end
         end
     end

@@ -1,9 +1,11 @@
 module API
 
 using UUIDs, Dates, Reseau, SASLAuth, MD5, Parsers, StructUtils, Logging, JSON, Random
-include("reseau_io.jl")
 
 export PostgresStyle, Error, Notification, Numeric, PostgresRange
+
+const ReseauConn = Union{Reseau.TCP.Conn, Reseau.TLS.Conn}
+const SKIP_BUFFER_SIZE = 8192
 
 struct Error <: Exception
     severity::String
@@ -231,6 +233,18 @@ function writemessages(socket, debug, msgs...)
     return
 end
 
+function skipbytes!(io::IO, n::Integer)
+    remaining = Int(n)
+    remaining <= 0 && return nothing
+    buf = Vector{UInt8}(undef, min(SKIP_BUFFER_SIZE, remaining))
+    while remaining > 0
+        nb = min(length(buf), remaining)
+        readbytes!(io, buf, nb)
+        remaining -= nb
+    end
+    return nothing
+end
+
 function readheader(socket, debug=false)
     mt = read(socket, UInt8)
     len = ntoh(read(socket, Int32)) - 4
@@ -254,7 +268,7 @@ function waitfor(socket, debug, codes...)
             error_msg = errorResponse(len, socket, debug)
         elseif error && mt == UInt8('Z')
             # error followed by ready
-            skip(socket, len)
+            skipbytes!(socket, len)
             break
         elseif mt == UInt8('S')
             # parameter status
@@ -278,12 +292,12 @@ function waitfor(socket, debug, codes...)
                 pid = ntoh(read(socket, Int32))
                 skey = ntoh(read(socket, Int32))
             else
-                skip(socket, len)
+                skipbytes!(socket, len)
             end
             found == 0 && break
         else
             # read off message
-            skip(socket, len)
+            skipbytes!(socket, len)
         end
     end
     error_msg === nothing && error && throw(Error("unexpected error response"))
@@ -397,8 +411,51 @@ function authRequest(debug, len, socket, user, password, client::Union{Nothing, 
     end
 end
 
+function connectsocket(host::AbstractString, port::Integer; connect_timeout::Union{Int, Nothing}=nothing)
+    address = string(host, ":", Int(port))
+    return if connect_timeout === nothing
+        Reseau.TCP.connect(address)
+    else
+        timeout_ns = Int64(connect_timeout) * 1_000_000_000
+        Reseau.TCP.connect(address; timeout_ns)
+    end
+end
+
+function tlsupgrade(
+        socket::Reseau.TCP.Conn;
+        connect_timeout::Union{Int, Nothing}=nothing,
+        server_name::Union{String, Nothing}=nothing,
+        verify_peer::Bool=true,
+        ssl_cert::Union{String, Nothing}=nothing,
+        ssl_key::Union{String, Nothing}=nothing,
+        ssl_cacert::Union{String, Nothing}=nothing,
+        ssl_capath::Union{String, Nothing}=nothing,
+    )
+    ca_file = ssl_cacert === nothing ? ssl_capath : ssl_cacert
+    handshake_timeout_ns = connect_timeout === nothing ? Int64(0) : Int64(connect_timeout) * 1_000_000_000
+    tls_conn = Reseau.TLS.client(
+        socket,
+        Reseau.TLS.Config(
+            ;
+            server_name,
+            verify_peer,
+            cert_file=ssl_cert,
+            key_file=ssl_key,
+            ca_file,
+            handshake_timeout_ns,
+        ),
+    )
+    try
+        Reseau.TLS.handshake!(tls_conn)
+        return tls_conn
+    catch
+        close(tls_conn)
+        rethrow()
+    end
+end
+
 function connect(host::String, port::Integer, dbname::String, user::String, password::Union{String, Nothing}, debug::Bool, application_name::Union{String, Nothing}, connect_timeout::Union{Int, Nothing}, sslmode::Union{String, Nothing}, sslrootcert::Union{String, Nothing}, sslcert::Union{String, Nothing}, sslkey::Union{String, Nothing}, sslcapath::Union{String, Nothing}, statement_timeout::Union{Int, Nothing})
-    socket = connectbuffered(host, port; connect_timeout)
+    socket = connectsocket(host, port; connect_timeout)
     sslmode_str = sslmode === nothing ? "prefer" : lowercase(String(sslmode))
     sslmode_str == "disable" || sslmode_str == "prefer" || sslmode_str == "require" || sslmode_str == "verify-full" || throw(Error("invalid sslmode: $sslmode_str"))
     if sslmode_str != "disable"
@@ -467,7 +524,7 @@ function describeprepared(socket, name::String, debug::Bool)
     mt, len = readheader(socket)
     @assert mt == UInt8('t') "unexpected message type: $(Char(mt))"
     nparams = Int(ntoh(read(socket, Int16)))
-    skip(socket, len - 2)
+    skipbytes!(socket, len - 2)
     mt, len = readheader(socket)
     if mt == UInt8('n')
         # no data
@@ -552,21 +609,21 @@ function StructUtils.applyeach(::PostgresStyle, f, e::Exec)
             error_msg = errorResponse(len, e.socket, e.debug)
         elseif error && mt == UInt8('Z')
             # error followed by ready
-            skip(e.socket, len)
+            skipbytes!(e.socket, len)
             error_msg === nothing && throw(Error("unexpected error response"))
             throw(error_msg)
         elseif mt == UInt8('T')
             # row description
-            skip(e.socket, len)
+            skipbytes!(e.socket, len)
         elseif mt == UInt8('n')
             # no data
-            skip(e.socket, len)
+            skipbytes!(e.socket, len)
         elseif mt == UInt8('I')
             # empty query response
-            skip(e.socket, len)
+            skipbytes!(e.socket, len)
         elseif mt == UInt8('S')
             # parameter status
-            skip(e.socket, len)
+            skipbytes!(e.socket, len)
         elseif mt == UInt8('A')
             # notification response
             notification = notificationResponse(len, e.socket)
@@ -577,9 +634,9 @@ function StructUtils.applyeach(::PostgresStyle, f, e::Exec)
         elseif mt == UInt8('C')
             # command complete
             #TODO: should we read the rows affected here and store them in Exec or something?
-            skip(e.socket, len)
+            skipbytes!(e.socket, len)
         elseif mt == UInt8('Z')
-            skip(e.socket, len)
+            skipbytes!(e.socket, len)
             break
         elseif mt == UInt8('N')
             # notice response
@@ -616,7 +673,7 @@ function copy_in(socket, query::String, source::IO, debug::Bool, notice_callback
     while true
         mt, len = readheader(socket, debug)
         if mt == UInt8('G')
-            skip(socket, len)
+            skipbytes!(socket, len)
             break
         elseif mt == UInt8('E')
             error_msg = errorResponse(len, socket, debug)
@@ -627,7 +684,7 @@ function copy_in(socket, query::String, source::IO, debug::Bool, notice_callback
             notification = notificationResponse(len, socket)
             notification_callback(notification)
         else
-            skip(socket, len)
+            skipbytes!(socket, len)
         end
     end
     error_msg === nothing || throw(error_msg)
@@ -644,7 +701,7 @@ function copy_in(socket, query::String, source::IO, debug::Bool, notice_callback
         if mt == UInt8('E')
             error_msg = errorResponse(len, socket, debug)
         elseif mt == UInt8('C')
-            skip(socket, len)
+            skipbytes!(socket, len)
         elseif mt == UInt8('N')
             notice = noticeResponse(len, socket)
             notice_callback(notice)
@@ -652,10 +709,10 @@ function copy_in(socket, query::String, source::IO, debug::Bool, notice_callback
             notification = notificationResponse(len, socket)
             notification_callback(notification)
         elseif mt == UInt8('Z')
-            skip(socket, len)
+            skipbytes!(socket, len)
             break
         else
-            skip(socket, len)
+            skipbytes!(socket, len)
         end
     end
     error_msg === nothing || throw(error_msg)
@@ -668,13 +725,13 @@ function copy_out(socket, query::String, dest::IO, debug::Bool, notice_callback:
     while true
         mt, len = readheader(socket, debug)
         if mt == UInt8('H')
-            skip(socket, len)
+            skipbytes!(socket, len)
         elseif mt == UInt8('d')
             write(dest, read(socket, len))
         elseif mt == UInt8('c')
-            skip(socket, len)
+            skipbytes!(socket, len)
         elseif mt == UInt8('C')
-            skip(socket, len)
+            skipbytes!(socket, len)
         elseif mt == UInt8('E')
             error_msg = errorResponse(len, socket, debug)
         elseif mt == UInt8('N')
@@ -684,10 +741,10 @@ function copy_out(socket, query::String, dest::IO, debug::Bool, notice_callback:
             notification = notificationResponse(len, socket)
             notification_callback(notification)
         elseif mt == UInt8('Z')
-            skip(socket, len)
+            skipbytes!(socket, len)
             break
         else
-            skip(socket, len)
+            skipbytes!(socket, len)
         end
     end
     error_msg === nothing || throw(error_msg)
@@ -701,7 +758,7 @@ function close_statement(socket, name::String, debug::Bool)
 end
 
 function cancel_request(host::String, port::Int, pid::Int32, skey::Int32, debug::Bool=false)
-    socket = connectbuffered(host, port)
+    socket = connectsocket(host, port)
     try
         buf = IOBuffer(Vector{UInt8}(undef, 16); write=true)
         write(buf, hton(Int32(16)))

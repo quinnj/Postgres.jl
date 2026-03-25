@@ -82,7 +82,7 @@ function wait_for_connection(cfg::PgConfig; timeout::Float64=60.0)
     last_err = nothing
     while time() - start_time < timeout
         try
-            return DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, cfg.password; dbname=cfg.dbname, port=cfg.port)
+            return DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, cfg.password; dbname=cfg.dbname, port=cfg.port, connect_timeout=2)
         catch err
             last_err = err
             sleep(0.5)
@@ -102,7 +102,13 @@ function with_postgres(f::Function)
         "POSTGRES_HOST_AUTH_METHOD" => DEFAULT_AUTH,
         "POSTGRES_INITDB_ARGS" => DEFAULT_INITDB_ARGS,
     )
-    Harbor.with_container(image; tag=tag, ports=Dict(5432 => host_port), environment=env) do _
+    Harbor.with_container(
+        image;
+        tag=tag,
+        ports=Dict(5432 => host_port),
+        environment=env,
+        wait_strategy=(pattern="database system is ready to accept connections",),
+    ) do _
         cfg = PgConfig("127.0.0.1", host_port, DEFAULT_USER, DEFAULT_PASSWORD, DEFAULT_DB)
         return f(cfg)
     end
@@ -595,6 +601,7 @@ end
                     listener = DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, cfg.password; dbname=cfg.dbname, port=cfg.port)
                     notifier = DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, cfg.password; dbname=cfg.dbname, port=cfg.port)
                     Postgres.listen!(listener, "notify_test")
+                    @test Postgres.wait_for_notification(listener; timeout=0.05) === nothing
                     Postgres.notify!(notifier, "notify_test", "payload")
                     notification = Postgres.wait_for_notification(listener; timeout=5.0)
                     @test notification !== nothing

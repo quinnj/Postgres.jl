@@ -241,10 +241,10 @@ function read_portal_batch!(cursor::Cursor)
             StructUtils.applyeach(PostgresStyle(), RowClosure(data, cursor.types, 1), API.DataRow(conn.socket, cursor.names, cursor.typeIds, conn.type_registry))
             push!(rows, ResultRow(data, cursor.names, cursor.types, cursor.lookup, cursor.rowcount))
         elseif mt == UInt8('s')
-            skip(conn.socket, len)
+            API.skipbytes!(conn.socket, len)
             done = false
         elseif mt == UInt8('C')
-            skip(conn.socket, len)
+            API.skipbytes!(conn.socket, len)
             done = true
         elseif mt == UInt8('N')
             notice = API.noticeResponse(len, conn.socket)
@@ -255,10 +255,10 @@ function read_portal_batch!(cursor::Cursor)
         elseif mt == UInt8('E')
             error_msg = API.errorResponse(len, conn.socket, conn.debug)
         elseif mt == UInt8('Z')
-            skip(conn.socket, len)
+            API.skipbytes!(conn.socket, len)
             break
         else
-            skip(conn.socket, len)
+            API.skipbytes!(conn.socket, len)
         end
     end
     error_msg === nothing || throw(error_msg)
