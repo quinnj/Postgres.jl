@@ -52,6 +52,62 @@ result = DBInterface.execute(conn, "UPDATE items SET seen = true WHERE seen = fa
 @show Postgres.rows_affected(result)
 ```
 
+## Typed Results With StructUtils
+
+Postgres.jl result sets implement the StructUtils.jl interface. That means `DBInterface.execute` can deserialize rows directly into a target type instead of first materializing `Tables.rowtable` rows.
+
+For a single-row query, pass a concrete struct type as the fourth argument. The query should return exactly one row.
+
+```julia
+using Postgres, StructUtils
+
+struct CountRow
+    count::Int
+end
+
+row = DBInterface.execute(conn, "SELECT count(*)::int AS count FROM users", (), CountRow)
+@show row.count
+```
+
+For multi-row queries, pass a vector type.
+
+```julia
+struct UserName
+    id::Int
+    name::String
+end
+
+users = DBInterface.execute(conn, "SELECT id, name FROM users ORDER BY id", (), Vector{UserName})
+```
+
+StructUtils field tags let Julia models keep idiomatic field names while SQL keeps idiomatic column names. Tags for Postgres.jl live under the `postgres` namespace.
+
+```julia
+using Dates, Postgres, StructUtils
+
+StructUtils.@tags struct ProfileSummary
+    profileId::Int &(postgres=(name=:profile_id,),)
+    firstName::Union{Missing, String} &(postgres=(name=:first_name,),)
+    lastName::Union{Missing, String} &(postgres=(name=:last_name,),)
+    createdAt::DateTime &(postgres=(name=:created_at,),)
+end
+
+profile = DBInterface.execute(conn, """
+    SELECT profile_id, first_name, last_name, created_at
+    FROM profiles
+    WHERE profile_id = $1
+    """, (profile_id,), ProfileSummary)
+
+profiles = DBInterface.execute(conn, """
+    SELECT profile_id, first_name, last_name, created_at
+    FROM profiles
+    ORDER BY created_at DESC
+    LIMIT 10
+    """, (), Vector{ProfileSummary})
+```
+
+The `postgres=(name=:column_name,)` tag is only needed when a column should map to a differently named field. Columns such as `id` or `name` can be left untagged because they already match the Julia field name.
+
 ## Parameters And Prepared Statements
 
 Use PostgreSQL placeholders (`$1`, `$2`, ...) and pass a tuple or other iterable of parameter values.
@@ -173,4 +229,3 @@ row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT 'happy'::mood AS mo
 ```
 
 Registering composite and range types follows the same pattern.
-

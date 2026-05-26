@@ -59,6 +59,48 @@ DBInterface.close!(stmt)
 DBInterface.close!(conn)
 ```
 
+Postgres.jl can also deserialize result rows directly into structs through
+StructUtils.jl. If column names match field names, pass the target type as the
+fourth `DBInterface.execute` argument.
+
+```julia
+using Postgres, DBInterface, StructUtils
+
+struct CountRow
+    count::Int
+end
+
+row = DBInterface.execute(conn, "SELECT count(*)::int AS count FROM users", (), CountRow)
+@show row.count
+```
+
+Use `StructUtils.@tags` with the `postgres` namespace when table columns use a
+different naming convention than Julia fields.
+
+```julia
+using Dates, Postgres, DBInterface, StructUtils
+
+StructUtils.@tags struct ProfileSummary
+    profileId::Int &(postgres=(name=:profile_id,),)
+    firstName::Union{Missing, String} &(postgres=(name=:first_name,),)
+    lastName::Union{Missing, String} &(postgres=(name=:last_name,),)
+    createdAt::DateTime &(postgres=(name=:created_at,),)
+end
+
+profile = DBInterface.execute(conn, """
+    SELECT profile_id, first_name, last_name, created_at
+    FROM profiles
+    WHERE profile_id = $1
+    """, (profile_id,), ProfileSummary)
+
+profiles = DBInterface.execute(conn, """
+    SELECT profile_id, first_name, last_name, created_at
+    FROM profiles
+    ORDER BY created_at DESC
+    LIMIT 10
+    """, (), Vector{ProfileSummary})
+```
+
 `Postgres.command_tag(result)` and `Postgres.rows_affected(result)` expose PostgreSQL command completion metadata.
 
 Statement caching is LRU-based. Set `statement_cache_maxsize=0` to disable caching.

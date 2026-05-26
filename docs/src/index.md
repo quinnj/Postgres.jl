@@ -38,6 +38,47 @@ rows = Tables.rowtable(DBInterface.execute(conn, "SELECT $1::int AS val", (42,))
 DBInterface.close!(conn)
 ```
 
+## StructUtils results
+
+Postgres.jl integrates with StructUtils.jl, so query results can be materialized directly as Julia structs.
+
+```julia
+using Postgres, DBInterface, StructUtils
+
+struct CountRow
+    count::Int
+end
+
+row = DBInterface.execute(conn, "SELECT count(*)::int AS count FROM users", (), CountRow)
+@show row.count
+```
+
+When PostgreSQL column names do not match Julia field names, add field tags in the `postgres` namespace. Postgres.jl's StructUtils style uses those tags while deserializing rows.
+
+```julia
+using Dates, Postgres, DBInterface, StructUtils
+
+StructUtils.@tags struct ProfileSummary
+    profileId::Int &(postgres=(name=:profile_id,),)
+    firstName::Union{Missing, String} &(postgres=(name=:first_name,),)
+    lastName::Union{Missing, String} &(postgres=(name=:last_name,),)
+    createdAt::DateTime &(postgres=(name=:created_at,),)
+end
+
+profile = DBInterface.execute(conn, """
+    SELECT profile_id, first_name, last_name, created_at
+    FROM profiles
+    WHERE profile_id = $1
+    """, (profile_id,), ProfileSummary)
+
+profiles = DBInterface.execute(conn, """
+    SELECT profile_id, first_name, last_name, created_at
+    FROM profiles
+    ORDER BY created_at DESC
+    LIMIT 10
+    """, (), Vector{ProfileSummary})
+```
+
 Prepared statements are cached with LRU eviction; disable caching via `statement_cache_maxsize=0`.
 
 ```julia
