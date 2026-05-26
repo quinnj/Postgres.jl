@@ -1,5 +1,14 @@
-using Documenter, Example
+using Documenter, Postgres
 
-makedocs(modules = [Example], sitename = "Example.jl")
+makedocs(
+    modules = [Postgres],
+    sitename = "Postgres.jl",
+    pages = [
+        "Home" => "index.md",
+        "Manual" => "manual.md",
+    ],
+)
 
-deploydocs(repo = "github.com/quinnj/Example.jl.git", push_preview = true)
+if get(ENV, "POSTGRES_DOCS_DEPLOY", "false") == "true"
+    deploydocs(repo = "github.com/quinnj/Postgres.jl.git", push_preview = true)
+end
