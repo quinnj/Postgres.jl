@@ -20,6 +20,8 @@ struct TypeInfo
     parser::Union{Function, Nothing}
 end
 
+const IntervalType = Union{Dates.Period, Dates.CompoundPeriod}
+
 const DEFAULT_TYPE_REGISTRY = Dict{Int, TypeInfo}(
     23 => TypeInfo(Int32, nothing),
     26 => TypeInfo(Cuint, nothing),
@@ -41,10 +43,12 @@ const DEFAULT_TYPE_REGISTRY = Dict{Int, TypeInfo}(
     1184 => TypeInfo(DateTime, nothing),
     1082 => TypeInfo(Date, nothing),
     1083 => TypeInfo(Time, nothing),
+    1186 => TypeInfo(IntervalType, (val, registry) -> parse_interval(val)),
     17 => TypeInfo(Vector{UInt8}, nothing),
     18 => TypeInfo(Char, nothing),
     1560 => TypeInfo(Bool, nothing),
     1000 => TypeInfo(Vector{Bool}, nothing),
+    1001 => TypeInfo(Vector{Vector{UInt8}}, (val, registry) -> parse_array_by_oid(val, 17, registry)),
     1005 => TypeInfo(Vector{Int16}, nothing),
     1007 => TypeInfo(Vector{Int32}, nothing),
     1016 => TypeInfo(Vector{Int64}, nothing),
@@ -53,6 +57,15 @@ const DEFAULT_TYPE_REGISTRY = Dict{Int, TypeInfo}(
     1009 => TypeInfo(Vector{String}, nothing),
     1014 => TypeInfo(Vector{String}, nothing),
     1015 => TypeInfo(Vector{String}, nothing),
+    1115 => TypeInfo(Vector{DateTime}, (val, registry) -> parse_array_by_oid(val, 1114, registry)),
+    1182 => TypeInfo(Vector{Date}, (val, registry) -> parse_array_by_oid(val, 1082, registry)),
+    1183 => TypeInfo(Vector{Time}, (val, registry) -> parse_array_by_oid(val, 1083, registry)),
+    1185 => TypeInfo(Vector{DateTime}, (val, registry) -> parse_array_by_oid(val, 1184, registry)),
+    1187 => TypeInfo(Vector{IntervalType}, (val, registry) -> parse_array_by_oid(val, 1186, registry)),
+    1231 => TypeInfo(Vector{Numeric}, (val, registry) -> parse_array_by_oid(val, 1700, registry)),
+    199 => TypeInfo(Vector{JSONType}, (val, registry) -> parse_array_by_oid(val, 114, registry)),
+    2951 => TypeInfo(Vector{UUID}, (val, registry) -> parse_array_by_oid(val, 2950, registry)),
+    3807 => TypeInfo(Vector{JSONType}, (val, registry) -> parse_array_by_oid(val, 3802, registry)),
     3904 => TypeInfo(PostgresRange{Int32}, (val, registry) -> parse_range(val, 23, registry)),
     3926 => TypeInfo(PostgresRange{Int64}, (val, registry) -> parse_range(val, 20, registry)),
     3906 => TypeInfo(PostgresRange{Numeric}, (val, registry) -> parse_range(val, 1700, registry)),
@@ -159,6 +172,66 @@ function parse_numeric(val::String)
     return Numeric(sign * coeff, scale)
 end
 
+function parse_interval_time(token::AbstractString)
+    sign = startswith(token, "-") ? -1 : 1
+    token = startswith(token, "-") || startswith(token, "+") ? token[2:end] : token
+    parts = split(token, ':')
+    length(parts) == 3 || return Dates.Period[]
+    hours = sign * parse(Int, parts[1])
+    minutes = sign * parse(Int, parts[2])
+    seconds_part = parts[3]
+    seconds = 0
+    milliseconds = 0
+    if occursin('.', seconds_part)
+        whole, frac = split(seconds_part, '.'; limit=2)
+        seconds = parse(Int, whole)
+        frac = rpad(frac[1:min(end, 3)], 3, '0')
+        milliseconds = parse(Int, frac)
+    else
+        seconds = parse(Int, seconds_part)
+    end
+    periods = Dates.Period[]
+    hours != 0 && push!(periods, Dates.Hour(hours))
+    minutes != 0 && push!(periods, Dates.Minute(minutes))
+    seconds != 0 && push!(periods, Dates.Second(sign * seconds))
+    milliseconds != 0 && push!(periods, Dates.Millisecond(sign * milliseconds))
+    return periods
+end
+
+function parse_interval(val::String)
+    tokens = split(strip(val))
+    periods = Dates.Period[]
+    i = 1
+    while i <= length(tokens)
+        token = tokens[i]
+        if occursin(':', token)
+            append!(periods, parse_interval_time(token))
+            i += 1
+            continue
+        end
+        i == length(tokens) && break
+        amount = parse(Int, token)
+        unit = lowercase(tokens[i + 1])
+        if startswith(unit, "year")
+            push!(periods, Dates.Year(amount))
+        elseif startswith(unit, "mon")
+            push!(periods, Dates.Month(amount))
+        elseif startswith(unit, "day")
+            push!(periods, Dates.Day(amount))
+        elseif startswith(unit, "hour")
+            push!(periods, Dates.Hour(amount))
+        elseif startswith(unit, "min")
+            push!(periods, Dates.Minute(amount))
+        elseif startswith(unit, "sec")
+            push!(periods, Dates.Second(amount))
+        end
+        i += 2
+    end
+    isempty(periods) && return Dates.Millisecond(0)
+    length(periods) == 1 && return only(periods)
+    return Dates.CompoundPeriod(periods...)
+end
+
 function split_range_values(val::String)
     code = codeunits(val)
     pos = 1
@@ -193,6 +266,15 @@ function parse_range(val::String, typeId::Int, registry::Dict{Int, TypeInfo})
     upper = parse_range_value(right, typeId, registry)
     T = type_info(registry, typeId).julia_type
     return PostgresRange{T}(lower, upper, lower_inclusive, upper_inclusive, false)
+end
+
+parse_array_scalar(typeId::Int, registry::Dict{Int, TypeInfo}, value::Missing) = missing
+parse_array_scalar(typeId::Int, registry::Dict{Int, TypeInfo}, value::AbstractVector) = [parse_array_scalar(typeId, registry, v) for v in value]
+parse_array_scalar(typeId::Int, registry::Dict{Int, TypeInfo}, value::AbstractString) = parse_value(typeId, String(value), registry)
+
+function parse_array_by_oid(val::String, typeId::Int, registry::Dict{Int, TypeInfo})
+    parsed = parse_array(val, String)
+    return parse_array_scalar(typeId, registry, parsed)
 end
 
 function parse_composite_fields(val::String)

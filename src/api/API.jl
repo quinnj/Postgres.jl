@@ -252,6 +252,23 @@ function readheader(socket, debug=false)
     return mt, len
 end
 
+function close_and_throw_error_response(socket, len, debug)
+    err = errorResponse(len, socket, debug)
+    close(socket)
+    throw(err)
+end
+
+function close_and_throw(socket, err)
+    close(socket)
+    throw(err)
+end
+
+function expect_auth_message(socket, debug, mt, len)
+    mt == UInt8('R') && return
+    mt == UInt8('E') && close_and_throw_error_response(socket, len, debug)
+    close_and_throw(socket, Error("unexpected message type: $(Char(mt))"))
+end
+
 # wait for code, then ready
 function waitfor(socket, debug, codes...)
     error = false
@@ -321,20 +338,17 @@ function authRequest(debug, len, socket, user, password, client::Union{Nothing, 
         mt, len = readheader(socket, debug)
         if mt == UInt8('E')
             # error
-            close(socket)
-            throw(errorResponse(len, socket, debug))
+            close_and_throw_error_response(socket, len, debug)
         elseif mt == UInt8('R')
             auth_code = ntoh(read(socket, Int32))
             if auth_code == 0
                 # authentication ok
                 return socket
             else
-                close(socket)
-                throw(Error("cleartext password authentication failed: $auth_code"))
+                close_and_throw(socket, Error("cleartext password authentication failed: $auth_code"))
             end
         else
-            close(socket)
-            throw(Error("unexpected message type: $(Char(mt))"))
+            close_and_throw(socket, Error("unexpected message type: $(Char(mt))"))
         end
     elseif auth_code == 5
         # md5 salt
@@ -348,29 +362,29 @@ function authRequest(debug, len, socket, user, password, client::Union{Nothing, 
         mt, len = readheader(socket, debug)
         if mt == UInt8('E')
             # error
-            close(socket)
-            throw(errorResponse(len, socket, debug))
+            close_and_throw_error_response(socket, len, debug)
         elseif mt == UInt8('R')
             auth_code = ntoh(read(socket, Int32))
             if auth_code == 0
                 # authentication ok
                 return socket
             else
-                close(socket)
-                throw(Error("MD5 password authentication failed: $auth_code"))
+                close_and_throw(socket, Error("MD5 password authentication failed: $auth_code"))
             end
         else
-            close(socket)
-            throw(Error("unexpected message type: $(Char(mt))"))
+            close_and_throw(socket, Error("unexpected message type: $(Char(mt))"))
         end
     elseif auth_code == 7
         # GSSAPI
+        close_and_throw(socket, Error("GSSAPI authentication not supported"))
 
     elseif auth_code == 8
         # Specifies that this message contains GSSAPI or SSPI data.
+        close_and_throw(socket, Error("GSSAPI/SSPI continuation not supported"))
 
     elseif auth_code == 9
         # Specifies that SSPI authentication is required.
+        close_and_throw(socket, Error("SSPI authentication not supported"))
 
     elseif auth_code == 10
         # SASL Authentication Required
@@ -378,15 +392,14 @@ function authRequest(debug, len, socket, user, password, client::Union{Nothing, 
         mechanisms = split(data, '\0'; keepempty=false)
 
         if "SCRAM-SHA-256" ∉ mechanisms
-            close(socket)
-            throw(Error("no supported SASL mechanisms: $mechanisms"))
+            close_and_throw(socket, Error("no supported SASL mechanisms: $mechanisms"))
         end
         client = SASLAuth.SCRAMSHA256Client(user, password)
         msg, _ = SASLAuth.step!(client, nothing)
         bytes = Vector{UInt8}(msg)
         writemessage(socket, debug, 'p', "SCRAM-SHA-256", Int32(length(bytes)), bytes)
         mt, len = readheader(socket, debug)
-        @assert mt == UInt8('R')
+        expect_auth_message(socket, debug, mt, len)
         return authRequest(debug, len, socket, user, password, client)
     elseif auth_code == 11
         # SASL Challenge
@@ -394,20 +407,20 @@ function authRequest(debug, len, socket, user, password, client::Union{Nothing, 
         msg, _ = SASLAuth.step!(client, challenge)
         writemessage(socket, debug, 'p', Vector{UInt8}(msg))
         mt, len = readheader(socket, debug)
-        @assert mt == UInt8('R')
+        expect_auth_message(socket, debug, mt, len)
         return authRequest(debug, len, socket, user, password, client)
     elseif auth_code == 12
         # SASL Final Message
         final_msg = String(read(socket, len - 4))
         _, done = SASLAuth.step!(client, final_msg)
-        @assert done
+        done || close_and_throw(socket, Error("SASL authentication did not complete"))
         mt, len = readheader(socket, debug)
-        @assert mt == UInt8('R')
-        @assert ntoh(read(socket, Int32)) == 0
+        expect_auth_message(socket, debug, mt, len)
+        auth_code = ntoh(read(socket, Int32))
+        auth_code == 0 || close_and_throw(socket, Error("SASL authentication failed: $auth_code"))
         return socket
     else
-        close(socket)
-        throw(Error("unknown authentication code: $auth_code"))
+        close_and_throw(socket, Error("unknown authentication code: $auth_code"))
     end
 end
 
@@ -493,14 +506,12 @@ function connect(host::String, port::Integer, dbname::String, user::String, pass
     mt, len = readheader(socket, debug)
     if mt == UInt8('E')
         # error
-        close(socket)
-        throw(errorResponse(len, socket, debug))
+        close_and_throw_error_response(socket, len, debug)
     elseif mt == UInt8('R')
         authRequest(debug, len, socket, user, password)
     elseif mt == UInt8('v')
         # server version too old
-        close(socket)
-        throw(Error("server version too old"))
+        close_and_throw(socket, Error("server version too old"))
     end
     pid, skey, server_params = waitfor(socket, debug, 'K', 'Z')
     return socket, pid, skey, server_params
@@ -595,6 +606,24 @@ struct Exec
     debug::Bool
     notice_callback::Function
     notification_callback::Function
+    command_tag::Base.RefValue{Union{Nothing, String}}
+    rows_affected::Base.RefValue{Union{Nothing, Int}}
+end
+
+function commandComplete(len, socket)
+    buf = read(socket, len)
+    isempty(buf) && return ""
+    return unsafe_string(pointer(buf))
+end
+
+function rows_affected_from_command_tag(tag::String)
+    isempty(tag) && return nothing
+    last_token = split(tag)[end]
+    try
+        return parse(Int, last_token)
+    catch
+        return nothing
+    end
 end
 
 function StructUtils.applyeach(::PostgresStyle, f, e::Exec)
@@ -633,8 +662,9 @@ function StructUtils.applyeach(::PostgresStyle, f, e::Exec)
             f(nrows, DataRow(e.socket, e.names, e.typeIds, e.type_registry))
         elseif mt == UInt8('C')
             # command complete
-            #TODO: should we read the rows affected here and store them in Exec or something?
-            skipbytes!(e.socket, len)
+            tag = commandComplete(len, e.socket)
+            e.command_tag[] = tag
+            e.rows_affected[] = rows_affected_from_command_tag(tag)
         elseif mt == UInt8('Z')
             skipbytes!(e.socket, len)
             break
@@ -657,7 +687,7 @@ function exec(socket, stmtname::String, params::Vector{Union{String, Missing}}, 
     # bind, then execute, then sync
     writemessages(socket, debug, ('B', "", stmtname, npformats, nparams, Params(params), Int16(0)), ('E', "", Int32(rowlimit)), ('S',))
     waitfor(socket, debug, '2')
-    return Exec(socket, names, typeIds, type_registry, debug, notice_callback, notification_callback)
+    return Exec(socket, names, typeIds, type_registry, debug, notice_callback, notification_callback, Ref{Union{Nothing, String}}(nothing), Ref{Union{Nothing, Int}}(nothing))
 end
 
 function exec(socket, query::String, debug::Bool)

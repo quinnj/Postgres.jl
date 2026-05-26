@@ -23,53 +23,131 @@ function ConnectionParams(; host::String="localhost", port::Int=5432, user::Stri
     return ConnectionParams(host, port, user, password, dbname, application_name, connect_timeout, sslmode, sslrootcert, sslcert, sslkey, sslcapath, statement_timeout, statement_cache_maxsize, debug, reconnect)
 end
 
+default_user() = get(ENV, "PGUSER", get(ENV, "USER", get(ENV, "USERNAME", "")))
+
+function parse_optional_int(value::Union{String, Nothing})
+    value === nothing && return nothing
+    isempty(value) && return nothing
+    return parse(Int, value)
+end
+
+function connection_defaults()
+    user = default_user()
+    return Dict{String, String}(
+        "host" => get(ENV, "PGHOST", "localhost"),
+        "port" => get(ENV, "PGPORT", "5432"),
+        "user" => user,
+        "statement_cache_maxsize" => "100",
+    )
+end
+
+function apply_env_defaults!(values::Dict{String, String})
+    env_map = (
+        "dbname" => "PGDATABASE",
+        "password" => "PGPASSWORD",
+        "application_name" => "PGAPPNAME",
+        "connect_timeout" => "PGCONNECT_TIMEOUT",
+        "sslmode" => "PGSSLMODE",
+        "sslrootcert" => "PGSSLROOTCERT",
+        "sslcert" => "PGSSLCERT",
+        "sslkey" => "PGSSLKEY",
+        "sslcapath" => "PGSSLCAPATH",
+    )
+    for (key, envkey) in env_map
+        !haskey(values, key) && haskey(ENV, envkey) && (values[key] = ENV[envkey])
+    end
+    return values
+end
+
+function params_from_values(values::Dict{String, String})
+    merged = connection_defaults()
+    merge!(merged, values)
+    apply_env_defaults!(merged)
+    user = get(merged, "user", "")
+    dbname = get(merged, "dbname", user)
+    return ConnectionParams(
+        ;
+        host=get(merged, "host", "localhost"),
+        port=parse(Int, get(merged, "port", "5432")),
+        user=user,
+        password=get(merged, "password", nothing),
+        dbname=dbname,
+        application_name=get(merged, "application_name", nothing),
+        connect_timeout=parse_optional_int(get(merged, "connect_timeout", nothing)),
+        sslmode=haskey(merged, "sslmode") ? lowercase(merged["sslmode"]) : nothing,
+        sslrootcert=get(merged, "sslrootcert", nothing),
+        sslcert=get(merged, "sslcert", nothing),
+        sslkey=get(merged, "sslkey", nothing),
+        sslcapath=get(merged, "sslcapath", nothing),
+        statement_timeout=parse_optional_int(get(merged, "statement_timeout", nothing)),
+        statement_cache_maxsize=parse(Int, get(merged, "statement_cache_maxsize", "100")),
+    )
+end
+
+function parse_keyword_dsn(dsn::String)
+    values = Dict{String, String}()
+    i = firstindex(dsn)
+    while i <= lastindex(dsn)
+        while i <= lastindex(dsn) && (isspace(dsn[i]) || dsn[i] == ';')
+            i = nextind(dsn, i)
+        end
+        i > lastindex(dsn) && break
+        key_start = i
+        while i <= lastindex(dsn) && dsn[i] != '='
+            i = nextind(dsn, i)
+        end
+        i > lastindex(dsn) && break
+        key = lowercase(strip(dsn[key_start:prevind(dsn, i)]))
+        i = nextind(dsn, i)
+        while i <= lastindex(dsn) && isspace(dsn[i])
+            i = nextind(dsn, i)
+        end
+        buf = IOBuffer()
+        if i <= lastindex(dsn) && dsn[i] == '\''
+            i = nextind(dsn, i)
+            while i <= lastindex(dsn)
+                c = dsn[i]
+                if c == '\\'
+                    i = nextind(dsn, i)
+                    if i <= lastindex(dsn)
+                        write(buf, dsn[i])
+                        i = nextind(dsn, i)
+                    end
+                elseif c == '\''
+                    i = nextind(dsn, i)
+                    break
+                else
+                    write(buf, c)
+                    i = nextind(dsn, i)
+                end
+            end
+        else
+            while i <= lastindex(dsn) && !isspace(dsn[i]) && dsn[i] != ';'
+                c = dsn[i]
+                if c == '\\'
+                    i = nextind(dsn, i)
+                    if i <= lastindex(dsn)
+                        write(buf, dsn[i])
+                        i = nextind(dsn, i)
+                    end
+                else
+                    write(buf, c)
+                    i = nextind(dsn, i)
+                end
+            end
+        end
+        !isempty(key) && (values[key] = String(take!(buf)))
+    end
+    return values
+end
+
 function parse_dsn(dsn::String)
     lowered = lowercase(dsn)
     (startswith(lowered, "postgres://") || startswith(lowered, "postgresql://")) && return parse_uri(dsn)
-    host = "localhost"
-    port = 5432
-    user = ""
-    password = nothing
-    dbname = ""
-    application_name = nothing
-    connect_timeout = nothing
-    sslmode = nothing
-    sslrootcert = nothing
-    sslcert = nothing
-    sslkey = nothing
-    sslcapath = nothing
-    statement_timeout = nothing
-    statement_cache_maxsize = 100
-
-    parts = split(dsn, ';')
-    for part in parts
-        part = strip(part)
-        isempty(part) && continue
-        if occursin('=', part)
-            key, value = split(part, '='; limit=2)
-            key = lowercase(strip(key))
-            value = strip(value)
-            key == "host" && (host = value)
-            key == "port" && (port = parse(Int, value))
-            key == "user" && (user = value)
-            key == "password" && (password = value)
-            key == "dbname" && (dbname = value)
-            key == "application_name" && (application_name = value)
-            key == "connect_timeout" && (connect_timeout = parse(Int, value))
-            key == "sslmode" && (sslmode = lowercase(value))
-            key == "sslrootcert" && (sslrootcert = value)
-            key == "sslcert" && (sslcert = value)
-            key == "sslkey" && (sslkey = value)
-            key == "sslcapath" && (sslcapath = value)
-            key == "statement_timeout" && (statement_timeout = parse(Int, value))
-            key == "statement_cache_maxsize" && (statement_cache_maxsize = parse(Int, value))
-        end
-    end
-
-    return ConnectionParams(; host=host, port=port, user=user, password=password, dbname=dbname, application_name=application_name, connect_timeout=connect_timeout, sslmode=sslmode, sslrootcert=sslrootcert, sslcert=sslcert, sslkey=sslkey, sslcapath=sslcapath, statement_timeout=statement_timeout, statement_cache_maxsize=statement_cache_maxsize)
+    return params_from_values(parse_keyword_dsn(dsn))
 end
 
-function url_decode(val::String)
+function url_decode(val::AbstractString; plus_as_space::Bool=false)
     buf = IOBuffer()
     i = 1
     while i <= lastindex(val)
@@ -79,94 +157,72 @@ function url_decode(val::String)
             hex = val[i + 1:i + 2]
             write(buf, UInt8(parse(Int, hex; base=16)))
             i += 3
-        elseif c == '+'
+        elseif c == '+' && plus_as_space
             write(buf, UInt8(' '))
             i += 1
         else
-            write(buf, UInt8(codeunit(val, i)))
+            write(buf, c)
             i = nextind(val, i)
         end
     end
     return String(take!(buf))
 end
 
-function parse_query_params(query::String)
+function parse_query_params(query::AbstractString)
     params = Dict{String, String}()
     for pair in split(query, '&')
         isempty(pair) && continue
-        key, value = split(pair, '='; limit=2)
-        params[url_decode(key)] = url_decode(value)
+        key, value = occursin('=', pair) ? split(pair, '='; limit=2) : (pair, "")
+        params[url_decode(key; plus_as_space=true)] = url_decode(value; plus_as_space=true)
     end
     return params
 end
 
 function parse_uri(uri::String)
     lowered = lowercase(uri)
-    startswith(lowered, "postgres://") && (uri = uri[12:end])
-    startswith(lowered, "postgresql://") && (uri = uri[15:end])
-    user = ""
-    password = nothing
-    host = "localhost"
-    port = 5432
-    dbname = ""
-    application_name = nothing
-    connect_timeout = nothing
-    sslmode = nothing
-    sslrootcert = nothing
-    sslcert = nothing
-    sslkey = nothing
-    sslcapath = nothing
-    statement_timeout = nothing
-    statement_cache_maxsize = 100
+    startswith(lowered, "postgres://") && (uri = uri[lastindex("postgres://") + 1:end])
+    startswith(lowered, "postgresql://") && (uri = uri[lastindex("postgresql://") + 1:end])
+    values = Dict{String, String}()
     main, query = occursin('?', uri) ? split(uri, '?'; limit=2) : (uri, "")
     userinfo, hostpart = occursin('@', main) ? split(main, '@'; limit=2) : ("", main)
     if !isempty(userinfo)
         if occursin(':', userinfo)
             usr, pwd = split(userinfo, ':'; limit=2)
-            user = url_decode(usr)
-            password = url_decode(pwd)
+            values["user"] = url_decode(usr)
+            values["password"] = url_decode(pwd)
         else
-            user = url_decode(userinfo)
+            values["user"] = url_decode(userinfo)
         end
     end
     hostport, db = occursin('/', hostpart) ? split(hostpart, '/'; limit=2) : (hostpart, "")
-    !isempty(db) && (dbname = url_decode(db))
+    !isempty(db) && (values["dbname"] = url_decode(db))
     if startswith(hostport, "[")
         closing = findfirst(isequal(']'), hostport)
-        closing === nothing || (host = hostport[2:closing - 1])
+        closing === nothing || (values["host"] = hostport[2:closing - 1])
         rest = closing === nothing ? "" : hostport[closing + 1:end]
         if startswith(rest, ":")
-            port = parse(Int, rest[2:end])
+            values["port"] = rest[2:end]
         end
     elseif !isempty(hostport)
         if occursin(':', hostport)
             host_str, port_str = split(hostport, ':'; limit=2)
-            host = url_decode(host_str)
-            port = parse(Int, port_str)
+            values["host"] = url_decode(host_str)
+            values["port"] = port_str
         else
-            host = url_decode(hostport)
+            values["host"] = url_decode(hostport)
         end
     end
     if !isempty(query)
         params = parse_query_params(query)
-        haskey(params, "user") && (user = params["user"])
-        haskey(params, "password") && (password = params["password"])
-        haskey(params, "dbname") && (dbname = params["dbname"])
-        haskey(params, "application_name") && (application_name = params["application_name"])
-        haskey(params, "connect_timeout") && (connect_timeout = parse(Int, params["connect_timeout"]))
-        haskey(params, "sslmode") && (sslmode = lowercase(params["sslmode"]))
-        haskey(params, "sslrootcert") && (sslrootcert = params["sslrootcert"])
-        haskey(params, "sslcert") && (sslcert = params["sslcert"])
-        haskey(params, "sslkey") && (sslkey = params["sslkey"])
-        haskey(params, "sslcapath") && (sslcapath = params["sslcapath"])
-        haskey(params, "statement_timeout") && (statement_timeout = parse(Int, params["statement_timeout"]))
-        haskey(params, "statement_cache_maxsize") && (statement_cache_maxsize = parse(Int, params["statement_cache_maxsize"]))
+        for key in ("user", "password", "dbname", "application_name", "connect_timeout", "sslmode", "sslrootcert", "sslcert", "sslkey", "sslcapath", "statement_timeout", "statement_cache_maxsize")
+            haskey(params, key) && (values[key] = params[key])
+        end
     end
-    return ConnectionParams(; host=host, port=port, user=user, password=password, dbname=dbname, application_name=application_name, connect_timeout=connect_timeout, sslmode=sslmode, sslrootcert=sslrootcert, sslcert=sslcert, sslkey=sslkey, sslcapath=sslcapath, statement_timeout=statement_timeout, statement_cache_maxsize=statement_cache_maxsize)
+    return params_from_values(values)
 end
 
 function parse_dsn(dsn::Nothing)
-    return ConnectionParams()
+    return params_from_values(Dict{String, String}())
 end
 
 export ConnectionParams, parse_dsn

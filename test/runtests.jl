@@ -274,6 +274,69 @@ INSERT INTO types_test (
 end
 
 @testset "Postgres" begin
+    @testset "Connection String Parsing" begin
+        params = Postgres.parse_dsn("host=127.0.0.1 port=5433 user='post gres' password='pa ss' dbname=mydb application_name='my app' sslmode=disable")
+        @test params.host == "127.0.0.1"
+        @test params.port == 5433
+        @test params.user == "post gres"
+        @test params.password == "pa ss"
+        @test params.dbname == "mydb"
+        @test params.application_name == "my app"
+        @test params.sslmode == "disable"
+
+        semicolon_params = Postgres.parse_dsn("host=localhost;port=5434;user=postgres;dbname=postgres;statement_cache_maxsize=7")
+        @test semicolon_params.host == "localhost"
+        @test semicolon_params.port == 5434
+        @test semicolon_params.statement_cache_maxsize == 7
+
+        uri_params = Postgres.parse_dsn("postgresql://postgres:secret@[::1]:5435/postgres?connect_timeout=2&sslmode=require")
+        @test uri_params.host == "::1"
+        @test uri_params.port == 5435
+        @test uri_params.user == "postgres"
+        @test uri_params.password == "secret"
+        @test uri_params.dbname == "postgres"
+        @test uri_params.connect_timeout == 2
+        @test uri_params.sslmode == "require"
+
+        default_db_params = Postgres.parse_dsn("postgresql://bob@localhost")
+        @test default_db_params.user == "bob"
+        @test default_db_params.dbname == "bob"
+
+        unicode_params = Postgres.parse_dsn("postgresql://usér@localhost/café")
+        @test unicode_params.user == "usér"
+        @test unicode_params.dbname == "café"
+
+        plus_params = Postgres.parse_dsn("postgresql://plus+user:p+ss@localhost/db+name?application_name=my+app")
+        @test plus_params.user == "plus+user"
+        @test plus_params.password == "p+ss"
+        @test plus_params.dbname == "db+name"
+        @test plus_params.application_name == "my app"
+
+        withenv(
+            "PGHOST" => "envhost",
+            "PGPORT" => "5544",
+            "PGUSER" => "envuser",
+            "PGPASSWORD" => "envpass",
+            "PGDATABASE" => "envdb",
+            "PGAPPNAME" => "envapp",
+            "PGCONNECT_TIMEOUT" => "3",
+        ) do
+            env_params = Postgres.parse_dsn(nothing)
+            @test env_params.host == "envhost"
+            @test env_params.port == 5544
+            @test env_params.user == "envuser"
+            @test env_params.password == "envpass"
+            @test env_params.dbname == "envdb"
+            @test env_params.application_name == "envapp"
+            @test env_params.connect_timeout == 3
+
+            mixed_params = Postgres.parse_dsn("host=explicit")
+            @test mixed_params.host == "explicit"
+            @test mixed_params.user == "envuser"
+            @test mixed_params.dbname == "envdb"
+        end
+    end
+
     if !docker_available()
         @info "Docker not available; skipping Postgres integration tests."
         @test true
@@ -287,7 +350,14 @@ end
                         @test isopen(conn_trust)
                         DBInterface.close!(conn_trust)
                     else
-                        @test_throws Postgres.API.Error DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, "wrong"; dbname=cfg.dbname, port=cfg.port)
+                        err = try
+                            DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, "wrong"; dbname=cfg.dbname, port=cfg.port)
+                            nothing
+                        catch err
+                            err
+                        end
+                        @test err isa Postgres.API.Error
+                        @test err.code == "28P01"
                     end
                     @test isopen(conn)
                 end
@@ -324,6 +394,15 @@ end
                     @test length(rows) == 1
                     @test rows[1].a == 1
                     @test rows[1].b == 2
+                    @test Postgres.command_tag(res) == "SELECT 1"
+                    @test Postgres.rows_affected(res) == 1
+                    DBInterface.execute(conn, "CREATE TEMP TABLE command_tag_test (id int)")
+                    insert_res = DBInterface.execute(conn, "INSERT INTO command_tag_test VALUES (1), (2)")
+                    @test Postgres.command_tag(insert_res) == "INSERT 0 2"
+                    @test Postgres.rows_affected(insert_res) == 2
+                    update_res = DBInterface.execute(conn, "UPDATE command_tag_test SET id = id + 1")
+                    @test Postgres.command_tag(update_res) == "UPDATE 2"
+                    @test Postgres.rows_affected(update_res) == 2
                 end
                 @testset "Type Parsing" begin
                     id, expected = setup_types(conn)
@@ -363,6 +442,20 @@ end
                     @test JSON.parse(typed.json_col)["a"] == 1
                     @test JSON.parse(typed.jsonb_col)["x"] == true
                 @test typed.int_array == expected[23]
+                    bytea_param = UInt8[0xde, 0xad, 0xbe, 0xef]
+                    bytea_row = only(Tables.rowtable(DBInterface.execute(conn, raw"SELECT $1::bytea AS bytea_col", (bytea_param,))))
+                    @test bytea_row.bytea_col == bytea_param
+                    array_types_row = only(Tables.rowtable(DBInterface.execute(conn, """
+                        SELECT
+                            ARRAY['12345678-1234-5678-1234-567812345678']::uuid[] AS uuid_array,
+                            ARRAY[DATE '2024-01-28']::date[] AS date_array,
+                            ARRAY['123.45'::numeric, NULL]::numeric[] AS numeric_array,
+                            ARRAY['{"a":1}'::jsonb]::jsonb[] AS jsonb_array
+                    """)))
+                    @test array_types_row.uuid_array == UUID[UUID("12345678-1234-5678-1234-567812345678")]
+                    @test array_types_row.date_array == Date[Date(2024, 1, 28)]
+                    @test isequal(array_types_row.numeric_array, Union{Missing, Postgres.Numeric}[Postgres.API.parse_numeric("123.45"), missing])
+                    @test JSON.parse(only(array_types_row.jsonb_array))["a"] == 1
                 end
 
                 @testset "Type Registry" begin
@@ -668,10 +761,11 @@ end
                     DBInterface.close!(cancel_conn)
                 end
 
-                @testset "Unsupported Types" begin
+                @testset "Interval Types" begin
                     interval_row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT '1 day'::interval AS interval_col")))
-                    @test interval_row.interval_col isa String
-                    @test_broken interval_row.interval_col isa Dates.Period
+                    @test interval_row.interval_col == Dates.Day(1)
+                    complex_interval = only(Tables.rowtable(DBInterface.execute(conn, "SELECT '1 year 2 mons 3 days 04:05:06.789'::interval AS interval_col")))
+                    @test complex_interval.interval_col == Dates.CompoundPeriod(Dates.Year(1), Dates.Month(2), Dates.Day(3), Dates.Hour(4), Dates.Minute(5), Dates.Second(6), Dates.Millisecond(789))
                 end
             finally
                 isopen(conn) && DBInterface.close!(conn)

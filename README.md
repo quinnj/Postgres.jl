@@ -29,6 +29,9 @@ DBInterface.close!(conn)
 
 Connection options support:
 
+- libpq-style keyword strings such as `host=127.0.0.1 port=5432 user=postgres dbname=postgres`.
+- PostgreSQL URIs such as `postgresql://postgres:postgres@127.0.0.1:5432/postgres`.
+- Environment defaults: `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGAPPNAME`, `PGCONNECT_TIMEOUT`, and TLS-related `PGSSL*` variables.
 - `sslmode` values: `disable`, `prefer`, `require`, `verify-full` (only `verify-full` enforces certificate verification).
 - TLS files: `sslrootcert`, `sslcert`, `sslkey`, `sslcapath`.
 - `connect_timeout` (seconds) and `statement_timeout` (milliseconds).
@@ -55,6 +58,8 @@ rows = Tables.rowtable(DBInterface.execute(stmt, (7,)))
 DBInterface.close!(stmt)
 DBInterface.close!(conn)
 ```
+
+`Postgres.command_tag(result)` and `Postgres.rows_affected(result)` expose PostgreSQL command completion metadata.
 
 Statement caching is LRU-based. Set `statement_cache_maxsize=0` to disable caching.
 
@@ -135,7 +140,7 @@ row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT 'happy'::mood AS mo
 DBInterface.close!(conn)
 ```
 
-`Numeric` values are returned as `Postgres.Numeric` and range types as `Postgres.PostgresRange{T}`.
+`Numeric` values are returned as `Postgres.Numeric`, `interval` values as `Dates.Period` or `Dates.CompoundPeriod`, and range types as `Postgres.PostgresRange{T}`.
 
 ## Query logging
 

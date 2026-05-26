@@ -10,10 +10,14 @@ struct Result <: AbstractVector{ResultRow}
     names::Vector{Symbol}
     types::Vector{Type}
     rows::Vector{ResultRow}
+    command_tag::Union{Nothing, String}
+    rows_affected::Union{Nothing, Int}
 end
 
 Base.size(r::Result) = (length(r.rows),)
 Base.getindex(r::Result, i::Integer) = r.rows[i]
+command_tag(r::Result) = r.command_tag
+rows_affected(r::Result) = r.rows_affected
 
 getdata(r::ResultRow) = getfield(r, :data)
 getnames(r::ResultRow) = getfield(r, :names)
@@ -164,6 +168,7 @@ _param(x::AbstractString) = String(x)
 _param(x) = string(x)
 _param(x::Missing) = x
 _param(::Nothing) = missing
+_param(x::AbstractVector{UInt8}) = string("\\x", bytes2hex(x))
 # convert to postgres array literal syntax: { x, y, z }
 # strings must be double-quoted and double quotes and backslashes escaped
 # missing values are NULL
@@ -225,7 +230,7 @@ function makeresult(e::API.Exec)
         StructUtils.applyeach(PostgresStyle(), RowClosure(data, types, 1), row)
         push!(rows, ResultRow(data, names, types, lookup, i))
     end
-    return Result(names, types, rows)
+    return Result(names, types, rows, e.command_tag[], e.rows_affected[])
 end
 
 function read_portal_batch!(cursor::Cursor)

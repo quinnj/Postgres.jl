@@ -15,7 +15,7 @@ jobs:
       fail-fast: false
       matrix:
         version:
-          - '1.6'
+          - '1.10'
           - '1' # automatically expands to the latest stable 1.x release of Julia
           - nightly
         os:
@@ -50,13 +50,35 @@ jobs:
       - uses: codecov/codecov-action@v1
         with:
           file: lcov.info
+  auth-modes:
+    name: Auth ${{ matrix.auth }} - Julia 1 - ubuntu-latest
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        auth:
+          - scram-sha-256
+          - md5
+    env:
+      POSTGRES_HOST_AUTH_METHOD: ${{ matrix.auth }}
+      POSTGRES_INITDB_ARGS: --auth-host=${{ matrix.auth }}
+    steps:
+      - uses: actions/checkout@v2
+      - uses: julia-actions/setup-julia@v1
+        with:
+          version: '1'
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-runtest@v1
   docs:
     name: Documentation
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
-      - uses: julia-actions/julia-buildpkg@latest
-      - uses: julia-actions/julia-docdeploy@latest
+      - uses: julia-actions/setup-julia@v1
+        with:
+          version: '1'
+      - run: julia --project=docs -e 'using Pkg; Pkg.instantiate()'
+      - run: julia --project=docs docs/make.jl
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}

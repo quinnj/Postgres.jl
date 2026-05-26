@@ -13,6 +13,8 @@ Pkg.add("Postgres")
 
 Postgres.jl accepts DSN strings or PostgreSQL URIs and supports:
 
+- libpq-style keyword strings such as `host=127.0.0.1 port=5432 user=postgres dbname=postgres`.
+- Environment defaults from `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGAPPNAME`, `PGCONNECT_TIMEOUT`, and TLS-related `PGSSL*` variables.
 - `sslmode` values: `disable`, `prefer`, `require`, `verify-full` (only `verify-full` verifies certificates).
 - TLS files: `sslrootcert`, `sslcert`, `sslkey`, `sslcapath`.
 - `connect_timeout` (seconds), `statement_timeout` (milliseconds).
@@ -44,6 +46,8 @@ rows = Tables.rowtable(DBInterface.execute(stmt, (7,)))
 DBInterface.close!(stmt)
 DBInterface.close!(conn)
 ```
+
+`Postgres.command_tag(result)` and `Postgres.rows_affected(result)` expose PostgreSQL command completion metadata.
 
 ## Transactions
 
@@ -111,7 +115,7 @@ row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT 'happy'::mood AS mo
 DBInterface.close!(conn)
 ```
 
-`Numeric` values are represented by `Postgres.Numeric`. Range types are parsed as `Postgres.PostgresRange{T}`.
+`Numeric` values are represented by `Postgres.Numeric`, `interval` values by `Dates.Period` or `Dates.CompoundPeriod`, and range types by `Postgres.PostgresRange{T}`.
 
 ## Query logging
 

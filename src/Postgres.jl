@@ -2,7 +2,7 @@ module Postgres
 
 using DBInterface, Dates, UUIDs, Parsers, Tables, StructUtils, JSON, ConcurrentUtilities, Reseau
 
-export DBInterface, PostgresInterfaceError, start_transaction, commit, rollback, in_transaction, transaction, ConnectionParams, parse_dsn, get_cached_statements, clear_statement_cache!, set_statement_cache_maxsize!, get_server_parameter, get_server_parameters, Error, Notification, Numeric, PostgresRange, register_type!, register_enum!, register_composite!, register_range!, set_notice_callback!, get_notice_callback, set_notification_callback!, get_notification_callback, set_query_logger!, get_query_logger, set_statement_timeout!, get_statement_timeout, copy_from, copy_to, listen!, unlisten!, notify!, wait_for_notification, cursor, ConnectionPool, acquire, release, with_connection
+export DBInterface, PostgresInterfaceError, start_transaction, commit, rollback, in_transaction, transaction, ConnectionParams, parse_dsn, get_cached_statements, clear_statement_cache!, set_statement_cache_maxsize!, get_server_parameter, get_server_parameters, Error, Notification, Numeric, PostgresRange, register_type!, register_enum!, register_composite!, register_range!, set_notice_callback!, get_notice_callback, set_notification_callback!, get_notification_callback, set_query_logger!, get_query_logger, set_statement_timeout!, get_statement_timeout, copy_from, copy_to, listen!, unlisten!, notify!, wait_for_notification, cursor, ConnectionPool, acquire, release, with_connection, command_tag, rows_affected
 
 # For non-api errors that happen in Postgres.jl
 struct PostgresInterfaceError
