@@ -29,7 +29,18 @@ jobs:
           - os: windows-latest
             arch: x64
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        shell: bash
+        run: |
+          git init .
+          git remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            ref="${{ github.event.pull_request.head.sha }}"
+          else
+            ref="$GITHUB_SHA"
+          fi
+          git fetch --no-tags --depth=1 origin "$ref"
+          git checkout --force FETCH_HEAD
       - name: Install Julia
         run: python .github/scripts/install-julia.py "${{ matrix.version }}" "${{ runner.os }}" "${{ matrix.arch }}"
       - name: Julia version
@@ -51,7 +62,18 @@ jobs:
       POSTGRES_HOST_AUTH_METHOD: ${{ matrix.auth }}
       POSTGRES_INITDB_ARGS: --auth-host=${{ matrix.auth }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        shell: bash
+        run: |
+          git init .
+          git remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            ref="${{ github.event.pull_request.head.sha }}"
+          else
+            ref="$GITHUB_SHA"
+          fi
+          git fetch --no-tags --depth=1 origin "$ref"
+          git checkout --force FETCH_HEAD
       - name: Install Julia
         run: python .github/scripts/install-julia.py "1" "${{ runner.os }}" "x64"
       - name: Build package
@@ -62,7 +84,18 @@ jobs:
     name: Documentation
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        shell: bash
+        run: |
+          git init .
+          git remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            ref="${{ github.event.pull_request.head.sha }}"
+          else
+            ref="$GITHUB_SHA"
+          fi
+          git fetch --no-tags --depth=1 origin "$ref"
+          git checkout --force FETCH_HEAD
       - name: Install Julia
         run: python .github/scripts/install-julia.py "1" "${{ runner.os }}" "x64"
       - run: julia --project=docs -e 'using Pkg; Pkg.instantiate()'
