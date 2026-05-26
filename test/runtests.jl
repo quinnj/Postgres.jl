@@ -77,12 +77,12 @@ function pick_port()
     return port
 end
 
-function wait_for_connection(cfg::PgConfig; timeout::Float64=60.0)
+function wait_for_connection(cfg::PgConfig; timeout::Float64=60.0, sslmode::Union{Nothing, String}=nothing, sslrootcert::Union{Nothing, String}=nothing)
     start_time = time()
     last_err = nothing
     while time() - start_time < timeout
         try
-            return DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, cfg.password; dbname=cfg.dbname, port=cfg.port, connect_timeout=2)
+            return DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, cfg.password; dbname=cfg.dbname, port=cfg.port, connect_timeout=2, sslmode=sslmode, sslrootcert=sslrootcert)
         catch err
             last_err = err
             sleep(0.5)
@@ -112,6 +112,112 @@ function with_postgres(f::Function)
         cfg = PgConfig("127.0.0.1", host_port, DEFAULT_USER, DEFAULT_PASSWORD, DEFAULT_DB)
         return f(cfg)
     end
+end
+
+function run_openssl(args::String...)
+    openssl = Sys.which("openssl")
+    openssl === nothing && error("OpenSSL executable not found")
+    run(pipeline(Cmd([openssl, args...]); stdout=devnull, stderr=devnull))
+end
+
+function ssl_postgres_command()
+    setup_script = """
+set -eu
+certdir=/tmp/postgres-jl-certs
+mkdir -p "\$certdir"
+cp /certs/server.crt "\$certdir/server.crt"
+cp /certs/server.key "\$certdir/server.key"
+cp /certs/root.crt "\$certdir/root.crt"
+chown postgres:postgres "\$certdir/server.crt" "\$certdir/server.key" "\$certdir/root.crt"
+chmod 0644 "\$certdir/server.crt" "\$certdir/root.crt"
+chmod 0600 "\$certdir/server.key"
+exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file="\$certdir/server.crt" -c ssl_key_file="\$certdir/server.key" -c ssl_ca_file="\$certdir/root.crt"
+"""
+    return ["sh", "-c", setup_script]
+end
+
+function generate_ssl_material(dir::AbstractString)
+    root_key = joinpath(dir, "root.key")
+    root_cert = joinpath(dir, "root.crt")
+    wrong_root_key = joinpath(dir, "wrong-root.key")
+    wrong_root_cert = joinpath(dir, "wrong-root.crt")
+    server_key = joinpath(dir, "server.key")
+    server_csr = joinpath(dir, "server.csr")
+    server_cert = joinpath(dir, "server.crt")
+    server_config = joinpath(dir, "server-openssl.cnf")
+
+    open(server_config, "w") do io
+        write(io, """
+[req]
+distinguished_name = req_distinguished_name
+prompt = no
+req_extensions = v3_req
+
+[req_distinguished_name]
+CN = 127.0.0.1
+
+[v3_req]
+basicConstraints = CA:FALSE
+keyUsage = digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+subjectAltName = @alt_names
+
+[alt_names]
+IP.1 = 127.0.0.1
+""")
+    end
+
+    run_openssl("req", "-x509", "-newkey", "rsa:2048", "-days", "1", "-nodes", "-keyout", root_key, "-out", root_cert, "-subj", "/CN=Postgres.jl Test Root CA")
+    run_openssl("req", "-x509", "-newkey", "rsa:2048", "-days", "1", "-nodes", "-keyout", wrong_root_key, "-out", wrong_root_cert, "-subj", "/CN=Postgres.jl Wrong Root CA")
+    run_openssl("req", "-new", "-newkey", "rsa:2048", "-nodes", "-keyout", server_key, "-out", server_csr, "-config", server_config)
+    run_openssl("x509", "-req", "-in", server_csr, "-CA", root_cert, "-CAkey", root_key, "-CAcreateserial", "-out", server_cert, "-days", "1", "-sha256", "-extensions", "v3_req", "-extfile", server_config)
+    chmod(server_key, 0o600)
+
+    return (rootcert=root_cert, wrongrootcert=wrong_root_cert, certdir=dir)
+end
+
+function with_ssl_postgres(f::Function)
+    image, tag = parse_image_ref(IMAGE_REF)
+    host_port = pick_port()
+    env = Dict(
+        "POSTGRES_USER" => DEFAULT_USER,
+        "POSTGRES_PASSWORD" => DEFAULT_PASSWORD,
+        "POSTGRES_DB" => DEFAULT_DB,
+        "POSTGRES_HOST_AUTH_METHOD" => DEFAULT_AUTH,
+        "POSTGRES_INITDB_ARGS" => DEFAULT_INITDB_ARGS,
+    )
+    mktempdir(@__DIR__) do dir
+        tls = generate_ssl_material(dir)
+        Harbor.with_container(
+            image;
+            tag=tag,
+            ports=Dict(5432 => host_port),
+            volumes=Dict(
+                "/certs" => tls.certdir,
+            ),
+            environment=env,
+            command=ssl_postgres_command(),
+            wait_strategy=(pattern="database system is ready to accept connections",),
+        ) do _
+            cfg = PgConfig("127.0.0.1", host_port, DEFAULT_USER, DEFAULT_PASSWORD, DEFAULT_DB)
+            return f(cfg, tls)
+        end
+    end
+end
+
+function connection_error(host::AbstractString, cfg::PgConfig; sslmode::Union{Nothing, String}=nothing, sslrootcert::Union{Nothing, String}=nothing)
+    try
+        conn = DBInterface.connect(Postgres.Connection, host, cfg.user, cfg.password; dbname=cfg.dbname, port=cfg.port, connect_timeout=2, sslmode=sslmode, sslrootcert=sslrootcert)
+        DBInterface.close!(conn)
+        return nothing
+    catch err
+        return err
+    end
+end
+
+function connection_uses_ssl(conn::Postgres.Connection)
+    row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")))
+    return row.ssl
 end
 
 function setup_types(conn::Postgres.Connection)
@@ -769,6 +875,42 @@ end
                 end
             finally
                 isopen(conn) && DBInterface.close!(conn)
+            end
+        end
+
+        @testset "SSL Certificate Fixture" begin
+            if Sys.which("openssl") === nothing
+                @info "OpenSSL executable not available; skipping certificate-backed SSL tests."
+                @test true
+            else
+                with_ssl_postgres() do ssl_cfg, tls
+                    require_conn = wait_for_connection(ssl_cfg; sslmode="require")
+                    try
+                        @test isopen(require_conn)
+                        @test connection_uses_ssl(require_conn)
+                    finally
+                        isopen(require_conn) && DBInterface.close!(require_conn)
+                    end
+
+                    verify_conn = DBInterface.connect(Postgres.Connection, ssl_cfg.host, ssl_cfg.user, ssl_cfg.password; dbname=ssl_cfg.dbname, port=ssl_cfg.port, sslmode="verify-full", sslrootcert=tls.rootcert)
+                    try
+                        @test isopen(verify_conn)
+                        @test connection_uses_ssl(verify_conn)
+                    finally
+                        isopen(verify_conn) && DBInterface.close!(verify_conn)
+                    end
+
+                    @test connection_error(ssl_cfg.host, ssl_cfg; sslmode="verify-full") !== nothing
+                    @test connection_error(ssl_cfg.host, ssl_cfg; sslmode="verify-full", sslrootcert=tls.wrongrootcert) !== nothing
+
+                    localhost_require_err = connection_error("localhost", ssl_cfg; sslmode="require")
+                    if localhost_require_err === nothing
+                        @test connection_error("localhost", ssl_cfg; sslmode="verify-full", sslrootcert=tls.rootcert) !== nothing
+                    else
+                        @info "localhost did not route to the Docker PostgreSQL port; skipping hostname mismatch check." error=sprint(showerror, localhost_require_err)
+                        @test true
+                    end
+                end
             end
         end
     end
