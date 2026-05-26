@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1.0"/><title>Home · Postgres.jl</title><meta name="title" content="Home · Postgres.jl"/><meta property="og:title" content="Home · Postgres.jl"/><meta property="twitter:title" content="Home · Postgres.jl"/><meta name="description" content="Documentation for Postgres.jl."/><meta property="og:description" content="Documentation for Postgres.jl."/><meta property="twitter:description" content="Documentation for Postgres.jl."/><script data-outdated-warner src="assets/warner.js"></script><link href="https://cdnjs.cloudflare.com/ajax/libs/lato-font/3.0.0/css/lato-font.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/juliamono/0.050/juliamono.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/fontawesome.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/solid.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/brands.min.css" rel="stylesheet" type="text/css"/><link href="https://cdnjs.cloudflare.com/ajax/libs/KaTeX/0.16.8/katex.min.css" rel="stylesheet" type="text/css"/><script>documenterBaseURL="."</script><script src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.6/require.min.js" data-main="assets/documenter.js"></script><script src="search_index.js"></script><script src="siteinfo.js"></script><script src="../versions.js"></script><link class="docs-theme-link" rel="stylesheet" type="text/css" href="assets/themes/catppuccin-mocha.css" data-theme-name="catppuccin-mocha"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="assets/themes/catppuccin-macchiato.css" data-theme-name="catppuccin-macchiato"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="assets/themes/catppuccin-frappe.css" data-theme-name="catppuccin-frappe"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="assets/themes/catppuccin-latte.css" data-theme-name="catppuccin-latte"/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="assets/themes/documenter-dark.css" data-theme-name="documenter-dark" data-theme-primary-dark/><link class="docs-theme-link" rel="stylesheet" type="text/css" href="assets/themes/documenter-light.css" data-theme-name="documenter-light" data-theme-primary/><script src="assets/themeswap.js"></script></head><body><div id="documenter"><nav class="docs-sidebar"><div class="docs-package-name"><span class="docs-autofit"><a href>Postgres.jl</a></span></div><button class="docs-search-query input is-rounded is-small is-clickable my-2 mx-auto py-1 px-2" id="documenter-search-query">Search docs (Ctrl + /)</button><ul class="docs-menu"><li class="is-active"><a class="tocitem" href>Home</a><ul class="internal"><li><a class="tocitem" href="#Installation"><span>Installation</span></a></li><li><a class="tocitem" href="#Connection-options"><span>Connection options</span></a></li><li><a class="tocitem" href="#Query-execution"><span>Query execution</span></a></li><li><a class="tocitem" href="#StructUtils-results"><span>StructUtils results</span></a></li><li><a class="tocitem" href="#Transactions"><span>Transactions</span></a></li><li><a class="tocitem" href="#COPY-protocol"><span>COPY protocol</span></a></li><li><a class="tocitem" href="#LISTEN/NOTIFY"><span>LISTEN/NOTIFY</span></a></li><li><a class="tocitem" href="#Cursor-streaming"><span>Cursor streaming</span></a></li><li><a class="tocitem" href="#Type-registry"><span>Type registry</span></a></li><li><a class="tocitem" href="#Query-logging"><span>Query logging</span></a></li><li><a class="tocitem" href="#Connection-pooling"><span>Connection pooling</span></a></li><li><a class="tocitem" href="#Errors-and-cancellation"><span>Errors and cancellation</span></a></li></ul></li><li><a class="tocitem" href="manual/">Manual</a></li></ul><div class="docs-version-selector field has-addons"><div class="control"><span class="docs-label button is-static is-size-7">Version</span></div><div class="docs-selector control is-expanded"><div class="select is-fullwidth is-size-7"><select id="documenter-version-selector"></select></div></div></div></nav><div class="docs-main"><header class="docs-navbar"><a class="docs-sidebar-button docs-navbar-link fa-solid fa-bars is-hidden-desktop" id="documenter-sidebar-button" href="#"></a><nav class="breadcrumb"><ul class="is-hidden-mobile"><li class="is-active"><a href>Home</a></li></ul><ul class="is-hidden-tablet"><li class="is-active"><a href>Home</a></li></ul></nav><div class="docs-right"><a class="docs-navbar-link" href="https://github.com/quinnj/Postgres.jl" title="View the repository on GitHub"><span class="docs-icon fa-brands"></span><span class="docs-label is-hidden-touch">GitHub</span></a><a class="docs-navbar-link" href="https://github.com/quinnj/Postgres.jl/blob/main/docs/src/index.md" title="Edit source on GitHub"><span class="docs-icon fa-solid"></span></a><a class="docs-settings-button docs-navbar-link fa-solid fa-gear" id="documenter-settings-button" href="#" title="Settings"></a><a class="docs-article-toggle-button fa-solid fa-chevron-up" id="documenter-article-toggle-button" href="javascript:;" title="Collapse all docstrings"></a></div></header><article class="content" id="documenter-page"><h1 id="Postgres.jl"><a class="docs-heading-anchor" href="#Postgres.jl">Postgres.jl</a><a id="Postgres.jl-1"></a><a class="docs-heading-anchor-permalink" href="#Postgres.jl" title="Permalink"></a></h1><p>Postgres.jl is a PostgreSQL client that speaks the v3 wire protocol with <code>DBInterface</code> and <code>Tables</code> integration.</p><p>See the <a href="manual/#Manual">Manual</a> for a guided walk through connections, queries, prepared statements, transactions, cancellation, notifications, and type translation.</p><h2 id="Installation"><a class="docs-heading-anchor" href="#Installation">Installation</a><a id="Installation-1"></a><a class="docs-heading-anchor-permalink" href="#Installation" title="Permalink"></a></h2><pre><code class="language-julia hljs">import Pkg
+Pkg.add(&quot;Postgres&quot;)</code></pre><h2 id="Connection-options"><a class="docs-heading-anchor" href="#Connection-options">Connection options</a><a id="Connection-options-1"></a><a class="docs-heading-anchor-permalink" href="#Connection-options" title="Permalink"></a></h2><p>Postgres.jl accepts DSN strings or PostgreSQL URIs and supports:</p><ul><li>libpq-style keyword strings such as <code>host=127.0.0.1 port=5432 user=postgres dbname=postgres</code>.</li><li>Environment defaults from <code>PGHOST</code>, <code>PGPORT</code>, <code>PGUSER</code>, <code>PGPASSWORD</code>, <code>PGDATABASE</code>, <code>PGAPPNAME</code>, <code>PGCONNECT_TIMEOUT</code>, and TLS-related <code>PGSSL*</code> variables.</li><li><code>sslmode</code> values: <code>disable</code>, <code>prefer</code>, <code>require</code>, <code>verify-full</code> (only <code>verify-full</code> verifies certificates).</li><li>TLS files: <code>sslrootcert</code>, <code>sslcert</code>, <code>sslkey</code>, <code>sslcapath</code>.</li><li><code>connect_timeout</code> (seconds), <code>statement_timeout</code> (milliseconds).</li><li><code>application_name</code> and <code>statement_cache_maxsize</code>.</li></ul><pre><code class="language-julia hljs">using Postgres, DBInterface
+conn = DBInterface.connect(Postgres.Connection, &quot;postgresql://postgres:postgres@127.0.0.1:5432/postgres?sslmode=disable&quot;)
+DBInterface.close!(conn)</code></pre><h2 id="Query-execution"><a class="docs-heading-anchor" href="#Query-execution">Query execution</a><a id="Query-execution-1"></a><a class="docs-heading-anchor-permalink" href="#Query-execution" title="Permalink"></a></h2><pre><code class="language-julia hljs">using Postgres, DBInterface, Tables
+conn = DBInterface.connect(Postgres.Connection, &quot;host=127.0.0.1;user=postgres;password=postgres;dbname=postgres&quot;)
+rows = Tables.rowtable(DBInterface.execute(conn, &quot;SELECT $1::int AS val&quot;, (42,)))
+@show rows[1].val
+DBInterface.close!(conn)</code></pre><h2 id="StructUtils-results"><a class="docs-heading-anchor" href="#StructUtils-results">StructUtils results</a><a id="StructUtils-results-1"></a><a class="docs-heading-anchor-permalink" href="#StructUtils-results" title="Permalink"></a></h2><p>Postgres.jl integrates with StructUtils.jl, so query results can be materialized directly as Julia structs.</p><pre><code class="language-julia hljs">using Postgres, DBInterface, StructUtils
+
+struct CountRow
+    count::Int
+end
+
+row = DBInterface.execute(conn, &quot;SELECT count(*)::int AS count FROM users&quot;, (), CountRow)
+@show row.count</code></pre><p>When PostgreSQL column names do not match Julia field names, add field tags in the <code>postgres</code> namespace. Postgres.jl&#39;s StructUtils style uses those tags while deserializing rows.</p><pre><code class="language-julia hljs">using Dates, Postgres, DBInterface, StructUtils
+
+StructUtils.@tags struct ProfileSummary
+    profileId::Int &amp;(postgres=(name=:profile_id,),)
+    firstName::Union{Missing, String} &amp;(postgres=(name=:first_name,),)
+    lastName::Union{Missing, String} &amp;(postgres=(name=:last_name,),)
+    createdAt::DateTime &amp;(postgres=(name=:created_at,),)
+end
+
+profile = DBInterface.execute(conn, &quot;&quot;&quot;
+    SELECT profile_id, first_name, last_name, created_at
+    FROM profiles
+    WHERE profile_id = $1
+    &quot;&quot;&quot;, (profile_id,), ProfileSummary)
+
+profiles = DBInterface.execute(conn, &quot;&quot;&quot;
+    SELECT profile_id, first_name, last_name, created_at
+    FROM profiles
+    ORDER BY created_at DESC
+    LIMIT 10
+    &quot;&quot;&quot;, (), Vector{ProfileSummary})</code></pre><p>Prepared statements are cached with LRU eviction; disable caching via <code>statement_cache_maxsize=0</code>.</p><pre><code class="language-julia hljs">using Postgres, DBInterface, Tables
+conn = DBInterface.connect(Postgres.Connection, &quot;host=127.0.0.1;user=postgres;password=postgres;dbname=postgres&quot;; statement_cache_maxsize=5)
+stmt = DBInterface.prepare(conn, &quot;SELECT $1::int AS val&quot;)
+rows = Tables.rowtable(DBInterface.execute(stmt, (7,)))
+DBInterface.close!(stmt)
+DBInterface.close!(conn)</code></pre><p><code>Postgres.command_tag(result)</code> and <code>Postgres.rows_affected(result)</code> expose PostgreSQL command completion metadata.</p><h2 id="Transactions"><a class="docs-heading-anchor" href="#Transactions">Transactions</a><a id="Transactions-1"></a><a class="docs-heading-anchor-permalink" href="#Transactions" title="Permalink"></a></h2><pre><code class="language-julia hljs">using Postgres, DBInterface
+conn = DBInterface.connect(Postgres.Connection, &quot;host=127.0.0.1;user=postgres;password=postgres;dbname=postgres&quot;)
+Postgres.transaction(conn) do tx
+    DBInterface.execute(tx, &quot;CREATE TEMP TABLE tx_demo (id int)&quot;)
+    DBInterface.execute(tx, &quot;INSERT INTO tx_demo VALUES (1)&quot;)
+end
+Postgres.@transaction conn begin
+    DBInterface.execute(conn, &quot;INSERT INTO tx_demo VALUES (2)&quot;)
+end
+DBInterface.close!(conn)</code></pre><h2 id="COPY-protocol"><a class="docs-heading-anchor" href="#COPY-protocol">COPY protocol</a><a id="COPY-protocol-1"></a><a class="docs-heading-anchor-permalink" href="#COPY-protocol" title="Permalink"></a></h2><pre><code class="language-julia hljs">using Postgres, DBInterface
+conn = DBInterface.connect(Postgres.Connection, &quot;host=127.0.0.1;user=postgres;password=postgres;dbname=postgres&quot;)
+DBInterface.execute(conn, &quot;CREATE TEMP TABLE copy_demo (id int, name text)&quot;)
+Postgres.copy_from(conn, &quot;COPY copy_demo (id, name) FROM STDIN&quot;, &quot;1\talpha\n2\tbeta\n&quot;)
+bytes = Postgres.copy_to(conn, &quot;COPY copy_demo TO STDOUT (FORMAT BINARY)&quot;)
+Postgres.copy_from(conn, &quot;COPY copy_demo FROM STDIN (FORMAT BINARY)&quot;, bytes)
+DBInterface.close!(conn)</code></pre><h2 id="LISTEN/NOTIFY"><a class="docs-heading-anchor" href="#LISTEN/NOTIFY">LISTEN/NOTIFY</a><a id="LISTEN/NOTIFY-1"></a><a class="docs-heading-anchor-permalink" href="#LISTEN/NOTIFY" title="Permalink"></a></h2><pre><code class="language-julia hljs">using Postgres, DBInterface
+listener = DBInterface.connect(Postgres.Connection, &quot;host=127.0.0.1;user=postgres;password=postgres;dbname=postgres&quot;)
+notifier = DBInterface.connect(Postgres.Connection, &quot;host=127.0.0.1;user=postgres;password=postgres;dbname=postgres&quot;)
+Postgres.listen!(listener, &quot;events&quot;)
+Postgres.notify!(notifier, &quot;events&quot;, &quot;hello&quot;)
+notice = Postgres.wait_for_notification(listener; timeout=5.0)
+@show notice.channel notice.payload
+DBInterface.close!(notifier)
+DBInterface.close!(listener)</code></pre><h2 id="Cursor-streaming"><a class="docs-heading-anchor" href="#Cursor-streaming">Cursor streaming</a><a id="Cursor-streaming-1"></a><a class="docs-heading-anchor-permalink" href="#Cursor-streaming" title="Permalink"></a></h2><pre><code class="language-julia hljs">using Postgres, DBInterface
+conn = DBInterface.connect(Postgres.Connection, &quot;host=127.0.0.1;user=postgres;password=postgres;dbname=postgres&quot;)
+cur = Postgres.cursor(conn, &quot;SELECT generate_series(1, 5) AS n&quot;; fetchsize=2)
+for row in cur
+    @show row.n
+end
+DBInterface.close!(cur)
+DBInterface.close!(conn)</code></pre><h2 id="Type-registry"><a class="docs-heading-anchor" href="#Type-registry">Type registry</a><a id="Type-registry-1"></a><a class="docs-heading-anchor-permalink" href="#Type-registry" title="Permalink"></a></h2><pre><code class="language-julia hljs">using Postgres, DBInterface, Tables
+conn = DBInterface.connect(Postgres.Connection, &quot;host=127.0.0.1;user=postgres;password=postgres;dbname=postgres&quot;)
+DBInterface.execute(conn, &quot;CREATE TYPE mood AS ENUM (&#39;sad&#39;, &#39;ok&#39;, &#39;happy&#39;)&quot;)
+Postgres.register_enum!(conn, &quot;mood&quot;)
+row = only(Tables.rowtable(DBInterface.execute(conn, &quot;SELECT &#39;happy&#39;::mood AS mood&quot;)))
+@show row.mood
+DBInterface.close!(conn)</code></pre><p><code>Numeric</code> values are represented by <code>Postgres.Numeric</code>, <code>interval</code> values by <code>Dates.Period</code> or <code>Dates.CompoundPeriod</code>, and range types by <code>Postgres.PostgresRange{T}</code>.</p><h2 id="Query-logging"><a class="docs-heading-anchor" href="#Query-logging">Query logging</a><a id="Query-logging-1"></a><a class="docs-heading-anchor-permalink" href="#Query-logging" title="Permalink"></a></h2><pre><code class="language-julia hljs">using Postgres, DBInterface
+conn = DBInterface.connect(Postgres.Connection, &quot;host=127.0.0.1;user=postgres;password=postgres;dbname=postgres&quot;)
+Postgres.set_query_logger!(conn) do event, info
+    @show event info.success info.duration_ns
+end
+DBInterface.execute(conn, &quot;SELECT 1&quot;)
+DBInterface.close!(conn)</code></pre><h2 id="Connection-pooling"><a class="docs-heading-anchor" href="#Connection-pooling">Connection pooling</a><a id="Connection-pooling-1"></a><a class="docs-heading-anchor-permalink" href="#Connection-pooling" title="Permalink"></a></h2><pre><code class="language-julia hljs">using Postgres, DBInterface
+pool = Postgres.ConnectionPool(Postgres.Connection, &quot;127.0.0.1&quot;, &quot;postgres&quot;, &quot;postgres&quot;; dbname=&quot;postgres&quot;, limit=5)
+Postgres.with_connection(pool) do conn
+    DBInterface.execute(conn, &quot;SELECT 1&quot;)
+end
+DBInterface.close!(pool)</code></pre><h2 id="Errors-and-cancellation"><a class="docs-heading-anchor" href="#Errors-and-cancellation">Errors and cancellation</a><a id="Errors-and-cancellation-1"></a><a class="docs-heading-anchor-permalink" href="#Errors-and-cancellation" title="Permalink"></a></h2><p><code>Postgres.Error</code> includes SQLSTATE information. Use <code>Postgres.cancel_query!(conn)</code> to cancel a running query.</p></article><nav class="docs-footer"><a class="docs-footer-nextpage" href="manual/">Manual »</a><div class="flexbox-break"></div><p class="footer-message">Powered by <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> and the <a href="https://julialang.org/">Julia Programming Language</a>.</p></nav></div><div class="modal" id="documenter-settings"><div class="modal-background"></div><div class="modal-card"><header class="modal-card-head"><p class="modal-card-title">Settings</p><button class="delete"></button></header><section class="modal-card-body"><p><label class="label">Theme</label><div class="select"><select id="documenter-themepicker"><option value="auto">Automatic (OS)</option><option value="documenter-light">documenter-light</option><option value="documenter-dark">documenter-dark</option><option value="catppuccin-latte">catppuccin-latte</option><option value="catppuccin-frappe">catppuccin-frappe</option><option value="catppuccin-macchiato">catppuccin-macchiato</option><option value="catppuccin-mocha">catppuccin-mocha</option></select></div></p><hr/><p>This document was generated with <a href="https://github.com/JuliaDocs/Documenter.jl">Documenter.jl</a> version 1.17.0 on <span class="colophon-date" title="Tuesday 26 May 2026 18:36">Tuesday 26 May 2026</span>. Using Julia version 1.12.6.</p></section><footer class="modal-card-foot"></footer></div></div></div></body></html>
