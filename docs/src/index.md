@@ -2,6 +2,8 @@
 
 Postgres.jl is a PostgreSQL client that speaks the v3 wire protocol with `DBInterface` and `Tables` integration.
 
+See the [Manual](@ref) for a guided walk through connections, queries, prepared statements, transactions, cancellation, notifications, and type translation.
+
 ## Installation
 
 ```julia
@@ -142,7 +144,7 @@ DBInterface.close!(pool)
 
 ## Errors and cancellation
 
-`Postgres.Error` includes SQLSTATE information. Use `cancel_query!(conn)` to cancel a running query.
+`Postgres.Error` includes SQLSTATE information. Use `Postgres.cancel_query!(conn)` to cancel a running query.
 
 ```@autodocs
 Modules = [Postgres]

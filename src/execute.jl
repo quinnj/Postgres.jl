@@ -58,6 +58,8 @@ mutable struct Statement <: DBInterface.Statement
     last_used::Int
 end
 
+DBInterface.getconnection(stmt::Statement) = stmt.conn
+
 mutable struct Cursor
     const conn::Connection
     const portal::String

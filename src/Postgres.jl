@@ -2,7 +2,7 @@ module Postgres
 
 using DBInterface, Dates, UUIDs, Parsers, Tables, StructUtils, JSON, ConcurrentUtilities, Reseau
 
-export DBInterface, PostgresInterfaceError, start_transaction, commit, rollback, in_transaction, transaction, ConnectionParams, parse_dsn, get_cached_statements, clear_statement_cache!, set_statement_cache_maxsize!, get_server_parameter, get_server_parameters, Error, Notification, Numeric, PostgresRange, register_type!, register_enum!, register_composite!, register_range!, set_notice_callback!, get_notice_callback, set_notification_callback!, get_notification_callback, set_query_logger!, get_query_logger, set_statement_timeout!, get_statement_timeout, copy_from, copy_to, listen!, unlisten!, notify!, wait_for_notification, cursor, ConnectionPool, acquire, release, with_connection, command_tag, rows_affected
+export DBInterface
 
 # For non-api errors that happen in Postgres.jl
 struct PostgresInterfaceError
@@ -19,10 +19,9 @@ const Pools = ConcurrentUtilities.Pools
 const NOOP_QUERY_LOGGER = (event, info) -> nothing
 const ReseauConn = Union{Reseau.TCP.Conn, Reseau.TLS.Conn}
 
-# T parameter is always Statement
-mutable struct Connection{IO, T} <: DBInterface.Connection
+mutable struct Connection{T} <: DBInterface.Connection
     const lock::ReentrantLock
-    socket::IO
+    socket::ReseauConn
     const host::String
     const user::String
     const password::Union{String, Nothing}
@@ -80,7 +79,7 @@ mutable struct Connection{IO, T} <: DBInterface.Connection
         end
         default_notification_callback = notification -> nothing
         default_query_logger = NOOP_QUERY_LOGGER
-        return new{typeof(socket), Statement}(ReentrantLock(), socket, host, user, password, dbname, port, app_name, timeout, sslmode_val, sslrootcert_val, sslcert_val, sslkey_val, sslcapath_val, statement_timeout_val, pid, skey, Dict{String, Statement}(), maxsize, 0, server_params, registry, false, reconnect, debug, default_notice_callback, default_notification_callback, default_query_logger, false, 0, 1)
+        return new{Statement}(ReentrantLock(), socket, host, user, password, dbname, port, app_name, timeout, sslmode_val, sslrootcert_val, sslcert_val, sslkey_val, sslcapath_val, statement_timeout_val, pid, skey, Dict{String, Statement}(), maxsize, 0, server_params, registry, false, reconnect, debug, default_notice_callback, default_notification_callback, default_query_logger, false, 0, 1)
     end
 end
 
@@ -245,13 +244,12 @@ function update_server_parameters!(conn::Connection, buf::Vector{UInt8})
     return
 end
 
-@inline function _set_read_deadline!(socket::Reseau.TCP.Conn, deadline_ns::Int64)
-    Reseau.TCP.set_read_deadline!(socket, deadline_ns)
-    return nothing
-end
-
-@inline function _set_read_deadline!(socket::Reseau.TLS.Conn, deadline_ns::Int64)
-    Reseau.TLS.set_read_deadline!(socket, deadline_ns)
+@inline function _set_read_deadline!(socket::ReseauConn, deadline_ns::Int64)
+    if socket isa Reseau.TCP.Conn
+        Reseau.TCP.set_read_deadline!(socket, deadline_ns)
+    else
+        Reseau.TLS.set_read_deadline!(socket, deadline_ns)
+    end
     return nothing
 end
 
@@ -320,12 +318,7 @@ function copy_from(conn::Connection, sql::AbstractString, data::IO; debug::Bool=
     return conn
 end
 
-function copy_from(conn::Connection, sql::AbstractString, data::AbstractString; debug::Bool=false)
-    buffer = IOBuffer(data)
-    return copy_from(conn, sql, buffer; debug=debug)
-end
-
-function copy_from(conn::Connection, sql::AbstractString, data::AbstractVector{UInt8}; debug::Bool=false)
+function copy_from(conn::Connection, sql::AbstractString, data; debug::Bool=false)
     buffer = IOBuffer(data)
     return copy_from(conn, sql, buffer; debug=debug)
 end
@@ -442,8 +435,6 @@ function cancel_query!(conn::Connection)
     API.cancel_request(host, port, pid, skey, debug)
     return conn
 end
-
-export cancel_query!
 
 disconnected() = throw(PostgresInterfaceError("postgres connection has been closed or disconnected"))
 
@@ -639,6 +630,18 @@ function transaction(f::Function, conn::Connection)
     end
 end
 
+function DBInterface.transaction(f::Function, conn::Connection)
+    start_transaction(conn)
+    try
+        result = f()
+        commit(conn)
+        return result
+    catch
+        rollback(conn)
+        rethrow()
+    end
+end
+
 macro transaction(conn, expr)
     quote
         local success = false
@@ -654,8 +657,6 @@ macro transaction(conn, expr)
         end
     end
 end
-
-export @transaction
 
 # escape(conn::Connection, s::AbstractString) = API.escape(conn.pg, s)
 

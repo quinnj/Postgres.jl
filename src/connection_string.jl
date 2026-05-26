@@ -1,5 +1,7 @@
 module ConnectionString
 
+using URIs
+
 struct ConnectionParams
     host::String
     port::Int
@@ -147,74 +149,36 @@ function parse_dsn(dsn::String)
     return params_from_values(parse_keyword_dsn(dsn))
 end
 
-function url_decode(val::AbstractString; plus_as_space::Bool=false)
-    buf = IOBuffer()
-    i = 1
-    while i <= lastindex(val)
-        c = val[i]
-        if c == '%'
-            i + 2 <= lastindex(val) || break
-            hex = val[i + 1:i + 2]
-            write(buf, UInt8(parse(Int, hex; base=16)))
-            i += 3
-        elseif c == '+' && plus_as_space
-            write(buf, UInt8(' '))
-            i += 1
-        else
-            write(buf, c)
-            i = nextind(val, i)
-        end
-    end
-    return String(take!(buf))
-end
-
-function parse_query_params(query::AbstractString)
-    params = Dict{String, String}()
-    for pair in split(query, '&')
-        isempty(pair) && continue
-        key, value = occursin('=', pair) ? split(pair, '='; limit=2) : (pair, "")
-        params[url_decode(key; plus_as_space=true)] = url_decode(value; plus_as_space=true)
-    end
-    return params
-end
-
 function parse_uri(uri::String)
-    lowered = lowercase(uri)
-    startswith(lowered, "postgres://") && (uri = uri[lastindex("postgres://") + 1:end])
-    startswith(lowered, "postgresql://") && (uri = uri[lastindex("postgresql://") + 1:end])
+    parsed = URIs.URI(uri)
+    scheme = lowercase(String(parsed.scheme))
+    (scheme == "postgres" || scheme == "postgresql") || throw(ArgumentError("invalid PostgreSQL URI scheme: $scheme"))
     values = Dict{String, String}()
-    main, query = occursin('?', uri) ? split(uri, '?'; limit=2) : (uri, "")
-    userinfo, hostpart = occursin('@', main) ? split(main, '@'; limit=2) : ("", main)
+    userinfo = String(parsed.userinfo)
     if !isempty(userinfo)
         if occursin(':', userinfo)
             usr, pwd = split(userinfo, ':'; limit=2)
-            values["user"] = url_decode(usr)
-            values["password"] = url_decode(pwd)
+            values["user"] = URIs.unescapeuri(usr)
+            values["password"] = URIs.unescapeuri(pwd)
         else
-            values["user"] = url_decode(userinfo)
+            values["user"] = URIs.unescapeuri(userinfo)
         end
     end
-    hostport, db = occursin('/', hostpart) ? split(hostpart, '/'; limit=2) : (hostpart, "")
-    !isempty(db) && (values["dbname"] = url_decode(db))
-    if startswith(hostport, "[")
-        closing = findfirst(isequal(']'), hostport)
-        closing === nothing || (values["host"] = hostport[2:closing - 1])
-        rest = closing === nothing ? "" : hostport[closing + 1:end]
-        if startswith(rest, ":")
-            values["port"] = rest[2:end]
-        end
-    elseif !isempty(hostport)
-        if occursin(':', hostport)
-            host_str, port_str = split(hostport, ':'; limit=2)
-            values["host"] = url_decode(host_str)
-            values["port"] = port_str
-        else
-            values["host"] = url_decode(hostport)
-        end
+
+    host = String(parsed.host)
+    !isempty(host) && (values["host"] = URIs.unescapeuri(host))
+    port = String(parsed.port)
+    !isempty(port) && (values["port"] = port)
+
+    path = String(parsed.path)
+    if startswith(path, "/") && length(path) > 1
+        values["dbname"] = URIs.unescapeuri(path[nextind(path, firstindex(path)):end])
     end
+
+    query = String(parsed.query)
     if !isempty(query)
-        params = parse_query_params(query)
-        for key in ("user", "password", "dbname", "application_name", "connect_timeout", "sslmode", "sslrootcert", "sslcert", "sslkey", "sslcapath", "statement_timeout", "statement_cache_maxsize")
+        params = URIs.queryparams(query)
+        for key in ("host", "port", "user", "password", "dbname", "application_name", "connect_timeout", "sslmode", "sslrootcert", "sslcert", "sslkey", "sslcapath", "statement_timeout", "statement_cache_maxsize")
             haskey(params, key) && (values[key] = params[key])
         end
     end

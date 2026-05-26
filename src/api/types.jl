@@ -234,20 +234,25 @@ end
 
 function split_range_values(val::String)
     code = codeunits(val)
-    pos = 1
+    pos = 0
     in_quotes = false
+    escaped = false
     for i in 1:length(code)
         c = code[i]
-        if c == UInt8('"')
+        if escaped
+            escaped = false
+        elseif in_quotes && c == UInt8('\\')
+            escaped = true
+        elseif c == UInt8('"')
             in_quotes = !in_quotes
         elseif c == UInt8(',') && !in_quotes
             pos = i
             break
         end
     end
-    pos == 1 && return val, ""
-    left = String(code[1:pos - 1])
-    right = String(code[pos + 1:end])
+    pos == 0 && return val, ""
+    left = pos == 1 ? "" : String(code[1:pos - 1])
+    right = pos == length(code) ? "" : String(code[pos + 1:end])
     return left, right
 end
 

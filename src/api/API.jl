@@ -567,7 +567,7 @@ function describeprepared(socket, name::String, debug::Bool)
 end
 
 struct DataRow
-    socket::IO
+    socket::ReseauConn
     names::Vector{Symbol}
     typeIds::Vector{Int}
     type_registry::Dict{Int, TypeInfo}
@@ -598,14 +598,14 @@ function StructUtils.applyeach(::PostgresStyle, f, dr::DataRow)
     return
 end
 
-struct Exec
-    socket::IO
+struct Exec{N, A}
+    socket::ReseauConn
     names::Vector{Symbol}
     typeIds::Vector{Int}
     type_registry::Dict{Int, TypeInfo}
     debug::Bool
-    notice_callback::Function
-    notification_callback::Function
+    notice_callback::N
+    notification_callback::A
     command_tag::Base.RefValue{Union{Nothing, String}}
     rows_affected::Base.RefValue{Union{Nothing, Int}}
 end
@@ -680,7 +680,7 @@ function StructUtils.applyeach(::PostgresStyle, f, e::Exec)
     return
 end
 
-function exec(socket, stmtname::String, params::Vector{Union{String, Missing}}, names, typeIds, type_registry::Dict{Int, TypeInfo}, debug::Bool, rowlimit::Int=0, notice_callback::Function=(notice)->nothing, notification_callback::Function=(notification)->nothing)
+function exec(socket::ReseauConn, stmtname::String, params::Vector{Union{String, Missing}}, names, typeIds, type_registry::Dict{Int, TypeInfo}, debug::Bool, rowlimit::Int=0, notice_callback::N=(notice)->nothing, notification_callback::A=(notification)->nothing) where {N, A}
     #TODO: support binary format: here and in applycast
     npformats = Int16(0) # all params use text format
     nparams = Int16(length(params))

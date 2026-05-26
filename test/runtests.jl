@@ -8,6 +8,7 @@ using JSON
 using Harbor
 using Postgres
 using Sockets
+using Random
 
 # Integration tests for Postgres.jl protocol and API behavior.
 const JSONType = typeof(JSON.lazy("{}"))
@@ -379,7 +380,32 @@ INSERT INTO types_test (
     return id, expected
 end
 
+function pg_array_token(value::Missing)
+    return "NULL"
+end
+
+function pg_array_token(value::AbstractString)
+    return string('"', replace(String(value), "\\" => "\\\\", "\"" => "\\\""), '"')
+end
+
+function pg_array_token(value)
+    return string(value)
+end
+
+function pg_array_literal(values)
+    return string("{", join((pg_array_token(value) for value in values), ","), "}")
+end
+
+function random_array_string(rng::AbstractRNG)
+    alphabet = vcat(collect('a':'z'), collect('A':'Z'), collect('0':'9'), [' ', ',', '\\', '"', '{', '}', '[', ']', 'N'])
+    return String(rand(rng, alphabet, rand(rng, 0:12)))
+end
+
 @testset "Postgres" begin
+    @testset "Export Surface" begin
+        @test Set(names(Postgres)) == Set([:DBInterface, :Postgres])
+    end
+
     @testset "Connection String Parsing" begin
         params = Postgres.parse_dsn("host=127.0.0.1 port=5433 user='post gres' password='pa ss' dbname=mydb application_name='my app' sslmode=disable")
         @test params.host == "127.0.0.1"
@@ -418,6 +444,17 @@ end
         @test plus_params.dbname == "db+name"
         @test plus_params.application_name == "my app"
 
+        encoded_params = Postgres.parse_dsn("postgresql://user%20name:p%40ss@localhost/db%2Fname?application_name=my+app&statement_cache_maxsize=2")
+        @test encoded_params.user == "user name"
+        @test encoded_params.password == "p@ss"
+        @test encoded_params.dbname == "db/name"
+        @test encoded_params.statement_cache_maxsize == 2
+
+        query_host_params = Postgres.parse_dsn("postgresql:///postgres?host=%2Fvar%2Frun%2Fpostgresql&port=5436")
+        @test query_host_params.host == "/var/run/postgresql"
+        @test query_host_params.port == 5436
+        @test query_host_params.dbname == "postgres"
+
         withenv(
             "PGHOST" => "envhost",
             "PGPORT" => "5544",
@@ -440,6 +477,56 @@ end
             @test mixed_params.host == "explicit"
             @test mixed_params.user == "envuser"
             @test mixed_params.dbname == "envdb"
+        end
+    end
+
+    @testset "API Type Parsers" begin
+        registry = Dict(Postgres.API.DEFAULT_TYPE_REGISTRY)
+
+        @test string(Postgres.API.parse_numeric("123.4500")) == "123.4500"
+        @test string(Postgres.API.parse_numeric("-0.00120")) == "-0.00120"
+        @test string(Postgres.API.parse_numeric("1.23e3")) == "1230"
+        @test Postgres.API.parse_numeric("+42") == Postgres.Numeric(BigInt(42), 0)
+
+        @test Postgres.API.parse_value(1184, "2024-02-13 05:28:17+02", registry) == DateTime(2024, 2, 13, 3, 28, 17)
+        @test Postgres.API.parse_value(1184, "2024-02-13 05:28:17+02:30", registry) == DateTime(2024, 2, 13, 2, 58, 17)
+        @test Postgres.API.parse_value(1184, "2024-02-13 05:28:17Z", registry) == DateTime(2024, 2, 13, 5, 28, 17)
+
+        @test Postgres.API.parse_interval("1 year 2 mons 3 days 04:05:06.789") == Dates.CompoundPeriod(Dates.Year(1), Dates.Month(2), Dates.Day(3), Dates.Hour(4), Dates.Minute(5), Dates.Second(6), Dates.Millisecond(789))
+        @test Postgres.API.parse_interval("-04:05:06.789") == Dates.CompoundPeriod(Dates.Hour(-4), Dates.Minute(-5), Dates.Second(-6), Dates.Millisecond(-789))
+
+        @test Postgres.API.parse_value(17, raw"\xDEADBEEF", registry) == UInt8[0xde, 0xad, 0xbe, 0xef]
+        @test Postgres.API.decode_bytea(raw"\141\\") == UInt8['a', '\\']
+        @test_throws ArgumentError Postgres.API.decode_bytea(raw"\xabc")
+        @test_throws ArgumentError Postgres.API.decode_bytea(raw"\xzz")
+
+        range = Postgres.API.parse_range("[1,5)", 23, registry)
+        @test range == Postgres.PostgresRange{Int32}(1, 5, true, false, false)
+        unbounded = Postgres.API.parse_range("(,5]", 23, registry)
+        @test ismissing(unbounded.lower)
+        @test unbounded.upper == 5
+        @test !unbounded.lower_inclusive
+        @test unbounded.upper_inclusive
+        empty_range = Postgres.API.parse_range("empty", 23, registry)
+        @test empty_range.empty
+        @test Postgres.API.split_range_values("\"a,b\",c") == ("\"a,b\"", "c")
+        @test Postgres.API.split_range_values("\"a\\\",b\",c") == ("\"a\\\",b\"", "c")
+
+        fields = Postgres.API.parse_composite_fields("(\"a,b\",,\"a\\\"b\",\"c\\\\d\",plain)")
+        @test isequal(fields, Union{String, Missing}["a,b", missing, "a\"b", "c\\d", "plain"])
+
+        rng = MersenneTwister(0x5097)
+        for _ in 1:200
+            values = [random_array_string(rng) for _ in 1:rand(rng, 0:8)]
+            literal = pg_array_literal(values)
+            @test Postgres.API.parse_array_by_oid(literal, 25, registry) == values
+            @test Postgres.API.parse_value(1009, literal, registry) == values
+        end
+
+        for _ in 1:200
+            values = Union{Missing, Int32}[rand(rng) < 0.2 ? missing : Int32(rand(rng, -1000:1000)) for _ in 1:rand(rng, 0:8)]
+            parsed = Postgres.API.parse_array_by_oid(pg_array_literal(values), 23, registry)
+            @test isequal(parsed, values)
         end
     end
 
@@ -735,6 +822,24 @@ end
                         DBInterface.execute(tx_conn, "INVALID SQL")
                     end
                     @test length(Tables.rowtable(DBInterface.execute(conn, "SELECT * FROM tx_do"))) == 1
+
+                    DBInterface.transaction(conn) do
+                        DBInterface.execute(conn, "INSERT INTO tx_do (id) VALUES (3)")
+                    end
+                    @test length(Tables.rowtable(DBInterface.execute(conn, "SELECT * FROM tx_do"))) == 2
+                    @test_throws Postgres.API.Error DBInterface.transaction(conn) do
+                        DBInterface.execute(conn, "INSERT INTO tx_do (id) VALUES (4)")
+                        DBInterface.execute(conn, "INVALID SQL")
+                    end
+                    @test length(Tables.rowtable(DBInterface.execute(conn, "SELECT * FROM tx_do"))) == 2
+
+                    DBInterface.execute(conn, "DROP TABLE IF EXISTS executemany_test")
+                    DBInterface.execute(conn, "CREATE TABLE executemany_test (id INT)")
+                    many_stmt = DBInterface.prepare(conn, "INSERT INTO executemany_test (id) VALUES (\$1)")
+                    DBInterface.executemany(many_stmt, ([1, 2, 3],))
+                    DBInterface.close!(many_stmt)
+                    count_row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT count(*) AS count FROM executemany_test")))
+                    @test count_row.count == 3
                 end
 
                 @testset "Query Logger" begin

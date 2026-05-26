@@ -15,9 +15,10 @@ jobs:
         run: which julia
         continue-on-error: true
       - name: Install Julia, but only if it is not already available in the PATH
-        run: |
-          curl -fsSL https://install.julialang.org | sh -s -- -y --default-channel release
-          echo "$HOME/.juliaup/bin" >> "$GITHUB_PATH"
+        uses: julia-actions/setup-julia@v3
+        with:
+          version: '1'
+          # arch: ${{ runner.arch }}
         if: steps.julia_in_path.outcome != 'success'
       - name: "Add the General registry via Git"
         run: |
