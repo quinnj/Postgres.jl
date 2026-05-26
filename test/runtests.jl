@@ -62,8 +62,8 @@ end
 function docker_available()
     Sys.which("docker") === nothing && return false
     try
-        run(pipeline(`docker info`, stdout=devnull, stderr=devnull))
-        return true
+        os_type = strip(read(`docker info --format "{{.OSType}}"`, String))
+        return os_type == "linux"
     catch
         return false
     end
