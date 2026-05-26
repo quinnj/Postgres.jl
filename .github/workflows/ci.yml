@@ -101,5 +101,6 @@ jobs:
       - run: julia --project=docs -e 'using Pkg; Pkg.instantiate()'
       - run: julia --project=docs docs/make.jl
         env:
+          POSTGRES_DOCS_DEPLOY: ${{ github.event_name == 'push' && 'true' || 'false' }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DOCUMENTER_KEY: ${{ secrets.DOCUMENTER_KEY }}
