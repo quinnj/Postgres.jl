@@ -564,17 +564,29 @@ Base.close(pool::ConnectionPool) = DBInterface.close!(pool)
 
 include("execute.jl")
 
+# Transaction control statements run over the simple-query protocol: one
+# atomic message with a single ReadyForQuery, instead of the unnamed
+# Parse/Describe/Bind/Execute sequence whose per-step Syncs let a
+# transaction-mode pooler (pgbouncer, Neon) reassign the server connection
+# mid-sequence and drop the unnamed statement ("unnamed prepared statement
+# does not exist"). Also one network round trip instead of three. Callers
+# must hold conn.lock.
+function execute_simple(conn::Connection, sql::String)
+    API.exec(conn.socket, sql, conn.debug)
+    return conn
+end
+
 function start_transaction(conn::Connection)
     @lock conn.lock begin
         checkconn(conn)
         if !conn.in_transaction
-            DBInterface.execute(conn, "BEGIN")
+            execute_simple(conn, "BEGIN")
             conn.in_transaction = true
             conn.transaction_depth = 1
         else
             # Start a SAVEPOINT for nested transactions
             savepoint = "sp_$(conn.transaction_depth)"
-            DBInterface.execute(conn, "SAVEPOINT $savepoint")
+            execute_simple(conn, "SAVEPOINT $savepoint")
             conn.transaction_depth += 1
         end
     end
@@ -588,7 +600,7 @@ function commit(conn::Connection)
         checkconn(conn)
         !conn.in_transaction && throw(PostgresInterfaceError("no transaction in progress"))
         if conn.transaction_depth == 1
-            DBInterface.execute(conn, "COMMIT")
+            execute_simple(conn, "COMMIT")
             conn.in_transaction = false
             conn.transaction_depth = 0
         else
@@ -605,14 +617,14 @@ function rollback(conn::Connection)
         checkconn(conn)
         !conn.in_transaction && throw(PostgresInterfaceError("no transaction in progress"))
         if conn.transaction_depth == 1
-            DBInterface.execute(conn, "ROLLBACK")
+            execute_simple(conn, "ROLLBACK")
             conn.in_transaction = false
             conn.transaction_depth = 0
         else
             # Rollback to SAVEPOINT for nested transaction
             conn.transaction_depth -= 1
             savepoint = "sp_$(conn.transaction_depth)"
-            DBInterface.execute(conn, "ROLLBACK TO SAVEPOINT $savepoint")
+            execute_simple(conn, "ROLLBACK TO SAVEPOINT $savepoint")
         end
     end
     return conn
