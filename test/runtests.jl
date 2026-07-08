@@ -46,6 +46,11 @@ StructUtils.@defaults struct TypeRow
     int_array::Vector{Int32} = Int32[]
 end
 
+struct Int8Row
+    x::Int8
+    s::String
+end
+
 struct PgConfig
     host::String
     port::Int
@@ -573,6 +578,80 @@ end
                     close(conn4.socket)
                     @test_throws Postgres.PostgresInterfaceError DBInterface.execute(conn4, "SELECT 1")
                     DBInterface.close!(conn4)
+                end
+                @testset "Protocol Resync On Error Paths" begin
+                    connp = DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, cfg.password; dbname=cfg.dbname, port=cfg.port)
+
+                    # a Describe error (e.g. the statement was discarded server-side)
+                    # surfaces the real server error, not an assert, and leaves the
+                    # stream at ReadyForQuery so the connection stays usable
+                    err = try
+                        Postgres.API.describeprepared(connp.socket, "no_such_stmt_xyz", false)
+                        nothing
+                    catch e
+                        e
+                    end
+                    @test err isa Postgres.API.Error
+                    @test occursin("does not exist", err.message)
+                    @test isopen(connp.socket)
+                    @test Tables.rowtable(DBInterface.execute(connp, "SELECT 1 AS a"))[1].a == 1
+
+                    # a consumer exception mid-result drains the remaining rows so
+                    # the connection stays usable
+                    stmt = DBInterface.prepare(connp, "SELECT i AS x, repeat('y', 10) AS s FROM generate_series(1, 200) i")
+                    ex = Postgres.API.exec(connp.socket, stmt.name, Union{String, Missing}[], stmt.names, stmt.typeIds, connp.type_registry, false)
+                    err = try
+                        StructUtils.applyeach(Postgres.API.PostgresStyle(), ex) do i, row
+                            i == 3 && error("consumer abort")
+                            nothing
+                        end
+                        nothing
+                    catch e
+                        e
+                    end
+                    @test err isa ErrorException
+                    @test isopen(connp.socket)
+                    @test Tables.rowtable(DBInterface.execute(connp, "SELECT 2 AS a"))[1].a == 2
+
+                    # a value-conversion failure during materialization (Int8
+                    # overflows at row 128) behaves the same through the
+                    # DBInterface.execute typed path
+                    err = try
+                        DBInterface.execute(connp, "SELECT i AS x, repeat('y', 10) AS s FROM generate_series(1, 300) i", nothing, Vector{Int8Row})
+                        nothing
+                    catch e
+                        e
+                    end
+                    @test err isa InexactError
+                    @test isopen(connp.socket)
+                    @test Tables.rowtable(DBInterface.execute(connp, "SELECT 3 AS a"))[1].a == 3
+
+                    # a backend killed mid-query surfaces the server's ErrorResponse
+                    # (not a raw EOF) and closes the socket so the dead connection
+                    # can never be reused
+                    conn_victim = DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, cfg.password; dbname=cfg.dbname, port=cfg.port)
+                    victim_task = @async try
+                        DBInterface.execute(conn_victim, "SELECT pg_sleep(30)")
+                        nothing
+                    catch e
+                        e
+                    end
+                    started = false
+                    for _ = 1:100
+                        active = Tables.rowtable(DBInterface.execute(connp, "SELECT count(*) AS n FROM pg_stat_activity WHERE pid = $(conn_victim.pid) AND state = 'active'"))[1].n
+                        started = active == 1
+                        started && break
+                        sleep(0.1)
+                    end
+                    @test started
+                    DBInterface.execute(connp, "SELECT pg_terminate_backend($(conn_victim.pid))")
+                    err = fetch(victim_task)
+                    @test err isa Postgres.API.Error
+                    @test occursin("terminat", err.message)
+                    @test !isopen(conn_victim.socket)
+
+                    DBInterface.close!(conn_victim)
+                    DBInterface.close!(connp)
                 end
                 @testset "Prepared Statements" begin
                     stmt = DBInterface.prepare(conn, raw"SELECT $1::int AS val")
