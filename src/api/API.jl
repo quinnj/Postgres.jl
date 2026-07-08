@@ -263,6 +263,45 @@ function close_and_throw(socket, err)
     throw(err)
 end
 
+# Read and discard messages through ReadyForQuery so a connection whose result
+# stream was abandoned mid-way stays usable. Must be called at a message
+# boundary. If the connection fails while draining, close it: the stream
+# position is unknowable and the socket must never be reused.
+function drain_to_ready!(socket, debug)
+    try
+        while true
+            mt, len = readheader(socket, debug)
+            skipbytes!(socket, len)
+            mt == UInt8('Z') && break
+        end
+    catch
+        close(socket)
+    end
+    return
+end
+
+# Read the next message header, expecting one of `expected`. Asynchronous
+# messages (parameter status, notices, notifications) are skipped. An
+# ErrorResponse is read fully, the stream drained through ReadyForQuery (the
+# connection stays usable), and thrown as a Postgres.Error. Any other message
+# type means the stream is desynchronized: close the connection and throw.
+function read_expected(socket, debug, expected::Char...)
+    while true
+        mt, len = readheader(socket, debug)
+        if any(c -> mt == UInt8(c), expected)
+            return mt, len
+        elseif mt == UInt8('E')
+            err = errorResponse(len, socket, debug)
+            drain_to_ready!(socket, debug)
+            throw(err)
+        elseif mt == UInt8('S') || mt == UInt8('N') || mt == UInt8('A')
+            skipbytes!(socket, len)
+        else
+            close_and_throw(socket, Error("unexpected message type '$(Char(mt))' from server; connection protocol state is corrupted"))
+        end
+    end
+end
+
 function expect_auth_message(socket, debug, mt, len)
     mt == UInt8('R') && return
     mt == UInt8('E') && close_and_throw_error_response(socket, len, debug)
@@ -277,45 +316,55 @@ function waitfor(socket, debug, codes...)
     pid = skey = Int32(0)
     server_params = Dict{String, String}()
     debug && @info "waitfor: $codes"
-    while true
-        mt, len = readheader(socket, debug)
-        if mt == UInt8('E')
-            # error
-            error = true
-            error_msg = errorResponse(len, socket, debug)
-        elseif error && mt == UInt8('Z')
-            # error followed by ready
-            skipbytes!(socket, len)
-            break
-        elseif mt == UInt8('S')
-            # parameter status
-            buf = read(socket, len)
-            i = 1
-            while i < len
-                j = findnext(isequal(UInt8(0)), buf, i)
-                j === nothing && break
-                key = unsafe_string(pointer(buf, i), j - i)
-                i = j + 1
-                j = findnext(isequal(UInt8(0)), buf, i)
-                j === nothing && break
-                val = unsafe_string(pointer(buf, i), j - i)
-                server_params[key] = val
-                i = j + 1
-            end
-        elseif Char(mt) in codes
-            # found
-            found -= mt
-            if mt == UInt8('K')
-                pid = ntoh(read(socket, Int32))
-                skey = ntoh(read(socket, Int32))
+    try
+        while true
+            mt, len = readheader(socket, debug)
+            if mt == UInt8('E')
+                # error
+                error = true
+                error_msg = errorResponse(len, socket, debug)
+            elseif error && mt == UInt8('Z')
+                # error followed by ready
+                skipbytes!(socket, len)
+                break
+            elseif mt == UInt8('S')
+                # parameter status
+                buf = read(socket, len)
+                i = 1
+                while i < len
+                    j = findnext(isequal(UInt8(0)), buf, i)
+                    j === nothing && break
+                    key = unsafe_string(pointer(buf, i), j - i)
+                    i = j + 1
+                    j = findnext(isequal(UInt8(0)), buf, i)
+                    j === nothing && break
+                    val = unsafe_string(pointer(buf, i), j - i)
+                    server_params[key] = val
+                    i = j + 1
+                end
+            elseif Char(mt) in codes
+                # found
+                found -= mt
+                if mt == UInt8('K')
+                    pid = ntoh(read(socket, Int32))
+                    skey = ntoh(read(socket, Int32))
+                else
+                    skipbytes!(socket, len)
+                end
+                found == 0 && break
             else
+                # read off message
                 skipbytes!(socket, len)
             end
-            found == 0 && break
-        else
-            # read off message
-            skipbytes!(socket, len)
         end
+    catch
+        # the connection failed mid-response: the stream position is
+        # unknowable, so the socket must never be reused
+        close(socket)
+        # if the server sent an ErrorResponse before the connection died
+        # (e.g. the backend was terminated), surface it over the raw IO error
+        error_msg === nothing || throw(error_msg)
+        rethrow()
     end
     error_msg === nothing && error && throw(Error("unexpected error response"))
     error && throw(error_msg)
@@ -489,8 +538,12 @@ function connect(host::String, port::Integer, dbname::String, user::String, pass
             )
         elseif mt == UInt8('N')
             (sslmode_str == "require" || sslmode_str == "verify-full") && throw(Error("server does not support SSL"))
+        elseif mt == UInt8('E')
+            # server may answer SSLRequest with a full ErrorResponse
+            len = ntoh(read(socket, Int32)) - 4
+            close_and_throw_error_response(socket, len, debug)
         else
-            @assert mt == UInt8('N') "unexpected message type: $(Char(mt))"
+            close_and_throw(socket, Error("unexpected response to SSLRequest: $(Char(mt))"))
         end
     end
     # Build startup parameters
@@ -532,42 +585,53 @@ function describeprepared(socket, name::String, debug::Bool)
     ncols = 0
     cols = Symbol[]
     types = Int[]
-    mt, len = readheader(socket)
-    @assert mt == UInt8('t') "unexpected message type: $(Char(mt))"
-    nparams = Int(ntoh(read(socket, Int16)))
-    skipbytes!(socket, len - 2)
-    mt, len = readheader(socket)
-    if mt == UInt8('n')
-        # no data
+    try
+        mt, len = read_expected(socket, debug, 't')
+        nparams = Int(ntoh(read(socket, Int16)))
+        skipbytes!(socket, len - 2)
+        mt, len = read_expected(socket, debug, 'T', 'n')
+        if mt == UInt8('n')
+            # no data
+            waitfor(socket, debug, 'Z')
+            return nparams, cols, types
+        end
+        ncols = Int(ntoh(read(socket, Int16)))
+        buf = read(socket, len - 2)
+        i = 1
+        while i < len - 2
+            ptr = pointer(buf, i)
+            plen = Int(@ccall strlen(ptr::Ptr{Cvoid})::Csize_t)
+            name = _symbol(ptr, plen)
+            i += plen + 1
+            i += 4 # skip table oid
+            i += 2 # skip column number
+            typeId = Int(ntoh(unsafe_load(Ptr{Int32}(pointer(buf, i)))))
+            push!(types, typeId)
+            i += 4
+            i += 2 # skip type length
+            # typeModifier = Int(ntoh(unsafe_load(Ptr{Int32}(pointer(buf, i)))))
+            i += 4
+            i += 2 # skip format code
+            push!(cols, name)
+        end
         waitfor(socket, debug, 'Z')
         return nparams, cols, types
+    catch err
+        # a deliberately-thrown Error leaves the stream at ReadyForQuery (or
+        # already closed the socket); anything else means we bailed
+        # mid-message and the connection must not be reused
+        err isa Error || close(socket)
+        rethrow()
     end
-    @assert mt == UInt8('T') "unexpected message type: $(Char(mt))"
-    ncols = Int(ntoh(read(socket, Int16)))
-    buf = read(socket, len - 2)
-    i = 1
-    while i < len - 2
-        ptr = pointer(buf, i)
-        plen = Int(@ccall strlen(ptr::Ptr{Cvoid})::Csize_t)
-        name = _symbol(ptr, plen)
-        i += plen + 1
-        i += 4 # skip table oid
-        i += 2 # skip column number
-        typeId = Int(ntoh(unsafe_load(Ptr{Int32}(pointer(buf, i)))))
-        push!(types, typeId)
-        i += 4
-        i += 2 # skip type length
-        # typeModifier = Int(ntoh(unsafe_load(Ptr{Int32}(pointer(buf, i)))))
-        i += 4
-        i += 2 # skip format code
-        push!(cols, name)
-    end
-    waitfor(socket, debug, 'Z')
-    return nparams, cols, types
 end
 
+# One DataRow message, with its body fully read off the socket. Parsing from a
+# buffer (instead of incrementally from the socket) means a failure while
+# converting values — a bad cast, a user lift throwing — aborts at a message
+# boundary, so the caller can drain the rest of the result and keep the
+# connection usable.
 struct DataRow
-    socket::ReseauConn
+    buf::Vector{UInt8}
     names::Vector{Symbol}
     typeIds::Vector{Int}
     type_registry::Dict{Int, TypeInfo}
@@ -582,17 +646,21 @@ StructUtils.lift(::PostgresStyle, ::Type{T}, x::T) where {T<:JSON.LazyValue} = x
 StructUtils.lift(::PostgresStyle, ::Type{T}, x::T, tags) where {T<:JSON.LazyValue} = x, nothing
 
 function StructUtils.applyeach(::PostgresStyle, f, dr::DataRow)
-    ncols = Int(ntoh(read(dr.socket, Int16)))
-    for i = 1:ncols
-        len = Int(ntoh(read(dr.socket, Int32)))
-        if len == -1
-            # null
-            f(dr.names[i], nothing)
-        else
-            #TODO: reuse a large buffer for reading values into then parse from
-            str = Base._string_n(len)
-            unsafe_read(dr.socket, pointer(str), len)
-            @inbounds applycast(f, dr.names[i], dr.typeIds[i], str, dr.type_registry)
+    buf = dr.buf
+    GC.@preserve buf begin
+        ncols = Int(ntoh(unsafe_load(Ptr{Int16}(pointer(buf)))))
+        pos = 3
+        for i = 1:ncols
+            len = Int(ntoh(unsafe_load(Ptr{Int32}(pointer(buf, pos)))))
+            pos += 4
+            if len == -1
+                # null
+                f(dr.names[i], nothing)
+            else
+                str = unsafe_string(pointer(buf, pos), len)
+                pos += len
+                @inbounds applycast(f, dr.names[i], dr.typeIds[i], str, dr.type_registry)
+            end
         end
     end
     return
@@ -628,55 +696,66 @@ end
 
 function StructUtils.applyeach(::PostgresStyle, f, e::Exec)
     nrows = 0
-    error = false
-    error_msg = nothing
-    while true
-        mt, len = readheader(e.socket)
-        if mt == UInt8('E')
-            # error
-            error = true
-            error_msg = errorResponse(len, e.socket, e.debug)
-        elseif error && mt == UInt8('Z')
-            # error followed by ready
-            skipbytes!(e.socket, len)
-            error_msg === nothing && throw(Error("unexpected error response"))
-            throw(error_msg)
-        elseif mt == UInt8('T')
-            # row description
-            skipbytes!(e.socket, len)
-        elseif mt == UInt8('n')
-            # no data
-            skipbytes!(e.socket, len)
-        elseif mt == UInt8('I')
-            # empty query response
-            skipbytes!(e.socket, len)
-        elseif mt == UInt8('S')
-            # parameter status
-            skipbytes!(e.socket, len)
-        elseif mt == UInt8('A')
-            # notification response
-            notification = notificationResponse(len, e.socket)
-            e.notification_callback(notification)
-        elseif mt == UInt8('D')
-            nrows += 1
-            f(nrows, DataRow(e.socket, e.names, e.typeIds, e.type_registry))
-        elseif mt == UInt8('C')
-            # command complete
-            tag = commandComplete(len, e.socket)
-            e.command_tag[] = tag
-            e.rows_affected[] = rows_affected_from_command_tag(tag)
-        elseif mt == UInt8('Z')
-            skipbytes!(e.socket, len)
-            break
-        elseif mt == UInt8('N')
-            # notice response
-            notice = noticeResponse(len, e.socket)
-            e.notice_callback(notice)
-        else
-            close(e.socket)
-            throw(Error("unexpected message type: $(Char(mt))"))
+    server_error = nothing
+    consumer_error = nothing
+    try
+        while true
+            mt, len = readheader(e.socket, e.debug)
+            if mt == UInt8('E')
+                # error; keep reading until ready-for-query, thrown below
+                server_error = errorResponse(len, e.socket, e.debug)
+            elseif mt == UInt8('Z')
+                skipbytes!(e.socket, len)
+                break
+            elseif mt == UInt8('D')
+                nrows += 1
+                if consumer_error === nothing
+                    row = DataRow(read(e.socket, len), e.names, e.typeIds, e.type_registry)
+                    try
+                        f(nrows, row)
+                    catch err
+                        # the consumer failed mid-result (value conversion,
+                        # etc.); keep reading through ReadyForQuery so the
+                        # connection stays usable, then rethrow below
+                        consumer_error = err
+                    end
+                else
+                    skipbytes!(e.socket, len)
+                end
+            elseif mt == UInt8('C')
+                # command complete
+                tag = commandComplete(len, e.socket)
+                e.command_tag[] = tag
+                e.rows_affected[] = rows_affected_from_command_tag(tag)
+            elseif mt == UInt8('T') || mt == UInt8('n') || mt == UInt8('I') || mt == UInt8('S')
+                # row description / no data / empty query response / parameter status
+                skipbytes!(e.socket, len)
+            elseif mt == UInt8('A')
+                # notification response
+                notification = notificationResponse(len, e.socket)
+                e.notification_callback(notification)
+            elseif mt == UInt8('N')
+                # notice response
+                notice = noticeResponse(len, e.socket)
+                e.notice_callback(notice)
+            else
+                throw(Error("unexpected message type '$(Char(mt))' from server; connection protocol state is corrupted"))
+            end
         end
+    catch
+        # we bailed mid-stream (connection died, desynchronized stream, or a
+        # callback threw): the stream position is unknowable, so the
+        # connection must never be reused
+        close(e.socket)
+        # if the server sent an ErrorResponse before the connection died
+        # (e.g. the backend was terminated), surface it over the raw IO error
+        server_error === nothing || throw(server_error)
+        rethrow()
     end
+    # server errors take precedence; otherwise surface a consumer error that
+    # aborted materialization (the stream was still drained above)
+    server_error === nothing || throw(server_error)
+    consumer_error === nothing || throw(consumer_error)
     return
 end
 

@@ -239,36 +239,56 @@ function read_portal_batch!(cursor::Cursor)
     conn = cursor.conn
     rows = ResultRow[]
     error_msg = nothing
+    consumer_error = nothing
     done = false
-    while true
-        mt, len = API.readheader(conn.socket, conn.debug)
-        if mt == UInt8('D')
-            cursor.rowcount += 1
-            data = Vector{Any}(undef, length(cursor.names))
-            StructUtils.applyeach(PostgresStyle(), RowClosure(data, cursor.types, 1), API.DataRow(conn.socket, cursor.names, cursor.typeIds, conn.type_registry))
-            push!(rows, ResultRow(data, cursor.names, cursor.types, cursor.lookup, cursor.rowcount))
-        elseif mt == UInt8('s')
-            API.skipbytes!(conn.socket, len)
-            done = false
-        elseif mt == UInt8('C')
-            API.skipbytes!(conn.socket, len)
-            done = true
-        elseif mt == UInt8('N')
-            notice = API.noticeResponse(len, conn.socket)
-            conn.notice_callback(notice)
-        elseif mt == UInt8('A')
-            notification = API.notificationResponse(len, conn.socket)
-            conn.notification_callback(notification)
-        elseif mt == UInt8('E')
-            error_msg = API.errorResponse(len, conn.socket, conn.debug)
-        elseif mt == UInt8('Z')
-            API.skipbytes!(conn.socket, len)
-            break
-        else
-            API.skipbytes!(conn.socket, len)
+    try
+        while true
+            mt, len = API.readheader(conn.socket, conn.debug)
+            if mt == UInt8('D')
+                cursor.rowcount += 1
+                if consumer_error === nothing
+                    row = API.DataRow(read(conn.socket, len), cursor.names, cursor.typeIds, conn.type_registry)
+                    try
+                        data = Vector{Any}(undef, length(cursor.names))
+                        StructUtils.applyeach(PostgresStyle(), RowClosure(data, cursor.types, 1), row)
+                        push!(rows, ResultRow(data, cursor.names, cursor.types, cursor.lookup, cursor.rowcount))
+                    catch err
+                        # value conversion failed; keep reading through
+                        # ReadyForQuery so the connection stays usable
+                        consumer_error = err
+                    end
+                else
+                    API.skipbytes!(conn.socket, len)
+                end
+            elseif mt == UInt8('s')
+                API.skipbytes!(conn.socket, len)
+                done = false
+            elseif mt == UInt8('C')
+                API.skipbytes!(conn.socket, len)
+                done = true
+            elseif mt == UInt8('N')
+                notice = API.noticeResponse(len, conn.socket)
+                conn.notice_callback(notice)
+            elseif mt == UInt8('A')
+                notification = API.notificationResponse(len, conn.socket)
+                conn.notification_callback(notification)
+            elseif mt == UInt8('E')
+                error_msg = API.errorResponse(len, conn.socket, conn.debug)
+            elseif mt == UInt8('Z')
+                API.skipbytes!(conn.socket, len)
+                break
+            else
+                API.skipbytes!(conn.socket, len)
+            end
         end
+    catch
+        # bailed mid-stream: the connection must never be reused
+        close(conn.socket)
+        error_msg === nothing || throw(error_msg)
+        rethrow()
     end
     error_msg === nothing || throw(error_msg)
+    consumer_error === nothing || throw(consumer_error)
     cursor.buffer = rows
     cursor.index = 1
     cursor.done = done
