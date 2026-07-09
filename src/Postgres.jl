@@ -34,6 +34,7 @@ mutable struct Connection{T} <: DBInterface.Connection
     const sslcert::Union{String, Nothing}
     const sslkey::Union{String, Nothing}
     const sslcapath::Union{String, Nothing}
+    const sslservername::Union{String, Nothing}
     statement_timeout::Union{Int, Nothing}
     # pid/skey are used to send cancellation request to backend
     pid::Int32
@@ -53,7 +54,7 @@ mutable struct Connection{T} <: DBInterface.Connection
     transaction_depth::Int # track nested transactions (SAVEPOINTs)
     generation::Int # increment on reconnect to invalidate statements
 
-    function Connection(; host::AbstractString="", user::AbstractString="", password::Union{AbstractString, Nothing}=nothing, dbname::AbstractString="", port::Integer=5432, debug::Bool=false, reconnect::Bool=false, application_name::Union{AbstractString, Nothing}=nothing, connect_timeout::Union{Integer, Nothing}=nothing, sslmode::Union{AbstractString, Nothing}=nothing, sslrootcert::Union{AbstractString, Nothing}=nothing, sslcert::Union{AbstractString, Nothing}=nothing, sslkey::Union{AbstractString, Nothing}=nothing, sslcapath::Union{AbstractString, Nothing}=nothing, statement_timeout::Union{Integer, Nothing}=nothing, statement_cache_maxsize::Integer=100)
+    function Connection(; host::AbstractString="", user::AbstractString="", password::Union{AbstractString, Nothing}=nothing, dbname::AbstractString="", port::Integer=5432, debug::Bool=false, reconnect::Bool=false, application_name::Union{AbstractString, Nothing}=nothing, connect_timeout::Union{Integer, Nothing}=nothing, sslmode::Union{AbstractString, Nothing}=nothing, sslrootcert::Union{AbstractString, Nothing}=nothing, sslcert::Union{AbstractString, Nothing}=nothing, sslkey::Union{AbstractString, Nothing}=nothing, sslcapath::Union{AbstractString, Nothing}=nothing, statement_timeout::Union{Integer, Nothing}=nothing, statement_cache_maxsize::Integer=100, sslservername::Union{AbstractString, Nothing}=nothing)
         host = String(host)
         user = String(user)
         dbname = String(dbname)
@@ -67,10 +68,11 @@ mutable struct Connection{T} <: DBInterface.Connection
         sslkey_val = sslkey === nothing ? nothing : String(sslkey)
         sslcapath_val = sslcapath === nothing ? nothing : String(sslcapath)
         statement_timeout_val = statement_timeout === nothing ? nothing : Int(statement_timeout)
+        sslservername_val = sslservername === nothing ? nothing : String(sslservername)
         maxsize = max(0, Int(statement_cache_maxsize))
         #TODO: if values have spaces, need to single-quote them
         # also need to escape single quotes/backslahes then with backslashes
-        socket, pid, skey, server_params = API.connect(host, port, dbname, user, password, debug, app_name, timeout, sslmode_val, sslrootcert_val, sslcert_val, sslkey_val, sslcapath_val, statement_timeout_val)
+        socket, pid, skey, server_params = API.connect(host, port, dbname, user, password, debug, app_name, timeout, sslmode_val, sslrootcert_val, sslcert_val, sslkey_val, sslcapath_val, statement_timeout_val; sslservername = sslservername_val)
         registry = Dict(API.DEFAULT_TYPE_REGISTRY)
         default_notice_callback = notice -> begin
             msg = get(notice, "M", "")
@@ -79,7 +81,7 @@ mutable struct Connection{T} <: DBInterface.Connection
         end
         default_notification_callback = notification -> nothing
         default_query_logger = NOOP_QUERY_LOGGER
-        return new{Statement}(ReentrantLock(), socket, host, user, password, dbname, port, app_name, timeout, sslmode_val, sslrootcert_val, sslcert_val, sslkey_val, sslcapath_val, statement_timeout_val, pid, skey, Dict{String, Statement}(), maxsize, 0, server_params, registry, false, reconnect, debug, default_notice_callback, default_notification_callback, default_query_logger, false, 0, 1)
+        return new{Statement}(ReentrantLock(), socket, host, user, password, dbname, port, app_name, timeout, sslmode_val, sslrootcert_val, sslcert_val, sslkey_val, sslcapath_val, sslservername_val, statement_timeout_val, pid, skey, Dict{String, Statement}(), maxsize, 0, server_params, registry, false, reconnect, debug, default_notice_callback, default_notification_callback, default_query_logger, false, 0, 1)
     end
 end
 
@@ -444,7 +446,7 @@ function checkconn(conn::Connection)
         # connection is closed, but not explicitly, reconnect
         conn.in_transaction && throw(PostgresInterfaceError("postgres connection has been closed or disconnected; reconnect disabled during transaction"))
         conn.reconnect || throw(PostgresInterfaceError("postgres connection has been closed or disconnected; reconnect disabled"))
-        conn.socket, conn.pid, conn.skey, server_params = API.connect(conn.host, conn.port, conn.dbname, conn.user, conn.password, conn.debug, conn.application_name, conn.connect_timeout, conn.sslmode, conn.sslrootcert, conn.sslcert, conn.sslkey, conn.sslcapath, conn.statement_timeout)
+        conn.socket, conn.pid, conn.skey, server_params = API.connect(conn.host, conn.port, conn.dbname, conn.user, conn.password, conn.debug, conn.application_name, conn.connect_timeout, conn.sslmode, conn.sslrootcert, conn.sslcert, conn.sslkey, conn.sslcapath, conn.statement_timeout; sslservername = conn.sslservername)
         empty!(conn.statements)
         conn.in_transaction = false
         conn.transaction_depth = 0
@@ -456,8 +458,8 @@ function checkconn(conn::Connection)
     return
 end
 
-function DBInterface.connect(::Type{Connection}, host::AbstractString, user::AbstractString, passwd::Union{AbstractString, Nothing}; dbname::AbstractString="", port::Integer=5432, debug::Bool=false, reconnect::Bool=false, application_name::Union{AbstractString, Nothing}=nothing, connect_timeout::Union{Integer, Nothing}=nothing, sslmode::Union{AbstractString, Nothing}=nothing, sslrootcert::Union{AbstractString, Nothing}=nothing, sslcert::Union{AbstractString, Nothing}=nothing, sslkey::Union{AbstractString, Nothing}=nothing, sslcapath::Union{AbstractString, Nothing}=nothing, statement_timeout::Union{Integer, Nothing}=nothing, statement_cache_maxsize::Integer=100)
-    Connection(host=host, user=user, password=passwd, dbname=dbname, port=port, debug=debug, reconnect=reconnect, application_name=application_name, connect_timeout=connect_timeout, sslmode=sslmode, sslrootcert=sslrootcert, sslcert=sslcert, sslkey=sslkey, sslcapath=sslcapath, statement_timeout=statement_timeout, statement_cache_maxsize=statement_cache_maxsize)
+function DBInterface.connect(::Type{Connection}, host::AbstractString, user::AbstractString, passwd::Union{AbstractString, Nothing}; dbname::AbstractString="", port::Integer=5432, debug::Bool=false, reconnect::Bool=false, application_name::Union{AbstractString, Nothing}=nothing, connect_timeout::Union{Integer, Nothing}=nothing, sslmode::Union{AbstractString, Nothing}=nothing, sslrootcert::Union{AbstractString, Nothing}=nothing, sslcert::Union{AbstractString, Nothing}=nothing, sslkey::Union{AbstractString, Nothing}=nothing, sslcapath::Union{AbstractString, Nothing}=nothing, statement_timeout::Union{Integer, Nothing}=nothing, statement_cache_maxsize::Integer=100, sslservername::Union{AbstractString, Nothing}=nothing)
+    Connection(host=host, user=user, password=passwd, dbname=dbname, port=port, debug=debug, reconnect=reconnect, application_name=application_name, connect_timeout=connect_timeout, sslmode=sslmode, sslrootcert=sslrootcert, sslcert=sslcert, sslkey=sslkey, sslcapath=sslcapath, statement_timeout=statement_timeout, statement_cache_maxsize=statement_cache_maxsize, sslservername=sslservername)
 end
 
 function DBInterface.connect(::Type{Connection}, dsn::String; debug::Bool=false, reconnect::Bool=false, statement_cache_maxsize::Union{Integer, Nothing}=nothing)

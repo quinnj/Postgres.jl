@@ -516,7 +516,10 @@ function tlsupgrade(
     end
 end
 
-function connect(host::String, port::Integer, dbname::String, user::String, password::Union{String, Nothing}, debug::Bool, application_name::Union{String, Nothing}, connect_timeout::Union{Int, Nothing}, sslmode::Union{String, Nothing}, sslrootcert::Union{String, Nothing}, sslcert::Union{String, Nothing}, sslkey::Union{String, Nothing}, sslcapath::Union{String, Nothing}, statement_timeout::Union{Int, Nothing})
+# sslservername: TLS SNI override for when `host` is a pre-resolved address —
+# SNI-routed servers (e.g. Neon) need the hostname on the TLS handshake even
+# when the TCP dial goes to an IP.
+function connect(host::String, port::Integer, dbname::String, user::String, password::Union{String, Nothing}, debug::Bool, application_name::Union{String, Nothing}, connect_timeout::Union{Int, Nothing}, sslmode::Union{String, Nothing}, sslrootcert::Union{String, Nothing}, sslcert::Union{String, Nothing}, sslkey::Union{String, Nothing}, sslcapath::Union{String, Nothing}, statement_timeout::Union{Int, Nothing}; sslservername::Union{String, Nothing}=nothing)
     socket = connectsocket(host, port; connect_timeout)
     sslmode_str = sslmode === nothing ? "prefer" : lowercase(String(sslmode))
     sslmode_str == "disable" || sslmode_str == "prefer" || sslmode_str == "require" || sslmode_str == "verify-full" || throw(Error("invalid sslmode: $sslmode_str"))
@@ -529,7 +532,7 @@ function connect(host::String, port::Integer, dbname::String, user::String, pass
             socket = tlsupgrade(
                 socket;
                 connect_timeout,
-                server_name=host,
+                server_name=something(sslservername, host),
                 verify_peer=sslmode_str == "verify-full",
                 ssl_cert=sslcert,
                 ssl_key=sslkey,
