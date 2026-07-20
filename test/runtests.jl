@@ -803,6 +803,16 @@ end
                     Postgres.start_transaction(conn)
                     @test_throws Postgres.API.Error DBInterface.execute(conn, "INVALID SQL")
                     Postgres.rollback(conn)
+
+                    # Simple-query protocol messages include CommandComplete
+                    # before ReadyForQuery. Verify the driver consumes both and
+                    # routes asynchronous notices through the connection style.
+                    NOTICE_SEEN[] = false
+                    simple_conn = DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, cfg.password; dbname=cfg.dbname, port=cfg.port, style=LoggingStyle())
+                    Postgres.API.exec(simple_conn.style, simple_conn.socket, raw"DO $$ BEGIN RAISE NOTICE 'simple query'; END $$;", false)
+                    @test NOTICE_SEEN[]
+                    @test Tables.rowtable(DBInterface.execute(simple_conn, "SELECT 7 AS a"))[1].a == 7
+                    close(simple_conn)
                 end
 
                 @testset "Transaction Macro" begin

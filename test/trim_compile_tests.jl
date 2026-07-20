@@ -10,7 +10,10 @@ function _postgres_trim_compile_timeout_s()::Float64
 end
 
 function _postgres_trim_error_budget()::Int
-    return parse(Int, get(ENV, "POSTGRES_TRIM_ERROR_BUDGET", "66"))
+    # StructUtils 2.8.2 still takes its generic construction path. The
+    # companion trim branch removes these errors; keep released-dependency CI
+    # bounded so compiler regressions are visible in the meantime.
+    return parse(Int, get(ENV, "POSTGRES_TRIM_ERROR_BUDGET", "92"))
 end
 
 function _postgres_trim_project_path()::String

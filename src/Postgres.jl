@@ -539,7 +539,7 @@ include("execute.jl")
 # does not exist"). Also one network round trip instead of three. Callers
 # must hold conn.lock.
 function execute_simple(conn::Connection, sql::String)
-    API.exec(conn.socket, sql, conn.debug)
+    API.exec(conn.style, conn.socket, sql, conn.debug)
     return conn
 end
 

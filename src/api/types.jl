@@ -44,6 +44,7 @@ struct Numeric
     coeff::BigInt
     scale::Int
 end
+StructUtils.structlike(::AbstractPostgresStyle, ::Type{Numeric}) = false
 
 Base.:(==)(a::Numeric, b::Numeric) = a.coeff == b.coeff && a.scale == b.scale
 
@@ -692,21 +693,16 @@ end
 end
 
 # ── typed-struct materialization: parse by the declared field type ───────────
-# For struct-filling closure targets (structs and NamedTuples), the wire string passes
-# through untouched and the field's declared type drives decoding via the
-# `StructUtils.lift(::AbstractPostgresStyle, ::Type{FieldT}, ::String)` methods
-# below — every step statically dispatched. `parse_value`'s OID-driven Any
-# return otherwise makes the field-population call dynamic per target struct
-# under `juliac --trim` (and the OID is advisory anyway once the target field
-# type is known). Untyped destinations (ResultRow/Vector{Any}) keep the
-# OID-driven parse_value path above.
 @static if isdefined(StructUtils, :InterpClosure) && isdefined(StructUtils, :HotStructClosure)
+    # Typed targets know each field type, so let their PostgresStyle lift parse
+    # the wire string directly. Untyped destinations keep the OID parser above.
     @inline function applycast(f::Union{StructUtils.InterpClosure, StructUtils.HotStructClosure}, name, typeId, val::String, registry::Dict{Int, TypeInfo})
         f(name, val)
         return
     end
 end
 
+StructUtils.lift(::AbstractPostgresStyle, ::Type{Int8}, s::String) = Parsers.parse(Int8, s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Bool}, s::String) = (s == "t" || s == "1"), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Char}, s::String) = s[1], nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Int16}, s::String) = Parsers.parse(Int16, s), nothing

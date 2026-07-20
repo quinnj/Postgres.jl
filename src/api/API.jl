@@ -860,12 +860,41 @@ function exec(style::S, socket::ReseauConn, stmtname::String, params::Vector{Uni
     return Exec{S}(style, socket, names, typeIds, type_registry, debug, Ref{Union{Nothing, String}}(nothing), Ref{Union{Nothing, Int}}(nothing))
 end
 
-function exec(socket, query::String, debug::Bool)
+function exec(style::S, socket::ReseauConn, query::String, debug::Bool) where {S <: AbstractPostgresStyle}
     writemessages(socket, debug, ('Q', query))
-    waitfor(socket, debug, 'Z')
-    #TODO: handle all the various response message types, like applyeach above + describeprepared
+    server_error = nothing
+    try
+        while true
+            mt, len = readheader(socket, debug)
+            if mt == UInt8('E')
+                # Keep draining through ReadyForQuery before surfacing the
+                # server error so the connection remains reusable.
+                server_error = errorResponse(len, socket, debug)
+            elseif mt == UInt8('Z')
+                skipbytes!(socket, len)
+                break
+            elseif mt == UInt8('N')
+                notice_callback(style, noticeResponse(len, socket))
+            elseif mt == UInt8('A')
+                notification_callback(style, notificationResponse(len, socket))
+            elseif mt == UInt8('C') || mt == UInt8('T') || mt == UInt8('D') ||
+                   mt == UInt8('I') || mt == UInt8('S')
+                # CommandComplete and any incidental simple-query result data.
+                skipbytes!(socket, len)
+            else
+                close_and_throw(socket, Error("unexpected message type '$(Char(mt))' from server; connection protocol state is corrupted"))
+            end
+        end
+    catch
+        close(socket)
+        server_error === nothing || throw(server_error)
+        rethrow()
+    end
+    server_error === nothing || throw(server_error)
     return
 end
+
+exec(socket::ReseauConn, query::String, debug::Bool) = exec(PostgresStyle(), socket, query, debug)
 
 function copy_in(style::S, socket, query::String, source::IO, debug::Bool) where {S <: AbstractPostgresStyle}
     writemessage(socket, debug, 'Q', query)
