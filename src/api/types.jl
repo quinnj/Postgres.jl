@@ -700,9 +700,11 @@ end
 # under `juliac --trim` (and the OID is advisory anyway once the target field
 # type is known). Untyped destinations (ResultRow/Vector{Any}) keep the
 # OID-driven parse_value path above.
-@inline function applycast(f::Union{StructUtils.InterpClosure, StructUtils.HotStructClosure}, name, typeId, val::String, registry::Dict{Int, TypeInfo})
-    f(name, val)
-    return
+@static if isdefined(StructUtils, :InterpClosure) && isdefined(StructUtils, :HotStructClosure)
+    @inline function applycast(f::Union{StructUtils.InterpClosure, StructUtils.HotStructClosure}, name, typeId, val::String, registry::Dict{Int, TypeInfo})
+        f(name, val)
+        return
+    end
 end
 
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Bool}, s::String) = (s == "t" || s == "1"), nothing
