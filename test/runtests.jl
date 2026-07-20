@@ -10,6 +10,16 @@ using Postgres
 using Sockets
 using Random
 
+# Style-based customization (the runtime callback setters are gone): overload the
+# behavior interface on a custom AbstractPostgresStyle and pass it at connect time.
+const LOGGED_EVENTS = NamedTuple[]
+const NOTICE_SEEN = Ref(false)
+struct LoggingStyle <: Postgres.API.AbstractPostgresStyle end
+Postgres.API.query_logging_enabled(::LoggingStyle) = true
+Postgres.API.query_logger(::LoggingStyle, event::Symbol, info::NamedTuple) = (push!(LOGGED_EVENTS, (event=event, info=info)); nothing)
+Postgres.API.notice_callback(::LoggingStyle, notice) = (NOTICE_SEEN[] = true; nothing)
+
+
 # Integration tests for Postgres.jl protocol and API behavior.
 const JSONType = typeof(JSON.lazy("{}"))
 const IMAGE_REF = get(ENV, "POSTGRES_IMAGE", "postgres:16")
@@ -548,6 +558,8 @@ end
         end
     end
 
+    include("trim_compile_tests.jl")
+
     if !docker_available()
         @info "Docker not available; skipping Postgres integration tests."
         @test true
@@ -939,21 +951,17 @@ end
                     @test count_row.count == 3
                 end
 
-                @testset "Query Logger" begin
-                    events = NamedTuple[]
-                    previous = Postgres.get_query_logger(conn)
-                    Postgres.set_query_logger!(conn, (event, info) -> begin
-                        push!(events, (event=event, info=info))
-                        return
-                    end)
-                    rows = Tables.rowtable(DBInterface.execute(conn, "SELECT 1 AS a"))
+                @testset "Query Logger (style)" begin
+                    log_conn = DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, cfg.password; dbname=cfg.dbname, port=cfg.port, style=LoggingStyle())
+                    empty!(LOGGED_EVENTS)
+                    rows = Tables.rowtable(DBInterface.execute(log_conn, "SELECT 1 AS a"))
                     @test rows[1].a == 1
-                    @test !isempty(events)
-                    @test events[end].event == :execute
-                    @test events[end].info.success
-                    @test_throws Postgres.API.Error DBInterface.execute(conn, "INVALID SQL")
-                    @test !events[end].info.success
-                    Postgres.set_query_logger!(conn, previous)
+                    @test !isempty(LOGGED_EVENTS)
+                    @test LOGGED_EVENTS[end].event == :execute
+                    @test LOGGED_EVENTS[end].info.success
+                    @test_throws Postgres.API.Error DBInterface.execute(log_conn, "INVALID SQL")
+                    @test !LOGGED_EVENTS[end].info.success
+                    close(log_conn)
                 end
 
                 @testset "Connection Pool" begin
@@ -1039,16 +1047,12 @@ end
                     DBInterface.close!(cur)
                 end
 
-                @testset "Notice Callback" begin
-                    notice_seen = Ref(false)
-                    previous = Postgres.get_notice_callback(conn)
-                    Postgres.set_notice_callback!(conn, notice -> begin
-                        notice_seen[] = true
-                        return
-                    end)
-                    DBInterface.execute(conn, raw"DO $$ BEGIN RAISE NOTICE 'hello'; END $$;")
-                    Postgres.set_notice_callback!(conn, previous)
-                    @test notice_seen[]
+                @testset "Notice Callback (style)" begin
+                    NOTICE_SEEN[] = false
+                    notice_conn = DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, cfg.password; dbname=cfg.dbname, port=cfg.port, style=LoggingStyle())
+                    DBInterface.execute(notice_conn, raw"DO $$ BEGIN RAISE NOTICE 'hello'; END $$;")
+                    close(notice_conn)
+                    @test NOTICE_SEEN[]
                 end
 
                 @testset "Cancel Request" begin
@@ -1075,6 +1079,8 @@ end
                     complex_interval = only(Tables.rowtable(DBInterface.execute(conn, "SELECT '1 year 2 mons 3 days 04:05:06.789'::interval AS interval_col")))
                     @test complex_interval.interval_col == Dates.CompoundPeriod(Dates.Year(1), Dates.Month(2), Dates.Day(3), Dates.Hour(4), Dates.Minute(5), Dates.Second(6), Dates.Millisecond(789))
                 end
+
+                run_postgres_trim_compile_tests(cfg)
             finally
                 isopen(conn) && DBInterface.close!(conn)
             end
