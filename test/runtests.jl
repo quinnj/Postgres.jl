@@ -624,7 +624,7 @@ end
                     # a consumer exception mid-result drains the remaining rows so
                     # the connection stays usable
                     stmt = DBInterface.prepare(connp, "SELECT i AS x, repeat('y', 10) AS s FROM generate_series(1, 200) i")
-                    ex = Postgres.API.exec(connp.socket, stmt.name, Union{String, Missing}[], stmt.names, stmt.typeIds, connp.type_registry, false)
+                    ex = Postgres.API.exec(connp.style, connp.socket, stmt.name, Union{String, Missing}[], stmt.names, stmt.typeIds, connp.type_registry, false)
                     err = try
                         StructUtils.applyeach(Postgres.API.PostgresStyle(), ex) do i, row
                             i == 3 && error("consumer abort")
