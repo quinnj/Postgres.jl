@@ -533,6 +533,19 @@ end
             parsed = Postgres.API.parse_array_by_oid(pg_array_literal(values), 23, registry)
             @test isequal(parsed, values)
         end
+
+        # The bind path builds the same literal syntax the parser consumes:
+        # element strings are double-quoted with embedded quotes and
+        # backslashes escaped. Round-trip serializer output through the parser
+        # so the two sides can never drift apart.
+        @test Postgres._param(["a\"b", "c\\d", "plain"]) ==
+              "{\"a\\\"b\", \"c\\\\d\", \"plain\"}"
+        hostile = ["He said \"hi\"", "C:\\temp\\x", "", "NULL", "{brace, comma}", "\\\""]
+        @test Postgres.API.parse_array_by_oid(Postgres._param(hostile), 25, registry) == hostile
+        for _ in 1:200
+            values = [random_array_string(rng) for _ in 1:rand(rng, 0:8)]
+            @test Postgres.API.parse_array_by_oid(Postgres._param(values), 25, registry) == values
+        end
     end
 
     if !docker_available()
@@ -717,6 +730,11 @@ end
                     bytea_param = UInt8[0xde, 0xad, 0xbe, 0xef]
                     bytea_row = only(Tables.rowtable(DBInterface.execute(conn, raw"SELECT $1::bytea AS bytea_col", (bytea_param,))))
                     @test bytea_row.bytea_col == bytea_param
+                    # String array binds must survive quotes and backslashes in
+                    # elements end to end, not just through the client parser.
+                    text_array_param = ["He said \"hi\"", "C:\\temp\\x", "", "NULL", "{brace, comma}"]
+                    text_array_row = only(Tables.rowtable(DBInterface.execute(conn, raw"SELECT $1::text[] AS text_array", (text_array_param,))))
+                    @test text_array_row.text_array == text_array_param
                     array_types_row = only(Tables.rowtable(DBInterface.execute(conn, """
                         SELECT
                             ARRAY['12345678-1234-5678-1234-567812345678']::uuid[] AS uuid_array,

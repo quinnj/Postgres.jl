@@ -174,7 +174,7 @@ _param(x::AbstractVector{UInt8}) = string("\\x", bytes2hex(x))
 # convert to postgres array literal syntax: { x, y, z }
 # strings must be double-quoted and double quotes and backslashes escaped
 # missing values are NULL
-_aparam(x::AbstractString) = string("\"", replace(x, r"([\"\\])" => "\\1"), "\"")
+_aparam(x::AbstractString) = string("\"", replace(x, r"([\"\\])" => s"\\\1"), "\"")
 _aparam(::Missing) = "NULL"
 _aparam(::Nothing) = "NULL"
 _aparam(x) = _param(x)
