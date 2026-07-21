@@ -1,8 +1,9 @@
 module API
 
 using UUIDs, Dates, Reseau, SASLAuth, MD5, Parsers, StructUtils, Logging, JSON, Random
+import ..PostgresInterfaceError
 
-export PostgresStyle, Error, Notification, Numeric, PostgresRange
+export PostgresStyle, AbstractPostgresStyle, query_logging_enabled, query_logger, notice_callback, notification_callback, Error, Notification, Numeric, PostgresRange
 
 const ReseauConn = Union{Reseau.TCP.Conn, Reseau.TLS.Conn}
 const SKIP_BUFFER_SIZE = 8192
@@ -179,6 +180,9 @@ msgsizeof(x) = sizeof(x)
 msgsizeof(x::Tuple{String, String}) = sizeof(x[1]) + 1 + sizeof(x[2]) + 1
 msgsizeof(x::Params) = sum(4 + (ismissing(p) ? 0 : sizeof(p)) for p in x.params; init=0)
 
+_msgsizeof_parts(::Tuple{}) = 0
+_msgsizeof_parts(parts::Tuple) = msgsizeof(first(parts)) + _msgsizeof_parts(Base.tail(parts))
+
 writepart(io, x) = write(io, x)
 function writepart(io, x::String)
     write(io, x)
@@ -203,34 +207,89 @@ function writepart(io, x::Params)
     end
 end
 
-function writemessage(socket, debug, code::Char, parts...)
+_writeparts(io, ::Tuple{}) = nothing
+function _writeparts(io, parts::Tuple)
+    writepart(io, first(parts))
+    _writeparts(io, Base.tail(parts))
+    return nothing
+end
+
+function _write_message_to_buffer(buf::IOBuffer, debug::Bool, msg::Tuple)
+    code = first(msg)::Char
+    parts = Base.tail(msg)
     debug && @info "sending message: $code, $parts"
-    len = Int32(4 + sum(msgsizeof(x) for x in parts; init=0))
+    len = Int32(4 + _msgsizeof_parts(parts))
+    code != '\0' && write(buf, UInt8(code))
+    write(buf, hton(len))
+    _writeparts(buf, parts)
+    return nothing
+end
+
+function _writemessage_parts(socket, debug::Bool, code::Char, parts::Tuple)::Nothing
+    debug && @info "sending message: $code, $parts"
+    len = Int32(4 + _msgsizeof_parts(parts))
     buf = IOBuffer(Vector{UInt8}(undef, len + 1); write=true)
     code != '\0' && write(buf, UInt8(code))
     write(buf, hton(len))
-    for part in parts
-        writepart(buf, part)
+    _writeparts(buf, parts)
+    write(socket, take!(buf))
+    flush(socket)
+    return nothing
+end
+
+writemessage(socket, debug::Bool, code::Char) = _writemessage_parts(socket, debug, code, ())
+writemessage(socket, debug::Bool, code::Char, part1) = _writemessage_parts(socket, debug, code, (part1,))
+writemessage(socket, debug::Bool, code::Char, part1, part2) = _writemessage_parts(socket, debug, code, (part1, part2))
+writemessage(socket, debug::Bool, code::Char, part1, part2, part3) = _writemessage_parts(socket, debug, code, (part1, part2, part3))
+writemessage(socket, debug::Bool, code::Char, parts...) = _writemessage_parts(socket, debug, code, parts)
+
+function _write_startup_param(buf::IOBuffer, key::String, value::String)::Nothing
+    writepart(buf, (key, value))
+    return nothing
+end
+
+function writestartupmessage(
+    socket,
+    debug::Bool,
+    user::String,
+    dbname::String,
+    application_name::Union{Nothing, String},
+    statement_timeout::Union{Nothing, Int},
+)::Nothing
+    timeout_options = statement_timeout === nothing ? nothing : string("-c statement_timeout=", statement_timeout)
+    len = 8 + msgsizeof(("user", user)) + msgsizeof(("database", dbname)) + 1
+    application_name !== nothing && (len += msgsizeof(("application_name", application_name)))
+    timeout_options !== nothing && (len += msgsizeof(("options", timeout_options)))
+    debug && @info "sending startup message"
+    buf = IOBuffer(Vector{UInt8}(undef, len); write=true)
+    write(buf, hton(Int32(len)))
+    write(buf, hton(Int32(196608)))
+    _write_startup_param(buf, "user", user)
+    _write_startup_param(buf, "database", dbname)
+    application_name !== nothing && _write_startup_param(buf, "application_name", application_name)
+    timeout_options !== nothing && _write_startup_param(buf, "options", timeout_options)
+    write(buf, UInt8(0))
+    write(socket, take!(buf))
+    flush(socket)
+    return nothing
+end
+
+function writemessages(socket, debug::Bool, msgs::Vararg{Tuple, N}) where {N}
+    buf = IOBuffer()
+    for msg in msgs
+        _write_message_to_buffer(buf, debug, msg)
     end
     write(socket, take!(buf))
     flush(socket)
     return
 end
 
-function writemessages(socket, debug, msgs...)
-    buf = IOBuffer()
-    for (code, parts...) in msgs
-        debug && @info "sending message: $code, $parts"
-        len = Int32(4 + sum(msgsizeof(x) for x in parts; init=0))
-        code != '\0' && write(buf, UInt8(code))
-        write(buf, hton(len))
-        for part in parts
-            writepart(buf, part)
-        end
-    end
-    write(socket, take!(buf))
-    flush(socket)
-    return
+_sum_codes(::Tuple{}) = 0
+_sum_codes(codes::Tuple) = UInt8(first(codes)) + _sum_codes(Base.tail(codes))
+
+_contains_code(::UInt8, ::Tuple{}) = false
+function _contains_code(mt::UInt8, codes::Tuple)
+    return mt == UInt8(first(codes)) || _contains_code(mt, Base.tail(codes))
 end
 
 function skipbytes!(io::IO, n::Integer)
@@ -309,10 +368,10 @@ function expect_auth_message(socket, debug, mt, len)
 end
 
 # wait for code, then ready
-function waitfor(socket, debug, codes...)
+function waitfor(socket, debug::Bool, codes::Vararg{Char, N}) where {N}
     error = false
     error_msg = nothing
-    found = sum(UInt8, codes)
+    found = _sum_codes(codes)
     pid = skey = Int32(0)
     server_params = Dict{String, String}()
     debug && @info "waitfor: $codes"
@@ -342,19 +401,17 @@ function waitfor(socket, debug, codes...)
                     server_params[key] = val
                     i = j + 1
                 end
-            elseif Char(mt) in codes
+            elseif _contains_code(mt, codes)
                 # found
                 found -= mt
                 if mt == UInt8('K')
                     pid = ntoh(read(socket, Int32))
                     skey = ntoh(read(socket, Int32))
                 else
+                    # read off message
                     skipbytes!(socket, len)
                 end
                 found == 0 && break
-            else
-                # read off message
-                skipbytes!(socket, len)
             end
         end
     catch
@@ -441,7 +498,7 @@ function authRequest(debug, len, socket, user, password, client::Union{Nothing, 
         mechanisms = split(data, '\0'; keepempty=false)
 
         if "SCRAM-SHA-256" ∉ mechanisms
-            close_and_throw(socket, Error("no supported SASL mechanisms: $mechanisms"))
+            close_and_throw(socket, Error("no supported SASL mechanisms"))
         end
         client = SASLAuth.SCRAMSHA256Client(user, password)
         msg, _ = SASLAuth.step!(client, nothing)
@@ -473,7 +530,30 @@ function authRequest(debug, len, socket, user, password, client::Union{Nothing, 
     end
 end
 
-function connectsocket(host::AbstractString, port::Integer; connect_timeout::Union{Int, Nothing}=nothing)
+function authRequest(debug, len, socket, user, ::Nothing, client::Nothing=nothing)
+    auth_code = ntoh(read(socket, Int32))
+    debug && @info "auth code: $auth_code"
+    if auth_code == 0
+        return socket
+    elseif auth_code == 2
+        close_and_throw(socket, Error("kerberos v5 authentication not supported"))
+    elseif auth_code == 3 || auth_code == 5 || auth_code == 10 || auth_code == 11 || auth_code == 12
+        close_and_throw(socket, Error("server requested password authentication but no password was provided"))
+    elseif auth_code == 7
+        close_and_throw(socket, Error("GSSAPI authentication not supported"))
+    elseif auth_code == 8
+        close_and_throw(socket, Error("GSSAPI/SSPI continuation not supported"))
+    elseif auth_code == 9
+        close_and_throw(socket, Error("SSPI authentication not supported"))
+    else
+        close_and_throw(socket, Error("unknown authentication code: $auth_code"))
+    end
+end
+
+connectsocket(host::AbstractString, port::Integer; connect_timeout::Union{Int, Nothing}=nothing) =
+    connectsocket(host, port, connect_timeout)
+
+function connectsocket(host::AbstractString, port::Integer, @nospecialize(connect_timeout::Union{Int, Nothing}))
     address = string(host, ":", Int(port))
     return if connect_timeout === nothing
         Reseau.TCP.connect(address)
@@ -493,20 +573,30 @@ function tlsupgrade(
         ssl_cacert::Union{String, Nothing}=nothing,
         ssl_capath::Union{String, Nothing}=nothing,
     )
+    return tlsupgrade(socket, connect_timeout, server_name, verify_peer,
+                      ssl_cert, ssl_key, ssl_cacert, ssl_capath)
+end
+
+function tlsupgrade(socket::Reseau.TCP.Conn, @nospecialize(connect_timeout::Union{Int, Nothing}),
+                    @nospecialize(server_name::Union{String, Nothing}), verify_peer::Bool,
+                    @nospecialize(ssl_cert::Union{String, Nothing}), @nospecialize(ssl_key::Union{String, Nothing}),
+                    @nospecialize(ssl_cacert::Union{String, Nothing}), @nospecialize(ssl_capath::Union{String, Nothing}))
     ca_file = ssl_cacert === nothing ? ssl_capath : ssl_cacert
     handshake_timeout_ns = connect_timeout === nothing ? Int64(0) : Int64(connect_timeout) * 1_000_000_000
-    tls_conn = Reseau.TLS.client(
-        socket,
-        Reseau.TLS.Config(
-            ;
-            server_name,
-            verify_peer,
-            cert_file=ssl_cert,
-            key_file=ssl_key,
-            ca_file,
-            handshake_timeout_ns,
-        ),
-    )
+    sni = server_name isa String ? server_name : nothing
+
+    # positional Config, split on the cert/key pair: the kwargs form (and >2
+    # Union-valued args at once) is unresolvable dynamic dispatch under --trim
+    config = if ssl_cert === nothing && ssl_key === nothing
+        Reseau.TLS.Config(sni, verify_peer, verify_peer, Reseau.TLS.ClientAuthMode.NoClientCert,
+                          nothing, nothing, ca_file, nothing, String[], UInt16[],
+                          handshake_timeout_ns, Reseau.TLS.TLS1_2_VERSION, nothing, false)
+    else
+        Reseau.TLS.Config(sni, verify_peer, verify_peer, Reseau.TLS.ClientAuthMode.NoClientCert,
+                          ssl_cert::String, ssl_key::String, ca_file, nothing, String[], UInt16[],
+                          handshake_timeout_ns, Reseau.TLS.TLS1_2_VERSION, nothing, false)
+    end
+    tls_conn = Reseau.TLS.client(socket, config)
     try
         Reseau.TLS.handshake!(tls_conn)
         return tls_conn
@@ -519,9 +609,23 @@ end
 # sslservername: TLS SNI override for when `host` is a pre-resolved address —
 # SNI-routed servers (e.g. Neon) need the hostname on the TLS handshake even
 # when the TCP dial goes to an IP.
-function connect(host::String, port::Integer, dbname::String, user::String, password::Union{String, Nothing}, debug::Bool, application_name::Union{String, Nothing}, connect_timeout::Union{Int, Nothing}, sslmode::Union{String, Nothing}, sslrootcert::Union{String, Nothing}, sslcert::Union{String, Nothing}, sslkey::Union{String, Nothing}, sslcapath::Union{String, Nothing}, statement_timeout::Union{Int, Nothing}; sslservername::Union{String, Nothing}=nothing)
-    socket = connectsocket(host, port; connect_timeout)
-    sslmode_str = sslmode === nothing ? "prefer" : lowercase(String(sslmode))
+function connect(host::String, port::Integer, dbname::String, user::String, @nospecialize(password::Union{String, Nothing}), debug::Bool, @nospecialize(application_name::Union{String, Nothing}), @nospecialize(connect_timeout::Union{Int, Nothing}), @nospecialize(sslmode::Union{String, Nothing}), @nospecialize(sslrootcert::Union{String, Nothing}), @nospecialize(sslcert::Union{String, Nothing}), @nospecialize(sslkey::Union{String, Nothing}), @nospecialize(sslcapath::Union{String, Nothing}), @nospecialize(sslservername::Union{String, Nothing}), @nospecialize(statement_timeout::Union{Int, Nothing}))
+    # re-assert the @nospecialize'd params to their declared unions: the asserts give
+    # inference the (static) union types without re-introducing per-argument
+    # specialization, so the kwarg NamedTuples below have static types instead of
+    # runtime apply_type — which `juliac --trim` can't resolve
+    password_v = password::Union{String, Nothing}
+    application_name_v = application_name::Union{String, Nothing}
+    connect_timeout_v = connect_timeout::Union{Int, Nothing}
+    sslmode_v = sslmode::Union{String, Nothing}
+    sslrootcert_v = sslrootcert::Union{String, Nothing}
+    sslcert_v = sslcert::Union{String, Nothing}
+    sslkey_v = sslkey::Union{String, Nothing}
+    sslcapath_v = sslcapath::Union{String, Nothing}
+    sslservername_v = sslservername::Union{String, Nothing}
+    statement_timeout_v = statement_timeout::Union{Int, Nothing}
+    socket = connectsocket(host, port, connect_timeout_v)
+    sslmode_str = sslmode_v === nothing ? "prefer" : lowercase(String(sslmode_v))
     sslmode_str == "disable" || sslmode_str == "prefer" || sslmode_str == "require" || sslmode_str == "verify-full" || throw(Error("invalid sslmode: $sslmode_str"))
     if sslmode_str != "disable"
         # send SSLRequest
@@ -529,16 +633,10 @@ function connect(host::String, port::Integer, dbname::String, user::String, pass
         mt = read(socket, UInt8)
         if mt == UInt8('S')
             # upgrade socket to tls and do handshake
-            socket = tlsupgrade(
-                socket;
-                connect_timeout,
-                server_name=something(sslservername, host),
-                verify_peer=sslmode_str == "verify-full",
-                ssl_cert=sslcert,
-                ssl_key=sslkey,
-                ssl_cacert=sslrootcert,
-                ssl_capath=sslcapath,
-            )
+            socket = tlsupgrade(socket, connect_timeout_v,
+                                sslservername_v isa String ? sslservername_v : host,
+                                sslmode_str == "verify-full",
+                                sslcert_v, sslkey_v, sslrootcert_v, sslcapath_v)
         elseif mt == UInt8('N')
             (sslmode_str == "require" || sslmode_str == "verify-full") && throw(Error("server does not support SSL"))
         elseif mt == UInt8('E')
@@ -549,22 +647,19 @@ function connect(host::String, port::Integer, dbname::String, user::String, pass
             close_and_throw(socket, Error("unexpected response to SSLRequest: $(Char(mt))"))
         end
     end
-    # Build startup parameters
-    params = [("user", user), ("database", dbname)]
-    if !isnothing(application_name)
-        push!(params, ("application_name", application_name))
+    # socket-union isa split (post-TLS-upgrade φ) so the call resolves under --trim
+    if socket isa Reseau.TCP.Conn
+        writestartupmessage(socket::Reseau.TCP.Conn, debug, user, dbname, application_name_v, statement_timeout_v)
+    else
+        writestartupmessage(socket::Reseau.TLS.Conn, debug, user, dbname, application_name_v, statement_timeout_v)
     end
-    if !isnothing(statement_timeout)
-        push!(params, ("options", "-c statement_timeout=$(statement_timeout)"))
-    end
-    writemessage(socket, debug, '\0', Int32(196608), params..., UInt8(0))
     # read initial response
     mt, len = readheader(socket, debug)
     if mt == UInt8('E')
         # error
         close_and_throw_error_response(socket, len, debug)
     elseif mt == UInt8('R')
-        authRequest(debug, len, socket, user, password)
+        authRequest(debug, len, socket, user, password_v)
     elseif mt == UInt8('v')
         # server version too old
         close_and_throw(socket, Error("server version too old"))
@@ -640,15 +735,9 @@ struct DataRow
     type_registry::Dict{Int, TypeInfo}
 end
 
-struct PostgresStyle <: StructUtils.StructStyle end
+# (style types + behavior interface live in types.jl, included before this point)
 
-StructUtils.fieldtagkey(::PostgresStyle) = :postgres
-StructUtils.structlike(::PostgresStyle, ::Type{<:Number}) = false
-StructUtils.structlike(::PostgresStyle, ::Type{<:JSON.LazyValue}) = false
-StructUtils.lift(::PostgresStyle, ::Type{T}, x::T) where {T<:JSON.LazyValue} = x, nothing
-StructUtils.lift(::PostgresStyle, ::Type{T}, x::T, tags) where {T<:JSON.LazyValue} = x, nothing
-
-function StructUtils.applyeach(::PostgresStyle, f, dr::DataRow)
+function StructUtils.applyeach(::AbstractPostgresStyle, f, dr::DataRow)
     buf = dr.buf
     GC.@preserve buf begin
         ncols = Int(ntoh(unsafe_load(Ptr{Int16}(pointer(buf)))))
@@ -669,14 +758,13 @@ function StructUtils.applyeach(::PostgresStyle, f, dr::DataRow)
     return
 end
 
-struct Exec{N, A}
+struct Exec{S <: AbstractPostgresStyle}
+    style::S
     socket::ReseauConn
     names::Vector{Symbol}
     typeIds::Vector{Int}
     type_registry::Dict{Int, TypeInfo}
     debug::Bool
-    notice_callback::N
-    notification_callback::A
     command_tag::Base.RefValue{Union{Nothing, String}}
     rows_affected::Base.RefValue{Union{Nothing, Int}}
 end
@@ -697,7 +785,7 @@ function rows_affected_from_command_tag(tag::String)
     end
 end
 
-function StructUtils.applyeach(::PostgresStyle, f, e::Exec)
+function StructUtils.applyeach(::AbstractPostgresStyle, f, e::Exec)
     nrows = 0
     server_error = nothing
     consumer_error = nothing
@@ -736,11 +824,11 @@ function StructUtils.applyeach(::PostgresStyle, f, e::Exec)
             elseif mt == UInt8('A')
                 # notification response
                 notification = notificationResponse(len, e.socket)
-                e.notification_callback(notification)
+                notification_callback(e.style, notification)
             elseif mt == UInt8('N')
                 # notice response
                 notice = noticeResponse(len, e.socket)
-                e.notice_callback(notice)
+                notice_callback(e.style, notice)
             else
                 throw(Error("unexpected message type '$(Char(mt))' from server; connection protocol state is corrupted"))
             end
@@ -762,24 +850,53 @@ function StructUtils.applyeach(::PostgresStyle, f, e::Exec)
     return
 end
 
-function exec(socket::ReseauConn, stmtname::String, params::Vector{Union{String, Missing}}, names, typeIds, type_registry::Dict{Int, TypeInfo}, debug::Bool, rowlimit::Int=0, notice_callback::N=(notice)->nothing, notification_callback::A=(notification)->nothing) where {N, A}
+function exec(style::S, socket::ReseauConn, stmtname::String, params::Vector{Union{String, Missing}}, names, typeIds, type_registry::Dict{Int, TypeInfo}, debug::Bool, rowlimit::Int=0) where {S <: AbstractPostgresStyle}
     #TODO: support binary format: here and in applycast
     npformats = Int16(0) # all params use text format
     nparams = Int16(length(params))
     # bind, then execute, then sync
     writemessages(socket, debug, ('B', "", stmtname, npformats, nparams, Params(params), Int16(0)), ('E', "", Int32(rowlimit)), ('S',))
     waitfor(socket, debug, '2')
-    return Exec(socket, names, typeIds, type_registry, debug, notice_callback, notification_callback, Ref{Union{Nothing, String}}(nothing), Ref{Union{Nothing, Int}}(nothing))
+    return Exec{S}(style, socket, names, typeIds, type_registry, debug, Ref{Union{Nothing, String}}(nothing), Ref{Union{Nothing, Int}}(nothing))
 end
 
-function exec(socket, query::String, debug::Bool)
+function exec(style::S, socket::ReseauConn, query::String, debug::Bool) where {S <: AbstractPostgresStyle}
     writemessages(socket, debug, ('Q', query))
-    waitfor(socket, debug, 'Z')
-    #TODO: handle all the various response message types, like applyeach above + describeprepared
+    server_error = nothing
+    try
+        while true
+            mt, len = readheader(socket, debug)
+            if mt == UInt8('E')
+                # Keep draining through ReadyForQuery before surfacing the
+                # server error so the connection remains reusable.
+                server_error = errorResponse(len, socket, debug)
+            elseif mt == UInt8('Z')
+                skipbytes!(socket, len)
+                break
+            elseif mt == UInt8('N')
+                notice_callback(style, noticeResponse(len, socket))
+            elseif mt == UInt8('A')
+                notification_callback(style, notificationResponse(len, socket))
+            elseif mt == UInt8('C') || mt == UInt8('T') || mt == UInt8('D') ||
+                   mt == UInt8('I') || mt == UInt8('S')
+                # CommandComplete and any incidental simple-query result data.
+                skipbytes!(socket, len)
+            else
+                close_and_throw(socket, Error("unexpected message type '$(Char(mt))' from server; connection protocol state is corrupted"))
+            end
+        end
+    catch
+        close(socket)
+        server_error === nothing || throw(server_error)
+        rethrow()
+    end
+    server_error === nothing || throw(server_error)
     return
 end
 
-function copy_in(socket, query::String, source::IO, debug::Bool, notice_callback::Function, notification_callback::Function)
+exec(socket::ReseauConn, query::String, debug::Bool) = exec(PostgresStyle(), socket, query, debug)
+
+function copy_in(style::S, socket, query::String, source::IO, debug::Bool) where {S <: AbstractPostgresStyle}
     writemessage(socket, debug, 'Q', query)
     error_msg = nothing
     while true
@@ -791,10 +908,10 @@ function copy_in(socket, query::String, source::IO, debug::Bool, notice_callback
             error_msg = errorResponse(len, socket, debug)
         elseif mt == UInt8('N')
             notice = noticeResponse(len, socket)
-            notice_callback(notice)
+            notice_callback(style, notice)
         elseif mt == UInt8('A')
             notification = notificationResponse(len, socket)
-            notification_callback(notification)
+            notification_callback(style, notification)
         else
             skipbytes!(socket, len)
         end
@@ -816,10 +933,10 @@ function copy_in(socket, query::String, source::IO, debug::Bool, notice_callback
             skipbytes!(socket, len)
         elseif mt == UInt8('N')
             notice = noticeResponse(len, socket)
-            notice_callback(notice)
+            notice_callback(style, notice)
         elseif mt == UInt8('A')
             notification = notificationResponse(len, socket)
-            notification_callback(notification)
+            notification_callback(style, notification)
         elseif mt == UInt8('Z')
             skipbytes!(socket, len)
             break
@@ -831,7 +948,7 @@ function copy_in(socket, query::String, source::IO, debug::Bool, notice_callback
     return
 end
 
-function copy_out(socket, query::String, dest::IO, debug::Bool, notice_callback::Function, notification_callback::Function)
+function copy_out(style::S, socket, query::String, dest::IO, debug::Bool) where {S <: AbstractPostgresStyle}
     writemessage(socket, debug, 'Q', query)
     error_msg = nothing
     while true
@@ -848,10 +965,10 @@ function copy_out(socket, query::String, dest::IO, debug::Bool, notice_callback:
             error_msg = errorResponse(len, socket, debug)
         elseif mt == UInt8('N')
             notice = noticeResponse(len, socket)
-            notice_callback(notice)
+            notice_callback(style, notice)
         elseif mt == UInt8('A')
             notification = notificationResponse(len, socket)
-            notification_callback(notification)
+            notification_callback(style, notification)
         elseif mt == UInt8('Z')
             skipbytes!(socket, len)
             break
@@ -898,5 +1015,10 @@ export cancel_request
 
 include("../array_parsing.jl")
 using .ArrayParsing
+
+function __init__()
+    _populate_default_type_registry!()
+    return nothing
+end
 
 end

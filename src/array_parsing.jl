@@ -1,6 +1,7 @@
 module ArrayParsing
 
-using Parsers
+using Parsers, Dates, UUIDs
+import ..pg_parse_date, ..pg_parse_time, ..pg_parse_datetime_any, ..parse_numeric, ..Numeric
 
 const BRACKET_OPEN = UInt8('[')
 const BRACKET_CLOSE = UInt8(']')
@@ -75,7 +76,7 @@ function parse_bool_token(token::String)
     throw(ArgumentError("invalid boolean token: $token"))
 end
 
-function parse_scalar(token::String, inner_type::DataType, quoted::Bool)
+function parse_scalar(token::String, inner_type::Type{T}, quoted::Bool) where {T}
     !quoted && token == NULL_STR && return missing
     inner_type === String && return token
     inner_type === Bool && return parse_bool_token(token)
@@ -84,10 +85,15 @@ function parse_scalar(token::String, inner_type::DataType, quoted::Bool)
     inner_type === Int64 && return Parsers.parse(Int64, token)
     inner_type === Float32 && return Parsers.parse(Float32, token)
     inner_type === Float64 && return Parsers.parse(Float64, token)
+    inner_type === Date && return pg_parse_date(token)
+    inner_type === Time && return pg_parse_time(token)
+    inner_type === DateTime && return pg_parse_datetime_any(token)
+    inner_type === UUID && return UUID(token)
+    inner_type === Numeric && return parse_numeric(token)
     return token
 end
 
-function coerce_array(values::Vector{Any}, inner_type::DataType)
+function coerce_array(values::Vector{Any}, inner_type::Type{T}) where {T}
     isempty(values) && return inner_type[]
     has_nested = false
     has_missing = false
@@ -119,7 +125,7 @@ function coerce_array(values::Vector{Any}, inner_type::DataType)
     return dest
 end
 
-function parse_array_value(code::Base.CodeUnits{UInt8, String}, pos::Ref{Int}, inner_type::DataType)
+function parse_array_value(code::Base.CodeUnits{UInt8, String}, pos::Ref{Int}, inner_type::Type{T}) where {T}
     c = code[pos[]]
     if c == BRACE_OPEN || c == BRACKET_OPEN
         return parse_array_inner(code, pos, inner_type)
@@ -132,7 +138,7 @@ function parse_array_value(code::Base.CodeUnits{UInt8, String}, pos::Ref{Int}, i
     end
 end
 
-function parse_array_inner(code::Base.CodeUnits{UInt8, String}, pos::Ref{Int}, inner_type::DataType)
+function parse_array_inner(code::Base.CodeUnits{UInt8, String}, pos::Ref{Int}, inner_type::Type{T}) where {T}
     values = Any[]
     pos[] += 1
     while pos[] <= length(code)
@@ -153,7 +159,7 @@ function parse_array_inner(code::Base.CodeUnits{UInt8, String}, pos::Ref{Int}, i
     return coerce_array(values, inner_type)
 end
 
-function parse_array(str::String, inner_type::DataType)
+function parse_array(str::String, inner_type::Type{T}) where {T}
     code = codeunits(str)
     pos = Ref{Int}(1)
     skip_ws(code, pos)

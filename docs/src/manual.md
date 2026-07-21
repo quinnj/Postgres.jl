@@ -108,6 +108,20 @@ profiles = DBInterface.execute(conn, """
 
 The `postgres=(name=:column_name,)` tag is only needed when a column should map to a differently named field. Columns such as `id` or `name` can be left untagged because they already match the Julia field name.
 
+### Driver Styles
+
+Connection behavior such as query logging, server notices, and asynchronous
+notifications is selected by a concrete driver style. Subtype
+`Postgres.AbstractPostgresStyle`, overload the documented behavior hooks for
+that style, and pass an instance with the `style` connection keyword. The
+default `Postgres.PostgresStyle` keeps query logging disabled and reports
+server notices through Julia's logger.
+
+```@docs
+Postgres.AbstractPostgresStyle
+Postgres.PostgresStyle
+```
+
 ## Parameters And Prepared Statements
 
 Use PostgreSQL placeholders (`$1`, `$2`, ...) and pass a tuple or other iterable of parameter values.

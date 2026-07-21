@@ -42,8 +42,11 @@ function DBInterface.close!(::Result)
     return
 end
 
-mutable struct Statement <: DBInterface.Statement
-    const conn::Connection
+# parametric on the connection's style so `conn` stays a concrete type — with the
+# 2-parameter Connection, a bare `Connection{Statement}` field is a UnionAll, making
+# every stmt.conn access (and everything downstream) dynamic under `juliac --trim`
+mutable struct Statement{S <: API.AbstractPostgresStyle} <: DBInterface.Statement
+    const conn::Connection{Statement{S}, S}
     name::String
     const sql::String
     const nfields::Int
@@ -60,8 +63,9 @@ end
 
 DBInterface.getconnection(stmt::Statement) = stmt.conn
 
-mutable struct Cursor
-    const conn::Connection
+# parametric on the connection's style, same rationale as Statement{S}
+mutable struct Cursor{S <: API.AbstractPostgresStyle}
+    const conn::Connection{Statement{S}, S}
     const portal::String
     const names::Vector{Symbol}
     const typeIds::Vector{Int}
@@ -75,9 +79,9 @@ mutable struct Cursor
     owns_transaction::Bool
 end
 
-Base.IteratorSize(::Type{Cursor}) = Base.SizeUnknown()
-Base.IteratorEltype(::Type{Cursor}) = Base.HasEltype()
-Base.eltype(::Type{Cursor}) = ResultRow
+Base.IteratorSize(::Type{<:Cursor}) = Base.SizeUnknown()
+Base.IteratorEltype(::Type{<:Cursor}) = Base.HasEltype()
+Base.eltype(::Type{<:Cursor}) = ResultRow
 
 function Base.show(io::IO, stmt::Statement)
     println(io, "Postgres.Statement:")
@@ -118,7 +122,7 @@ function DBInterface.prepare(conn::Connection, sql::AbstractString; debug::Bool=
             nparams, names, types = API.describeprepared(conn.socket, name, debug)
             params = Union{String, Missing}[missing for _ = 1:nparams]
             last_used = next_statement_clock!(conn)
-            return Statement(conn, name, sql_str, length(names), names, types, nparams, params, false, false, conn.generation, last_used)
+            return Statement{_style_type(conn)}(conn, name, sql_str, length(names), names, types, nparams, params, false, false, conn.generation, last_used)
         end
         # evict if at max size
         while length(conn.statements) >= conn.statement_cache_maxsize
@@ -129,7 +133,7 @@ function DBInterface.prepare(conn::Connection, sql::AbstractString; debug::Bool=
         nparams, names, types = API.describeprepared(conn.socket, name, debug)
         params = Union{String, Missing}[missing for _ = 1:nparams]
         last_used = next_statement_clock!(conn)
-        stmt = Statement(conn, name, sql_str, length(names), names, types, nparams, params, false, true, conn.generation, last_used)
+        stmt = Statement{_style_type(conn)}(conn, name, sql_str, length(names), names, types, nparams, params, false, true, conn.generation, last_used)
         conn.statements[sql_str] = stmt
         return stmt
     end
@@ -143,7 +147,6 @@ function DBInterface.close!(stmt::Statement)
             stmt.closed = true
             return
         end
-        checkconn(stmt.conn)
         stmt.cached && haskey(stmt.conn.statements, stmt.sql) && stmt.conn.statements[stmt.sql] === stmt && delete!(stmt.conn.statements, stmt.sql)
         API.close_statement(stmt.conn.socket, stmt.name, stmt.conn.debug)
         stmt.closed = true
@@ -166,21 +169,48 @@ function DBInterface.close!(cursor::Cursor)
 end
 Base.close(cursor::Cursor) = DBInterface.close!(cursor)
 
-_param(x::AbstractString) = String(x)
-_param(x) = string(x)
+_param(x::AbstractString)::String = String(x)
+_param(x)::String = string(x)
 _param(x::Missing) = x
 _param(::Nothing) = missing
-_param(x::AbstractVector{UInt8}) = string("\\x", bytes2hex(x))
+_param(x::AbstractVector{UInt8})::String = string("\\x", bytes2hex(x))
 # convert to postgres array literal syntax: { x, y, z }
 # strings must be double-quoted and double quotes and backslashes escaped
 # missing values are NULL
-_aparam(x::AbstractString) = string("\"", replace(x, r"([\"\\])" => s"\\\1"), "\"")
-_aparam(::Missing) = "NULL"
-_aparam(::Nothing) = "NULL"
-_aparam(x) = _param(x)
-_param(x::AbstractVector) = string("{", join([_aparam(y) for y in x], ", "), "}")
+_aparam(x::AbstractString)::String = string("\"", replace(x, r"([\"\\])" => s"\\\1"), "\"")
+_aparam(::Missing)::String = "NULL"
+_aparam(::Nothing)::String = "NULL"
+_aparam(x)::String = _param(x)
+function _param(x::AbstractVector)::String
+    io = IOBuffer()
+    write(io, '{')
+    first_item = true
+    for y in x
+        if first_item
+            first_item = false
+        else
+            write(io, ", ")
+        end
+        write(io, _aparam(y))
+    end
+    write(io, '}')
+    return String(take!(io))
+end
 
 @noinline param_mismatch(sql, nparams, n) = throw(PostgresInterfaceError("number of parameters provided ($n) does not match number of placeholders ($nparams) in sql: $sql"))
+
+@generated function bind_tuple_params!(dest::Vector{Union{String, Missing}}, params::Tuple{Vararg{Any, N}}) where {N}
+    assigns = [:(dest[$i] = _param(params[$i])) for i in 1:N]
+    return Expr(:block, assigns..., :(return nothing))
+end
+
+function bind_params!(dest::Vector{Union{String, Missing}}, params::Tuple, sql::AbstractString)
+    nparams = length(params)
+    nparams > length(dest) && param_mismatch(sql, length(dest), nparams)
+    nparams == length(dest) || param_mismatch(sql, length(dest), nparams)
+    bind_tuple_params!(dest, params)
+    return
+end
 
 function bind_params!(dest::Vector{Union{String, Missing}}, params, sql::AbstractString)
     nparams = 0
@@ -207,13 +237,16 @@ mutable struct RowClosure
     i::Int
 end
 
-@inline function (f::RowClosure)(k, v)
+# @nospecialize(v): parse_value's return is Any by nature (OID-driven); the value
+# lands in a Vector{Any}, so one instance suffices and the applycast call site
+# stays statically resolvable under --trim
+@inline function (f::RowClosure)(k, @nospecialize(v))
     if v === nothing
         # translate nothing -> missing for Tables.jl
         @inbounds f.types[f.i] = Union{f.types[f.i], Missing}
         @inbounds f.data[f.i] = missing
     else
-        if v isa AbstractVector && Missing <: eltype(v)
+        if v isa AbstractVector{>:Missing}
             @inbounds f.types[f.i] = typeof(v)
         end
         @inbounds f.data[f.i] = v
@@ -227,9 +260,9 @@ function makeresult(e::API.Exec)
     types = Type[API.juliatype(x -> x, i, e.type_registry) for i in typeIds]
     lookup = Dict(x => i for (i, x) in enumerate(names))
     rows = ResultRow[]
-    StructUtils.applyeach(PostgresStyle(), e) do i, row
+    StructUtils.applyeach(e.style, e) do i, row
         data = Vector{Any}(undef, length(names))
-        StructUtils.applyeach(PostgresStyle(), RowClosure(data, types, 1), row)
+        StructUtils.applyeach(e.style, RowClosure(data, types, 1), row)
         push!(rows, ResultRow(data, names, types, lookup, i))
     end
     return Result(names, types, rows, e.command_tag[], e.rows_affected[])
@@ -250,7 +283,7 @@ function read_portal_batch!(cursor::Cursor)
                     row = API.DataRow(read(conn.socket, len), cursor.names, cursor.typeIds, conn.type_registry)
                     try
                         data = Vector{Any}(undef, length(cursor.names))
-                        StructUtils.applyeach(PostgresStyle(), RowClosure(data, cursor.types, 1), row)
+                        StructUtils.applyeach(conn.style, RowClosure(data, cursor.types, 1), row)
                         push!(rows, ResultRow(data, cursor.names, cursor.types, cursor.lookup, cursor.rowcount))
                     catch err
                         # value conversion failed; keep reading through
@@ -268,10 +301,10 @@ function read_portal_batch!(cursor::Cursor)
                 done = true
             elseif mt == UInt8('N')
                 notice = API.noticeResponse(len, conn.socket)
-                conn.notice_callback(notice)
+                API.notice_callback(conn.style, notice)
             elseif mt == UInt8('A')
                 notification = API.notificationResponse(len, conn.socket)
-                conn.notification_callback(notification)
+                API.notification_callback(conn.style, notification)
             elseif mt == UInt8('E')
                 error_msg = API.errorResponse(len, conn.socket, conn.debug)
             elseif mt == UInt8('Z')
@@ -317,8 +350,8 @@ function Base.iterate(cursor::Cursor, state=nothing)
 end
 
 function DBInterface.execute(stmt::Statement, params=nothing, ::Type{T}=Any; debug::Bool=false, binary::Bool=false) where {T}
-    logger = stmt.conn.query_logger
-    log_enabled = logger !== NOOP_QUERY_LOGGER
+    style = stmt.conn.style
+    log_enabled = API.query_logging_enabled(style)
     start_ns = log_enabled ? time_ns() : 0
     result = nothing
     try
@@ -326,21 +359,29 @@ function DBInterface.execute(stmt::Statement, params=nothing, ::Type{T}=Any; deb
             # check that connection/statement are ok
             checkstmt(stmt)
             bind_params!(stmt.params, params, stmt.sql)
-            e = API.exec(stmt.conn.socket, stmt.name, stmt.params, stmt.names, stmt.typeIds, stmt.conn.type_registry, debug, 0, stmt.conn.notice_callback, stmt.conn.notification_callback)
-            result = T === Any ? makeresult(e) : StructUtils.arraylike(T) ? StructUtils.make(T, e, PostgresStyle()) : only(StructUtils.make(Vector{T}, e, PostgresStyle()))
+            # isa-split the socket union with per-branch typeasserts (identical calls in
+            # both branches get tail-merged back into one dynamic call by the optimizer),
+            # so the exec call resolves statically under `juliac --trim`
+            socket = stmt.conn.socket
+            e = if socket isa Reseau.TCP.Conn
+                API.exec(style, socket::Reseau.TCP.Conn, stmt.name, stmt.params, stmt.names, stmt.typeIds, stmt.conn.type_registry, debug, 0)
+            else
+                API.exec(style, socket::Reseau.TLS.Conn, stmt.name, stmt.params, stmt.names, stmt.typeIds, stmt.conn.type_registry, debug, 0)
+            end
+            result = T === Any ? makeresult(e) : StructUtils.arraylike(T) ? StructUtils.make(T, e, style) : only(StructUtils.make(Vector{T}, e, style))
         end
-        log_enabled && log_query(logger, :execute, (sql=stmt.sql, params=params, duration_ns=time_ns() - start_ns, success=true))
+        log_enabled && API.query_logger(style, :execute, (sql=stmt.sql, params=params, duration_ns=time_ns() - start_ns, success=true))
         return result
     catch err
-        log_enabled && log_query(logger, :execute, (sql=stmt.sql, params=params, duration_ns=time_ns() - start_ns, success=false, error=err))
+        log_enabled && API.query_logger(style, :execute, (sql=stmt.sql, params=params, duration_ns=time_ns() - start_ns, success=false, error=err))
         rethrow()
     end
 end
 
 function DBInterface.execute(conn::Connection, sql::AbstractString, params=nothing, ::Type{T}=Any; debug::Bool=false) where {T}
     sql_str = String(sql)
-    logger = conn.query_logger
-    log_enabled = logger !== NOOP_QUERY_LOGGER
+    style = conn.style
+    log_enabled = API.query_logging_enabled(style)
     start_ns = log_enabled ? time_ns() : 0
     result = nothing
     try
@@ -349,13 +390,19 @@ function DBInterface.execute(conn::Connection, sql::AbstractString, params=nothi
             stmtname = API.prepare(conn.socket, sql_str, debug; name="")
             nparams, names, types = API.describeprepared(conn.socket, stmtname, debug)
             params_vec = build_params(params, nparams, sql_str)
-            e = API.exec(conn.socket, stmtname, params_vec, names, types, conn.type_registry, debug, 0, conn.notice_callback, conn.notification_callback)
-            result = T === Any ? makeresult(e) : StructUtils.arraylike(T) ? StructUtils.make(T, e, PostgresStyle()) : only(StructUtils.make(Vector{T}, e, PostgresStyle()))
+            # see the statement-execute method: socket union isa-split for --trim
+            socket = conn.socket
+            e = if socket isa Reseau.TCP.Conn
+                API.exec(style, socket::Reseau.TCP.Conn, stmtname, params_vec, names, types, conn.type_registry, debug, 0)
+            else
+                API.exec(style, socket::Reseau.TLS.Conn, stmtname, params_vec, names, types, conn.type_registry, debug, 0)
+            end
+            result = T === Any ? makeresult(e) : StructUtils.arraylike(T) ? StructUtils.make(T, e, style) : only(StructUtils.make(Vector{T}, e, style))
         end
-        log_enabled && log_query(logger, :execute, (sql=sql_str, params=params, duration_ns=time_ns() - start_ns, success=true))
+        log_enabled && API.query_logger(style, :execute, (sql=sql_str, params=params, duration_ns=time_ns() - start_ns, success=true))
         return result
     catch err
-        log_enabled && log_query(logger, :execute, (sql=sql_str, params=params, duration_ns=time_ns() - start_ns, success=false, error=err))
+        log_enabled && API.query_logger(style, :execute, (sql=sql_str, params=params, duration_ns=time_ns() - start_ns, success=false, error=err))
         rethrow()
     end
 end
@@ -368,7 +415,7 @@ function cursor(stmt::Statement, params=nothing; fetchsize::Integer=1000, owns_t
         portal = string(UUIDs.uuid4())
         types = Type[API.juliatype(x -> x, i, conn.type_registry) for i in stmt.typeIds]
         lookup = Dict(x => i for (i, x) in enumerate(stmt.names))
-        cursor = Cursor(conn, portal, stmt.names, stmt.typeIds, types, lookup, max(1, Int(fetchsize)), ResultRow[], 1, false, 0, owns_transaction)
+        cursor = Cursor{_style_type(conn)}(conn, portal, stmt.names, stmt.typeIds, types, lookup, max(1, Int(fetchsize)), ResultRow[], 1, false, 0, owns_transaction)
         API.writemessages(conn.socket, conn.debug, ('B', portal, stmt.name, Int16(0), Int16(length(stmt.params)), API.Params(stmt.params), Int16(0)), ('E', portal, Int32(cursor.fetchsize)), ('S',))
         read_portal_batch!(cursor)
         return cursor

@@ -16,10 +16,9 @@ include("connection_string.jl")
 using .ConnectionString
 
 const Pools = ConcurrentUtilities.Pools
-const NOOP_QUERY_LOGGER = (event, info) -> nothing
 const ReseauConn = Union{Reseau.TCP.Conn, Reseau.TLS.Conn}
 
-mutable struct Connection{T} <: DBInterface.Connection
+mutable struct Connection{T, S <: API.AbstractPostgresStyle} <: DBInterface.Connection
     const lock::ReentrantLock
     socket::ReseauConn
     const host::String
@@ -47,14 +46,15 @@ mutable struct Connection{T} <: DBInterface.Connection
     closed::Bool # if explicitly closed by user; guarded by lock
     const reconnect::Bool
     debug::Bool
-    notice_callback::Function # callback for NOTICE messages
-    notification_callback::Function # callback for NOTIFY messages
-    query_logger::Function # callback for query/copy events
+    # style-dispatched behavior (query_logger / notice_callback / notification_callback
+    # overloads on a custom AbstractPostgresStyle) — Function-typed callback fields are
+    # dynamic dispatch at every use, unresolvable under `juliac --trim`
+    const style::S
     in_transaction::Bool # track transaction state
     transaction_depth::Int # track nested transactions (SAVEPOINTs)
     generation::Int # increment on reconnect to invalidate statements
 
-    function Connection(; host::AbstractString="", user::AbstractString="", password::Union{AbstractString, Nothing}=nothing, dbname::AbstractString="", port::Integer=5432, debug::Bool=false, reconnect::Bool=false, application_name::Union{AbstractString, Nothing}=nothing, connect_timeout::Union{Integer, Nothing}=nothing, sslmode::Union{AbstractString, Nothing}=nothing, sslrootcert::Union{AbstractString, Nothing}=nothing, sslcert::Union{AbstractString, Nothing}=nothing, sslkey::Union{AbstractString, Nothing}=nothing, sslcapath::Union{AbstractString, Nothing}=nothing, statement_timeout::Union{Integer, Nothing}=nothing, statement_cache_maxsize::Integer=100, sslservername::Union{AbstractString, Nothing}=nothing)
+    function Connection(; host::AbstractString="", user::AbstractString="", password::Union{AbstractString, Nothing}=nothing, dbname::AbstractString="", port::Integer=5432, debug::Bool=false, reconnect::Bool=false, application_name::Union{AbstractString, Nothing}=nothing, connect_timeout::Union{Integer, Nothing}=nothing, sslmode::Union{AbstractString, Nothing}=nothing, sslrootcert::Union{AbstractString, Nothing}=nothing, sslcert::Union{AbstractString, Nothing}=nothing, sslkey::Union{AbstractString, Nothing}=nothing, sslcapath::Union{AbstractString, Nothing}=nothing, sslservername::Union{AbstractString, Nothing}=nothing, statement_timeout::Union{Integer, Nothing}=nothing, statement_cache_maxsize::Integer=100, style::API.AbstractPostgresStyle=PostgresStyle())
         host = String(host)
         user = String(user)
         dbname = String(dbname)
@@ -72,18 +72,13 @@ mutable struct Connection{T} <: DBInterface.Connection
         maxsize = max(0, Int(statement_cache_maxsize))
         #TODO: if values have spaces, need to single-quote them
         # also need to escape single quotes/backslahes then with backslashes
-        socket, pid, skey, server_params = API.connect(host, port, dbname, user, password, debug, app_name, timeout, sslmode_val, sslrootcert_val, sslcert_val, sslkey_val, sslcapath_val, statement_timeout_val; sslservername = sslservername_val)
+        socket, pid, skey, server_params = API.connect(host, port, dbname, user, password, debug, app_name, timeout, sslmode_val, sslrootcert_val, sslcert_val, sslkey_val, sslcapath_val, sslservername_val, statement_timeout_val)
         registry = Dict(API.DEFAULT_TYPE_REGISTRY)
-        default_notice_callback = notice -> begin
-            msg = get(notice, "M", "")
-            !isempty(msg) && @warn msg
-            return
-        end
-        default_notification_callback = notification -> nothing
-        default_query_logger = NOOP_QUERY_LOGGER
-        return new{Statement}(ReentrantLock(), socket, host, user, password, dbname, port, app_name, timeout, sslmode_val, sslrootcert_val, sslcert_val, sslkey_val, sslcapath_val, sslservername_val, statement_timeout_val, pid, skey, Dict{String, Statement}(), maxsize, 0, server_params, registry, false, reconnect, debug, default_notice_callback, default_notification_callback, default_query_logger, false, 0, 1)
+        return new{Statement{typeof(style)}, typeof(style)}(ReentrantLock(), socket, host, user, password, dbname, port, app_name, timeout, sslmode_val, sslrootcert_val, sslcert_val, sslkey_val, sslcapath_val, sslservername_val, statement_timeout_val, pid, skey, Dict{String, Statement{typeof(style)}}(), maxsize, 0, server_params, registry, false, reconnect, debug, style, false, 0, 1)
     end
 end
+
+_style_type(::Connection{T, S}) where {T, S} = S
 
 Base.isopen(conn::Connection) = @lock conn.lock isopen(conn.socket)
 
@@ -126,11 +121,6 @@ function evict_lru_statement!(conn::Connection)
     return
 end
 
-function log_query(logger::Function, event::Symbol, info::NamedTuple)
-    logger(event, info)
-    return
-end
-
 function get_cached_statements(conn::Connection)
     @lock conn.lock copy(conn.statements)
 end
@@ -167,32 +157,9 @@ get_server_parameter(conn::Connection, param::String) = @lock conn.lock get(conn
 
 get_server_parameters(conn::Connection) = @lock conn.lock copy(conn.server_parameters)
 
-set_notice_callback!(conn::Connection, f::Function) = @lock conn.lock begin
-    conn.notice_callback = f
-    return conn
-end
-
-function get_notice_callback(conn::Connection)
-    return @lock conn.lock conn.notice_callback
-end
-
-set_notification_callback!(conn::Connection, f::Function) = @lock conn.lock begin
-    conn.notification_callback = f
-    return conn
-end
-
-function get_notification_callback(conn::Connection)
-    return @lock conn.lock conn.notification_callback
-end
-
-set_query_logger!(conn::Connection, f::Function) = @lock conn.lock begin
-    conn.query_logger = f
-    return conn
-end
-
-function get_query_logger(conn::Connection)
-    return @lock conn.lock conn.query_logger
-end
+# NOTE: runtime callback setters are gone — customize behavior by passing a custom
+# AbstractPostgresStyle to Connection(; style=...) and overloading the style-first
+# interface methods (query_logger / notice_callback / notification_callback).
 
 function get_statement_timeout(conn::Connection)
     return @lock conn.lock conn.statement_timeout
@@ -279,11 +246,11 @@ function wait_for_notification(conn::Connection; timeout::Union{Real, Nothing}=n
                 mt, len = API.readheader(conn.socket, conn.debug)
                 if mt == UInt8('A')
                     notification = API.notificationResponse(len, conn.socket)
-                    conn.notification_callback(notification)
+                    API.notification_callback(conn.style, notification)
                     return notification
                 elseif mt == UInt8('N')
                     notice = API.noticeResponse(len, conn.socket)
-                    conn.notice_callback(notice)
+                    API.notice_callback(conn.style, notice)
                 elseif mt == UInt8('S')
                     buf = read(conn.socket, len)
                     update_server_parameters!(conn, buf)
@@ -303,18 +270,17 @@ function wait_for_notification(conn::Connection; timeout::Union{Real, Nothing}=n
 end
 
 function copy_from(conn::Connection, sql::AbstractString, data::IO; debug::Bool=false)
-    logger = conn.query_logger
-    log_enabled = logger !== NOOP_QUERY_LOGGER
+    log_enabled = API.query_logging_enabled(conn.style)
     start_ns = log_enabled ? time_ns() : 0
     sql_str = String(sql)
     try
         @lock conn.lock begin
             checkconn(conn)
-            API.copy_in(conn.socket, sql_str, data, debug || conn.debug, conn.notice_callback, conn.notification_callback)
+            API.copy_in(conn.style, conn.socket, sql_str, data, debug || conn.debug)
         end
-        log_enabled && log_query(logger, :copy_from, (sql=sql_str, duration_ns=time_ns() - start_ns, success=true))
+        log_enabled && API.query_logger(conn.style, :copy_from, (sql=sql_str, duration_ns=time_ns() - start_ns, success=true))
     catch err
-        log_enabled && log_query(logger, :copy_from, (sql=sql_str, duration_ns=time_ns() - start_ns, success=false, error=err))
+        log_enabled && API.query_logger(conn.style, :copy_from, (sql=sql_str, duration_ns=time_ns() - start_ns, success=false, error=err))
         rethrow()
     end
     return conn
@@ -326,18 +292,17 @@ function copy_from(conn::Connection, sql::AbstractString, data; debug::Bool=fals
 end
 
 function copy_to(conn::Connection, sql::AbstractString, dest::IO; debug::Bool=false)
-    logger = conn.query_logger
-    log_enabled = logger !== NOOP_QUERY_LOGGER
+    log_enabled = API.query_logging_enabled(conn.style)
     start_ns = log_enabled ? time_ns() : 0
     sql_str = String(sql)
     try
         @lock conn.lock begin
             checkconn(conn)
-            API.copy_out(conn.socket, sql_str, dest, debug || conn.debug, conn.notice_callback, conn.notification_callback)
+            API.copy_out(conn.style, conn.socket, sql_str, dest, debug || conn.debug)
         end
-        log_enabled && log_query(logger, :copy_to, (sql=sql_str, duration_ns=time_ns() - start_ns, success=true))
+        log_enabled && API.query_logger(conn.style, :copy_to, (sql=sql_str, duration_ns=time_ns() - start_ns, success=true))
     catch err
-        log_enabled && log_query(logger, :copy_to, (sql=sql_str, duration_ns=time_ns() - start_ns, success=false, error=err))
+        log_enabled && API.query_logger(conn.style, :copy_to, (sql=sql_str, duration_ns=time_ns() - start_ns, success=false, error=err))
         rethrow()
     end
     return dest
@@ -446,7 +411,7 @@ function checkconn(conn::Connection)
         # connection is closed, but not explicitly, reconnect
         conn.in_transaction && throw(PostgresInterfaceError("postgres connection has been closed or disconnected; reconnect disabled during transaction"))
         conn.reconnect || throw(PostgresInterfaceError("postgres connection has been closed or disconnected; reconnect disabled"))
-        conn.socket, conn.pid, conn.skey, server_params = API.connect(conn.host, conn.port, conn.dbname, conn.user, conn.password, conn.debug, conn.application_name, conn.connect_timeout, conn.sslmode, conn.sslrootcert, conn.sslcert, conn.sslkey, conn.sslcapath, conn.statement_timeout; sslservername = conn.sslservername)
+        conn.socket, conn.pid, conn.skey, server_params = API.connect(conn.host, conn.port, conn.dbname, conn.user, conn.password, conn.debug, conn.application_name, conn.connect_timeout, conn.sslmode, conn.sslrootcert, conn.sslcert, conn.sslkey, conn.sslcapath, conn.sslservername, conn.statement_timeout)
         empty!(conn.statements)
         conn.in_transaction = false
         conn.transaction_depth = 0
@@ -458,8 +423,8 @@ function checkconn(conn::Connection)
     return
 end
 
-function DBInterface.connect(::Type{Connection}, host::AbstractString, user::AbstractString, passwd::Union{AbstractString, Nothing}; dbname::AbstractString="", port::Integer=5432, debug::Bool=false, reconnect::Bool=false, application_name::Union{AbstractString, Nothing}=nothing, connect_timeout::Union{Integer, Nothing}=nothing, sslmode::Union{AbstractString, Nothing}=nothing, sslrootcert::Union{AbstractString, Nothing}=nothing, sslcert::Union{AbstractString, Nothing}=nothing, sslkey::Union{AbstractString, Nothing}=nothing, sslcapath::Union{AbstractString, Nothing}=nothing, statement_timeout::Union{Integer, Nothing}=nothing, statement_cache_maxsize::Integer=100, sslservername::Union{AbstractString, Nothing}=nothing)
-    Connection(host=host, user=user, password=passwd, dbname=dbname, port=port, debug=debug, reconnect=reconnect, application_name=application_name, connect_timeout=connect_timeout, sslmode=sslmode, sslrootcert=sslrootcert, sslcert=sslcert, sslkey=sslkey, sslcapath=sslcapath, statement_timeout=statement_timeout, statement_cache_maxsize=statement_cache_maxsize, sslservername=sslservername)
+function DBInterface.connect(::Type{Connection}, host::AbstractString, user::AbstractString, passwd::Union{AbstractString, Nothing}; dbname::AbstractString="", port::Integer=5432, debug::Bool=false, reconnect::Bool=false, application_name::Union{AbstractString, Nothing}=nothing, connect_timeout::Union{Integer, Nothing}=nothing, sslmode::Union{AbstractString, Nothing}=nothing, sslrootcert::Union{AbstractString, Nothing}=nothing, sslcert::Union{AbstractString, Nothing}=nothing, sslkey::Union{AbstractString, Nothing}=nothing, sslcapath::Union{AbstractString, Nothing}=nothing, sslservername::Union{AbstractString, Nothing}=nothing, statement_timeout::Union{Integer, Nothing}=nothing, statement_cache_maxsize::Integer=100, style::API.AbstractPostgresStyle=PostgresStyle())
+    Connection(host=host, user=user, password=passwd, dbname=dbname, port=port, debug=debug, reconnect=reconnect, application_name=application_name, connect_timeout=connect_timeout, sslmode=sslmode, sslrootcert=sslrootcert, sslcert=sslcert, sslkey=sslkey, sslcapath=sslcapath, sslservername=sslservername, statement_timeout=statement_timeout, statement_cache_maxsize=statement_cache_maxsize, style=style)
 end
 
 function DBInterface.connect(::Type{Connection}, dsn::String; debug::Bool=false, reconnect::Bool=false, statement_cache_maxsize::Union{Integer, Nothing}=nothing)
@@ -503,8 +468,8 @@ function ConnectionPool(connector::Function; limit::Integer=10)
     return ConnectionPool(pool, connector)
 end
 
-function ConnectionPool(::Type{Connection}, host::AbstractString, user::AbstractString, passwd::Union{AbstractString, Nothing}; dbname::AbstractString="", port::Integer=5432, debug::Bool=false, reconnect::Bool=false, application_name::Union{AbstractString, Nothing}=nothing, connect_timeout::Union{Integer, Nothing}=nothing, sslmode::Union{AbstractString, Nothing}=nothing, sslrootcert::Union{AbstractString, Nothing}=nothing, sslcert::Union{AbstractString, Nothing}=nothing, sslkey::Union{AbstractString, Nothing}=nothing, sslcapath::Union{AbstractString, Nothing}=nothing, statement_timeout::Union{Integer, Nothing}=nothing, statement_cache_maxsize::Integer=100, limit::Integer=10)
-    connector = () -> DBInterface.connect(Connection, host, user, passwd; dbname=dbname, port=port, debug=debug, reconnect=reconnect, application_name=application_name, connect_timeout=connect_timeout, sslmode=sslmode, sslrootcert=sslrootcert, sslcert=sslcert, sslkey=sslkey, sslcapath=sslcapath, statement_timeout=statement_timeout, statement_cache_maxsize=statement_cache_maxsize)
+function ConnectionPool(::Type{Connection}, host::AbstractString, user::AbstractString, passwd::Union{AbstractString, Nothing}; dbname::AbstractString="", port::Integer=5432, debug::Bool=false, reconnect::Bool=false, application_name::Union{AbstractString, Nothing}=nothing, connect_timeout::Union{Integer, Nothing}=nothing, sslmode::Union{AbstractString, Nothing}=nothing, sslrootcert::Union{AbstractString, Nothing}=nothing, sslcert::Union{AbstractString, Nothing}=nothing, sslkey::Union{AbstractString, Nothing}=nothing, sslcapath::Union{AbstractString, Nothing}=nothing, statement_timeout::Union{Integer, Nothing}=nothing, statement_cache_maxsize::Integer=100, limit::Integer=10, style::API.AbstractPostgresStyle=PostgresStyle())
+    connector = () -> DBInterface.connect(Connection, host, user, passwd; dbname=dbname, port=port, debug=debug, reconnect=reconnect, application_name=application_name, connect_timeout=connect_timeout, sslmode=sslmode, sslrootcert=sslrootcert, sslcert=sslcert, sslkey=sslkey, sslcapath=sslcapath, statement_timeout=statement_timeout, statement_cache_maxsize=statement_cache_maxsize, style=style)
     return ConnectionPool(connector; limit=limit)
 end
 
@@ -574,7 +539,7 @@ include("execute.jl")
 # does not exist"). Also one network round trip instead of three. Callers
 # must hold conn.lock.
 function execute_simple(conn::Connection, sql::String)
-    API.exec(conn.socket, sql, conn.debug)
+    API.exec(conn.style, conn.socket, sql, conn.debug)
     return conn
 end
 
@@ -632,7 +597,7 @@ function rollback(conn::Connection)
     return conn
 end
 
-function transaction(f::Function, conn::Connection)
+function transaction(f::F, conn::Connection) where {F}
     start_transaction(conn)
     try
         result = f(conn)
@@ -644,7 +609,7 @@ function transaction(f::Function, conn::Connection)
     end
 end
 
-function DBInterface.transaction(f::Function, conn::Connection)
+function DBInterface.transaction(f::F, conn::Connection) where {F}
     start_transaction(conn)
     try
         result = f()
