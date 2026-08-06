@@ -132,6 +132,10 @@ conn = DBInterface.connect(Postgres.Connection, "host=127.0.0.1 user=postgres db
 ```@docs
 Postgres.AbstractPostgresStyle
 Postgres.PostgresStyle
+Postgres.query_logging_enabled
+Postgres.query_logger
+Postgres.notice_callback
+Postgres.notification_callback
 ```
 
 ## Parameters And Prepared Statements

@@ -29,13 +29,55 @@ abstract type AbstractPostgresStyle <: StructUtils.StructStyle end
 struct PostgresStyle <: AbstractPostgresStyle end
 
 # behavior interface (style-first; overload on your own style)
+
+"""
+    Postgres.query_logging_enabled(style) -> Bool
+
+Whether [`query_logger`](@ref Postgres.API.query_logger) should be called for
+queries on connections using `style`. `false` by default, which also skips the
+timing work the logger would need.
+"""
 query_logging_enabled(::AbstractPostgresStyle) = false
+
+"""
+    Postgres.query_logger(style, event::Symbol, info::NamedTuple)
+
+Called after each query when
+[`query_logging_enabled`](@ref Postgres.API.query_logging_enabled) is true for
+`style`. `event` is `:execute`, `:copy_from`, or `:copy_to`; `info` carries
+`sql`, `duration_ns`, `success`, the bound `params` (for `:execute`), and
+`error` when the query failed.
+
+`info.params` holds the query's parameter values, so a logger that records
+them will record whatever sensitive data those queries carry.
+"""
 query_logger(::AbstractPostgresStyle, event::Symbol, info::NamedTuple) = nothing
+
+"""
+    Postgres.notice_callback(style, notice)
+
+Called for each `NoticeResponse` the server sends. `notice` is a `Dict` of the
+raw notice fields, keyed by their single-character protocol codes (`"M"` is
+the message, `"S"` the severity). Emits the message as a `@warn` by default.
+"""
 function notice_callback(::AbstractPostgresStyle, notice)
     msg = get(notice, "M", "")
     !isempty(msg) && @warn msg
     return nothing
 end
+
+"""
+    Postgres.notification_callback(style, notification::Notification)
+
+Called for each asynchronous `NOTIFY` ([`Notification`](@ref
+Postgres.API.Notification)) received while reading query results. Does nothing
+by default.
+
+A connection only observes notifications while it is reading from the server,
+so a connection that is idle or busy in another phase of a query may not see
+one. Use [`wait_for_notification`](@ref Postgres.wait_for_notification) on a
+dedicated connection to receive every notification on a channel.
+"""
 notification_callback(::AbstractPostgresStyle, notification) = nothing
 
 StructUtils.fieldtagkey(::AbstractPostgresStyle) = :postgres
