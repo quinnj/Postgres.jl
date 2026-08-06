@@ -375,29 +375,42 @@ function wait_for_notification(conn::Connection; timeout::Union{Real, Nothing}=n
                 remaining_s <= 0 && return nothing
                 Int64(time_ns()) + min(NOTIFICATION_POLL_INTERVAL_NS, round(Int64, remaining_s * 1_000_000_000))
             end
+            # The deadline covers only the first byte: if it expires there,
+            # nothing of a message has been consumed and polling again is safe.
+            # Once a byte arrives the rest of the message is read without a
+            # deadline, so a message straddling the poll boundary can never
+            # leave the stream parked mid-message.
             _set_read_deadline!(conn.socket, deadline_ns)
-            try
-                mt, len = API.readheader(conn.socket, conn.debug)
-                if mt == UInt8('A')
-                    notification = API.notificationResponse(len, conn.socket)
-                    API.notification_callback(conn.style, notification)
-                    return notification
-                elseif mt == UInt8('N')
-                    notice = API.noticeResponse(len, conn.socket)
-                    API.notice_callback(conn.style, notice)
-                elseif mt == UInt8('S')
-                    buf = read(conn.socket, len)
-                    update_server_parameters!(conn, buf)
-                elseif mt == UInt8('E')
-                    err = API.errorResponse(len, conn.socket, conn.debug)
-                    throw(err)
-                else
-                    API.skipbytes!(conn.socket, len)
-                end
+            mt = try
+                read(conn.socket, UInt8)
             catch err
                 err isa Reseau.IOPoll.DeadlineExceededError || rethrow()
-            finally
-                _clear_read_deadline!(conn.socket)
+                isopen(conn.socket) && _clear_read_deadline!(conn.socket)
+                continue
+            end
+            isopen(conn.socket) && _clear_read_deadline!(conn.socket)
+            # no deadline is in effect from here on, so the rest of the message
+            # is read to completion and any failure is a real one
+            len = ntoh(read(conn.socket, Int32)) - 4
+            if len < 0 || len > API.MAX_MESSAGE_LEN
+                close(conn.socket)
+                throw(API.Error("invalid message length $len from server; connection protocol state is corrupted"))
+            end
+            conn.debug && @info "readheader: $(Char(mt)), $len"
+            if mt == UInt8('A')
+                notification = API.notificationResponse(len, conn.socket)
+                API.notification_callback(conn.style, notification)
+                return notification
+            elseif mt == UInt8('N')
+                notice = API.noticeResponse(len, conn.socket)
+                API.notice_callback(conn.style, notice)
+            elseif mt == UInt8('S')
+                buf = read(conn.socket, len)
+                update_server_parameters!(conn, buf)
+            elseif mt == UInt8('E')
+                throw(API.errorResponse(len, conn.socket, conn.debug))
+            else
+                API.skipbytes!(conn.socket, len)
             end
         end
     end
@@ -561,6 +574,16 @@ function register_range!(conn::Connection, name::AbstractString; schema::Abstrac
     return conn
 end
 
+# If the connection actually negotiated TLS, the cancel connection must
+# require it too, even under the permissive default — otherwise a server
+# answering 'N' to the cancel connection's SSLRequest downgrades the cancel
+# key to cleartext.
+function cancel_sslmode(socket_is_tls::Bool, sslmode::Union{String, Nothing})
+    socket_is_tls || return sslmode
+    (sslmode === nothing || lowercase(sslmode) == "prefer") && return "require"
+    return sslmode
+end
+
 """
     Postgres.cancel_query!(conn)
 
@@ -581,17 +604,11 @@ function cancel_query!(conn::Connection)
     pid = conn.pid
     skey = conn.skey
     debug = conn.debug
-    sslmode = conn.sslmode
-    # If the connection actually negotiated TLS, require it for the cancel
-    # connection too, even under the permissive default — otherwise a server
-    # answering 'N' downgrades the cancel key to cleartext. Checked outside
-    # the lock deliberately: cancel_query! is called precisely when another
-    # task holds it running the query being cancelled, so a trylock-guarded
-    # check would be skipped in the case that matters. Reading the socket
-    # field unlocked matches how host/pid/skey are read below.
-    if conn.socket isa Reseau.TLS.Conn && (sslmode === nothing || lowercase(sslmode) == "prefer")
-        sslmode = "require"
-    end
+    # Checked outside the lock deliberately: cancel_query! is called precisely
+    # when another task holds it running the query being cancelled, so a
+    # trylock-guarded check would be skipped in the case that matters. Reading
+    # the socket field unlocked matches how host/pid/skey are read below.
+    sslmode = cancel_sslmode(conn.socket isa Reseau.TLS.Conn, conn.sslmode)
     if trylock(conn.lock)
         try
             !isopen(conn.socket) && throw(PostgresInterfaceError("cannot cancel query: connection not open"))

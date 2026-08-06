@@ -442,6 +442,12 @@ function waitfor(socket, debug::Bool, codes::Vararg{Char, N}) where {N}
                     skipbytes!(socket, len)
                 end
                 found == 0 && break
+            else
+                # any other message (notices, notifications, ...): discard the
+                # body. Without this the body is read as the next header and
+                # the stream desynchronizes — e.g. a NOTIFY delivered on a
+                # connection that is also running queries.
+                skipbytes!(socket, len)
             end
         end
     catch
@@ -797,9 +803,10 @@ function StructUtils.applyeach(::AbstractPostgresStyle, f, dr::DataRow)
     GC.@preserve buf begin
         nbuf >= 2 || throw(Error("truncated DataRow message from server"))
         ncols = Int(ntoh(unsafe_load(Ptr{Int16}(pointer(buf)))))
-        # the count is signed on the wire: a negative would pass an upper-bound
-        # check and silently yield an unfilled row (UndefRefError downstream)
-        (0 <= ncols <= length(dr.names) && ncols <= length(dr.typeIds)) ||
+        # the protocol mandates one value per described column; anything else
+        # (including a negative count, which is signed on the wire) would leave
+        # the caller's row partly unfilled — an UndefRefError downstream
+        (ncols == length(dr.names) && ncols == length(dr.typeIds)) ||
             throw(Error("DataRow column count does not match the row description"))
         pos = 3
         for i = 1:ncols

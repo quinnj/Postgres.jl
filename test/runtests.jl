@@ -582,6 +582,18 @@ end
             @test vals == Any[Int32(5), nothing]
         end
 
+        # a cancel connection must never downgrade to cleartext when the
+        # connection being cancelled actually negotiated TLS
+        @test Postgres.cancel_sslmode(true, nothing) == "require"
+        @test Postgres.cancel_sslmode(true, "prefer") == "require"
+        @test Postgres.cancel_sslmode(true, "PREFER") == "require"
+        @test Postgres.cancel_sslmode(true, "verify-full") == "verify-full"
+        @test Postgres.cancel_sslmode(true, "require") == "require"
+        # an explicitly plaintext connection is left alone, as are non-TLS ones
+        @test Postgres.cancel_sslmode(true, "disable") == "disable"
+        @test Postgres.cancel_sslmode(false, nothing) === nothing
+        @test Postgres.cancel_sslmode(false, "prefer") == "prefer"
+
         # escaping helpers reject embedded NULs rather than emitting SQL the
         # server would truncate mid-statement
         @test Postgres.escape_identifier("a\"b") == "\"a\"\"b\""
@@ -1130,6 +1142,17 @@ end
                     @test notification !== nothing
                     @test notification.channel == "notify_test"
                     @test notification.payload == "payload"
+                    # A notification delivered while the same connection runs
+                    # queries must not desync the stream: the async message
+                    # arrives interleaved with the query's own messages, and
+                    # its body has to be consumed rather than read as the next
+                    # message header.
+                    Postgres.notify!(notifier, "notify_test", "interleaved")
+                    sleep(0.2)
+                    @test Tables.rowtable(DBInterface.execute(listener, "SELECT 2 AS a"))[1].a == 2
+                    @test Tables.rowtable(DBInterface.execute(listener, "SELECT 3 AS a"))[1].a == 3
+                    @test isopen(listener)
+
                     DBInterface.close!(notifier)
                     DBInterface.close!(listener)
                 end
