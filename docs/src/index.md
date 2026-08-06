@@ -18,7 +18,7 @@ Postgres.jl accepts DSN strings or PostgreSQL URIs and supports:
 - libpq-style keyword strings such as `host=127.0.0.1 port=5432 user=postgres dbname=postgres`.
 - Environment defaults from `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGAPPNAME`, `PGCONNECT_TIMEOUT`, and TLS-related `PGSSL*` variables.
 - `sslmode` values: `disable`, `prefer`, `require`, `verify-full` (only `verify-full` verifies certificates).
-- TLS files: `sslrootcert`, `sslcert`, `sslkey`, `sslcapath`.
+- TLS files: `sslrootcert`, `sslcert`, `sslkey`, `sslcapath`; `sslservername` overrides the TLS SNI hostname when connecting to a pre-resolved address.
 - `connect_timeout` (seconds), `statement_timeout` (milliseconds).
 - `application_name` and `statement_cache_maxsize`.
 
@@ -33,7 +33,7 @@ DBInterface.close!(conn)
 ```julia
 using Postgres, DBInterface, Tables
 conn = DBInterface.connect(Postgres.Connection, "host=127.0.0.1;user=postgres;password=postgres;dbname=postgres")
-rows = Tables.rowtable(DBInterface.execute(conn, "SELECT $1::int AS val", (42,)))
+rows = Tables.rowtable(DBInterface.execute(conn, raw"SELECT $1::int AS val", (42,)))
 @show rows[1].val
 DBInterface.close!(conn)
 ```
@@ -65,7 +65,7 @@ StructUtils.@tags struct ProfileSummary
     createdAt::DateTime &(postgres=(name=:created_at,),)
 end
 
-profile = DBInterface.execute(conn, """
+profile = DBInterface.execute(conn, raw"""
     SELECT profile_id, first_name, last_name, created_at
     FROM profiles
     WHERE profile_id = $1
@@ -162,12 +162,16 @@ DBInterface.close!(conn)
 
 ## Query logging
 
+Query logging (and other driver behavior) is customized with a driver style; see the [Manual](@ref) for details.
+
 ```julia
 using Postgres, DBInterface
-conn = DBInterface.connect(Postgres.Connection, "host=127.0.0.1;user=postgres;password=postgres;dbname=postgres")
-Postgres.set_query_logger!(conn) do event, info
-    @show event info.success info.duration_ns
-end
+
+struct LoggingStyle <: Postgres.AbstractPostgresStyle end
+Postgres.query_logging_enabled(::LoggingStyle) = true
+Postgres.query_logger(::LoggingStyle, event::Symbol, info::NamedTuple) = @info "query" event info.success info.duration_ns
+
+conn = DBInterface.connect(Postgres.Connection, "host=127.0.0.1;user=postgres;password=postgres;dbname=postgres"; style=LoggingStyle())
 DBInterface.execute(conn, "SELECT 1")
 DBInterface.close!(conn)
 ```
@@ -187,6 +191,17 @@ DBInterface.close!(pool)
 
 `Postgres.Error` includes SQLSTATE information. Use `Postgres.cancel_query!(conn)` to cancel a running query.
 
+## Reference
+
 ```@autodocs
 Modules = [Postgres]
+```
+
+```@docs
+Postgres.Error
+Postgres.Notification
+Postgres.Numeric
+Postgres.PostgresRange
+Postgres.ConnectionParams
+Postgres.parse_dsn
 ```

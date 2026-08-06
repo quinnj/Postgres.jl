@@ -40,6 +40,17 @@ StructUtils.lift(::AbstractPostgresStyle, ::Type{T}, x::T) where {T<:JSON.LazyVa
 StructUtils.lift(::AbstractPostgresStyle, ::Type{T}, x::T, tags) where {T<:JSON.LazyValue} = x, nothing
 
 
+"""
+    Postgres.Numeric
+
+Exact decimal representation of a PostgreSQL `numeric`/`decimal` value:
+`coeff * 10^-scale`, where `coeff` is a `BigInt` and `scale` the number of
+digits after the decimal point. Preserves the value and scale exactly (no
+floating-point rounding). `print`/`string` produce the decimal text form.
+
+The PostgreSQL special values `NaN`, `Infinity`, and `-Infinity` cannot be
+represented and throw an error when encountered.
+"""
 struct Numeric
     coeff::BigInt
     scale::Int
@@ -48,6 +59,14 @@ StructUtils.structlike(::AbstractPostgresStyle, ::Type{Numeric}) = false
 
 Base.:(==)(a::Numeric, b::Numeric) = a.coeff == b.coeff && a.scale == b.scale
 
+"""
+    Postgres.PostgresRange{T}
+
+A PostgreSQL range value (`int4range`, `numrange`, `tstzrange`, ...). `lower`
+and `upper` are the bounds (`missing` when unbounded), `lower_inclusive` and
+`upper_inclusive` indicate whether each bound is inclusive, and `empty` is
+`true` for the empty range.
+"""
 struct PostgresRange{T}
     lower::Union{T, Missing}
     upper::Union{T, Missing}
@@ -190,8 +209,6 @@ function register_type!(registry::Dict{Int, TypeInfo}, oid::Integer, julia_type:
     return registry
 end
 
-const DATETIME_OPTIONS = Parsers.Options(dateformat=dateformat"yyyy-mm-dd HH:MM:SS.s")
-
 @inline function tzoffset_seconds(offset::AbstractString)
     isempty(offset) && return 0
     sign = offset[1] == '-' ? -1 : 1
@@ -315,6 +332,9 @@ Base.show(io::IO, num::Numeric) = print(io, numeric_string(num))
 function parse_numeric(val::String)
     stripped = strip(val)
     stripped == "" && return Numeric(BigInt(0), 0)
+    lowered = lowercase(stripped)
+    (lowered == "nan" || lowered == "infinity" || lowered == "-infinity" || lowered == "+infinity") &&
+        throw(PostgresInterfaceError("postgres numeric special value \"$stripped\" cannot be represented as Postgres.Numeric"))
     sign = 1
     if stripped[1] == '-'
         sign = -1

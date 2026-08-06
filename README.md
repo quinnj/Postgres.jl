@@ -1,6 +1,10 @@
 # Postgres.jl
 
-Postgres.jl is a PostgreSQL client that implements the v3 wire protocol with `DBInterface` and `Tables` integration.
+[![CI](https://github.com/JuliaDatabases/Postgres.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/JuliaDatabases/Postgres.jl/actions/workflows/CI.yml)
+[![docs](https://img.shields.io/badge/docs-dev-blue.svg)](https://JuliaDatabases.github.io/Postgres.jl/dev/)
+[![codecov](https://codecov.io/gh/JuliaDatabases/Postgres.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/JuliaDatabases/Postgres.jl)
+
+Postgres.jl is a pure-Julia PostgreSQL client that implements the v3 wire protocol with `DBInterface` and `Tables` integration.
 
 ## Installation
 
@@ -33,7 +37,7 @@ Connection options support:
 - PostgreSQL URIs such as `postgresql://postgres:postgres@127.0.0.1:5432/postgres`.
 - Environment defaults: `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGAPPNAME`, `PGCONNECT_TIMEOUT`, and TLS-related `PGSSL*` variables.
 - `sslmode` values: `disable`, `prefer`, `require`, `verify-full` (only `verify-full` enforces certificate verification).
-- TLS files: `sslrootcert`, `sslcert`, `sslkey`, `sslcapath`.
+- TLS files: `sslrootcert`, `sslcert`, `sslkey`, `sslcapath`; `sslservername` overrides the TLS SNI hostname when connecting to a pre-resolved address.
 - `connect_timeout` (seconds) and `statement_timeout` (milliseconds).
 - `application_name` and `statement_cache_maxsize`.
 
@@ -51,9 +55,9 @@ DBInterface.close!(conn)
 ```julia
 using Postgres, DBInterface, Tables
 conn = DBInterface.connect(Postgres.Connection, "host=127.0.0.1;user=postgres;password=postgres;dbname=postgres")
-rows = Tables.rowtable(DBInterface.execute(conn, "SELECT $1::int AS val", (42,)))
+rows = Tables.rowtable(DBInterface.execute(conn, raw"SELECT $1::int AS val", (42,)))
 @show rows[1].val
-stmt = DBInterface.prepare(conn, "SELECT $1::int AS val")
+stmt = DBInterface.prepare(conn, raw"SELECT $1::int AS val")
 rows = Tables.rowtable(DBInterface.execute(stmt, (7,)))
 DBInterface.close!(stmt)
 DBInterface.close!(conn)
@@ -87,7 +91,7 @@ StructUtils.@tags struct ProfileSummary
     createdAt::DateTime &(postgres=(name=:created_at,),)
 end
 
-profile = DBInterface.execute(conn, """
+profile = DBInterface.execute(conn, raw"""
     SELECT profile_id, first_name, last_name, created_at
     FROM profiles
     WHERE profile_id = $1
@@ -184,14 +188,18 @@ DBInterface.close!(conn)
 
 `Numeric` values are returned as `Postgres.Numeric`, `interval` values as `Dates.Period` or `Dates.CompoundPeriod`, and range types as `Postgres.PostgresRange{T}`.
 
-## Query logging
+## Query logging and driver styles
+
+Driver behavior — query logging, server notices, asynchronous notifications — is customized by defining a driver "style": subtype `Postgres.AbstractPostgresStyle`, overload the behavior hooks for it, and pass an instance via the `style` connection keyword.
 
 ```julia
 using Postgres, DBInterface
-conn = DBInterface.connect(Postgres.Connection, "host=127.0.0.1;user=postgres;password=postgres;dbname=postgres")
-Postgres.set_query_logger!(conn) do event, info
-    @show event info.success info.duration_ns
-end
+
+struct LoggingStyle <: Postgres.AbstractPostgresStyle end
+Postgres.query_logging_enabled(::LoggingStyle) = true
+Postgres.query_logger(::LoggingStyle, event::Symbol, info::NamedTuple) = @info "query" event info.success info.duration_ns
+
+conn = DBInterface.connect(Postgres.Connection, "host=127.0.0.1;user=postgres;password=postgres;dbname=postgres"; style=LoggingStyle())
 DBInterface.execute(conn, "SELECT 1")
 DBInterface.close!(conn)
 ```

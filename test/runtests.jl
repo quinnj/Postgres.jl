@@ -418,7 +418,27 @@ end
 
 @testset "Postgres" begin
     @testset "Export Surface" begin
-        @test Set(names(Postgres)) == Set([:DBInterface, :Postgres])
+        exported = Set([:DBInterface, :Postgres])
+        @static if VERSION >= v"1.11"
+            # names() includes `public` declarations on Julia 1.11+
+            public_names = Set([
+                :Connection, :ConnectionPool, :ConnectionParams, :PostgresInterfaceError,
+                :Error, :Notification, :Numeric, :PostgresRange, :AbstractPostgresStyle, :PostgresStyle,
+                :query_logging_enabled, :query_logger, :notice_callback, :notification_callback, :parse_dsn,
+                :transaction, Symbol("@transaction"), :start_transaction, :commit, :rollback, :in_transaction,
+                :cursor, :copy_from, :copy_to, :listen!, :unlisten!, :notify!, :wait_for_notification,
+                :register_type!, :register_enum!, :register_composite!, :register_range!,
+                :command_tag, :rows_affected, :cancel_query!, :escape_identifier, :escape_literal,
+                :get_cached_statements, :clear_statement_cache!, :set_statement_cache_maxsize!,
+                :get_server_parameter, :get_server_parameters, :get_statement_timeout, :set_statement_timeout!,
+                :acquire, :release, :with_connection, :describe,
+            ])
+            @test Set(names(Postgres)) == union(exported, public_names)
+        else
+            @test Set(names(Postgres)) == exported
+        end
+        @test Postgres.PostgresInterfaceError <: Exception
+        @test Postgres.Error <: Exception
     end
 
     @testset "Connection String Parsing" begin
@@ -470,6 +490,18 @@ end
         @test query_host_params.port == 5436
         @test query_host_params.dbname == "postgres"
 
+        sni_params = Postgres.parse_dsn("host=203.0.113.7 sslmode=require sslservername=db.example.com")
+        @test sni_params.sslservername == "db.example.com"
+        sni_uri_params = Postgres.parse_dsn("postgresql://postgres@203.0.113.7/postgres?sslservername=db.example.com")
+        @test sni_uri_params.sslservername == "db.example.com"
+
+        # IPv6 hosts must be bracketed for the transport address parser;
+        # unix socket paths are rejected with a clear error
+        @test Postgres.API.hostport_address("::1", 5432) == "[::1]:5432"
+        @test Postgres.API.hostport_address("127.0.0.1", 5432) == "127.0.0.1:5432"
+        @test Postgres.API.hostport_address("db.example.com", 6432) == "db.example.com:6432"
+        @test_throws Postgres.PostgresInterfaceError Postgres.API.hostport_address("/var/run/postgresql", 5432)
+
         withenv(
             "PGHOST" => "envhost",
             "PGPORT" => "5544",
@@ -502,6 +534,10 @@ end
         @test string(Postgres.API.parse_numeric("-0.00120")) == "-0.00120"
         @test string(Postgres.API.parse_numeric("1.23e3")) == "1230"
         @test Postgres.API.parse_numeric("+42") == Postgres.Numeric(BigInt(42), 0)
+        # numeric special values can't be represented and must fail clearly
+        @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric("NaN")
+        @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric("Infinity")
+        @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric("-Infinity")
 
         @test Postgres.API.parse_value(1184, "2024-02-13 05:28:17+02", registry) == DateTime(2024, 2, 13, 3, 28, 17)
         @test Postgres.API.parse_value(1184, "2024-02-13 05:28:17+02:30", registry) == DateTime(2024, 2, 13, 2, 58, 17)
@@ -877,6 +913,24 @@ end
                     conn3 = DBInterface.connect(Postgres.Connection, params_with_app)
                     @test isopen(conn3)
                     DBInterface.close!(conn3)
+
+                    # ConnectionParams debug/reconnect fields are honored (and
+                    # overridable via keyword arguments)
+                    params_reconnect = Postgres.ConnectionParams(
+                        host=cfg.host,
+                        port=cfg.port,
+                        user=cfg.user,
+                        password=cfg.password,
+                        dbname=cfg.dbname,
+                        reconnect=true
+                    )
+                    conn4 = DBInterface.connect(Postgres.Connection, params_reconnect)
+                    @test conn4.reconnect
+                    @test !conn4.debug
+                    DBInterface.close!(conn4)
+                    conn5 = DBInterface.connect(Postgres.Connection, params_reconnect; reconnect=false)
+                    @test !conn5.reconnect
+                    DBInterface.close!(conn5)
                 end
 
                 @testset "SSL Modes" begin
@@ -1048,6 +1102,47 @@ end
                     Postgres.copy_from(conn, "COPY copy_test FROM STDIN (FORMAT BINARY)", binary_copy)
                     rows2 = Tables.rowtable(DBInterface.execute(conn, "SELECT count(*) AS count FROM copy_test"))
                     @test rows2[1].count == 2
+
+                    # an invalid COPY statement errors (instead of hanging) and
+                    # leaves the connection usable
+                    @test_throws Postgres.API.Error Postgres.copy_from(conn, "COPY nonexistent_copy_tbl FROM STDIN", "1\n")
+                    @test Tables.rowtable(DBInterface.execute(conn, "SELECT 1 AS a"))[1].a == 1
+
+                    # non-COPY and wrong-direction statements are rejected
+                    # cleanly, without desyncing or deadlocking the connection
+                    @test_throws Postgres.API.Error Postgres.copy_from(conn, "SELECT 1", "1\n")
+                    @test_throws Postgres.API.Error Postgres.copy_to(conn, "SELECT 1")
+                    @test_throws Postgres.API.Error Postgres.copy_from(conn, "COPY copy_test TO STDOUT", "1\talpha\n")
+                    @test_throws Postgres.API.Error Postgres.copy_to(conn, "COPY copy_test FROM STDIN")
+                    @test Tables.rowtable(DBInterface.execute(conn, "SELECT 2 AS a"))[1].a == 2
+
+                    # COPY via execute throws a clear client error pointing at
+                    # copy_from/copy_to and keeps the connection usable
+                    err = try
+                        DBInterface.execute(conn, "COPY copy_test FROM STDIN")
+                        nothing
+                    catch e
+                        e
+                    end
+                    @test err isa Postgres.API.Error
+                    @test occursin("copy_from", err.message)
+                    err = try
+                        DBInterface.execute(conn, "COPY copy_test TO STDOUT")
+                        nothing
+                    catch e
+                        e
+                    end
+                    @test err isa Postgres.API.Error
+                    @test occursin("copy_to", err.message)
+                    @test Tables.rowtable(DBInterface.execute(conn, "SELECT 3 AS a"))[1].a == 3
+
+                    # COPY via cursor errors cleanly, keeps the connection
+                    # usable, and doesn't leave its transaction open
+                    @test_throws Postgres.PostgresInterfaceError Postgres.cursor(conn, "COPY copy_test TO STDOUT")
+                    @test !Postgres.in_transaction(conn)
+                    @test_throws Postgres.PostgresInterfaceError Postgres.cursor(conn, "COPY copy_test FROM STDIN")
+                    @test !Postgres.in_transaction(conn)
+                    @test Tables.rowtable(DBInterface.execute(conn, "SELECT 4 AS a"))[1].a == 4
                 end
 
                 @testset "Cursor Streaming" begin

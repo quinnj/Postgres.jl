@@ -92,7 +92,7 @@ StructUtils.@tags struct ProfileSummary
     createdAt::DateTime &(postgres=(name=:created_at,),)
 end
 
-profile = DBInterface.execute(conn, """
+profile = DBInterface.execute(conn, raw"""
     SELECT profile_id, first_name, last_name, created_at
     FROM profiles
     WHERE profile_id = $1
@@ -117,6 +117,16 @@ that style, and pass an instance with the `style` connection keyword. The
 default `Postgres.PostgresStyle` keeps query logging disabled and reports
 server notices through Julia's logger.
 
+```julia
+struct LoggingStyle <: Postgres.AbstractPostgresStyle end
+Postgres.query_logging_enabled(::LoggingStyle) = true
+Postgres.query_logger(::LoggingStyle, event::Symbol, info::NamedTuple) = @info "query" event info.success info.duration_ns
+Postgres.notice_callback(::LoggingStyle, notice) = @info "notice" notice
+Postgres.notification_callback(::LoggingStyle, notification) = @info "notification" notification
+
+conn = DBInterface.connect(Postgres.Connection, "host=127.0.0.1 user=postgres dbname=postgres"; style=LoggingStyle())
+```
+
 ```@docs
 Postgres.AbstractPostgresStyle
 Postgres.PostgresStyle
@@ -124,17 +134,17 @@ Postgres.PostgresStyle
 
 ## Parameters And Prepared Statements
 
-Use PostgreSQL placeholders (`$1`, `$2`, ...) and pass a tuple or other iterable of parameter values.
+Use PostgreSQL placeholders (`$1`, `$2`, ...) and pass a tuple or other iterable of parameter values. Note the use of `raw"..."` strings so that `$1` is not treated as Julia string interpolation.
 
 ```julia
-rows = Tables.rowtable(DBInterface.execute(conn, "SELECT $1::int + $2::int AS total", (20, 22)))
+rows = Tables.rowtable(DBInterface.execute(conn, raw"SELECT $1::int + $2::int AS total", (20, 22)))
 @show only(rows).total
 ```
 
 Prepared statements can be created explicitly. Postgres.jl also caches prepared statements internally with LRU eviction; set `statement_cache_maxsize=0` to disable caching.
 
 ```julia
-stmt = DBInterface.prepare(conn, "SELECT $1::text AS value")
+stmt = DBInterface.prepare(conn, raw"SELECT $1::text AS value")
 rows = Tables.rowtable(DBInterface.execute(stmt, ("prepared",)))
 DBInterface.close!(stmt)
 ```
@@ -143,7 +153,7 @@ Bulk inserts can use `DBInterface.executemany`.
 
 ```julia
 DBInterface.execute(conn, "CREATE TEMP TABLE demo_many (id int, name text)")
-stmt = DBInterface.prepare(conn, "INSERT INTO demo_many VALUES ($1, $2)")
+stmt = DBInterface.prepare(conn, raw"INSERT INTO demo_many VALUES ($1, $2)")
 DBInterface.executemany(stmt, ([1, 2, 3], ["a", "b", "c"]))
 DBInterface.close!(stmt)
 ```

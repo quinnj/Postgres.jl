@@ -4,8 +4,15 @@ using DBInterface, Dates, UUIDs, Parsers, Tables, StructUtils, JSON, ConcurrentU
 
 export DBInterface
 
-# For non-api errors that happen in Postgres.jl
-struct PostgresInterfaceError
+"""
+    Postgres.PostgresInterfaceError <: Exception
+
+A client-side error raised by Postgres.jl itself (closed connections,
+parameter-count mismatches, unsupported features, ...), as opposed to
+[`Postgres.Error`](@ref Postgres.API.Error), which represents an error
+reported by the server.
+"""
+struct PostgresInterfaceError <: Exception
     msg::String
 end
 Base.showerror(io::IO, e::PostgresInterfaceError) = print(io, e.msg)
@@ -18,6 +25,39 @@ using .ConnectionString
 const Pools = ConcurrentUtilities.Pools
 const ReseauConn = Union{Reseau.TCP.Conn, Reseau.TLS.Conn}
 
+"""
+    Postgres.Connection
+
+A single connection to a PostgreSQL server, created via
+`DBInterface.connect(Postgres.Connection, ...)`:
+
+    DBInterface.connect(Postgres.Connection, host, user, password; dbname, port=5432, kwargs...)
+    DBInterface.connect(Postgres.Connection, dsn::String; kwargs...)
+    DBInterface.connect(Postgres.Connection, params::ConnectionParams; kwargs...)
+
+`dsn` may be a libpq-style keyword string (`"host=127.0.0.1 user=postgres dbname=postgres"`)
+or a PostgreSQL URI (`"postgresql://user:pass@host:5432/dbname?sslmode=require"`).
+
+Supported keyword arguments (all but the last three also available as DSN/URI
+options):
+
+- `dbname`, `port`, `application_name`
+- `connect_timeout` (seconds), `statement_timeout` (milliseconds)
+- `sslmode` (`"disable"`, `"prefer"` (default), `"require"`, `"verify-full"`),
+  `sslrootcert`, `sslcert`, `sslkey`, `sslcapath`, and `sslservername`
+  (TLS SNI override for pre-resolved hosts)
+- `statement_cache_maxsize`: LRU prepared-statement cache size (default 100; `0` disables)
+- `reconnect`: automatically reconnect and re-prepare statements if the
+  connection is found dead (default `false`; never reconnects mid-transaction)
+- `style`: a custom [`AbstractPostgresStyle`](@ref Postgres.API.AbstractPostgresStyle)
+  for query logging / notice / notification behavior
+- `debug`: log wire protocol messages
+
+Connections are safe for concurrent use from multiple tasks: operations are
+serialized on an internal lock. Close with `DBInterface.close!(conn)` or
+`close(conn)`; the do-block form `DBInterface.connect(f, Postgres.Connection, ...)`
+closes automatically.
+"""
 mutable struct Connection{T, S <: API.AbstractPostgresStyle} <: DBInterface.Connection
     const lock::ReentrantLock
     socket::ReseauConn
@@ -70,8 +110,6 @@ mutable struct Connection{T, S <: API.AbstractPostgresStyle} <: DBInterface.Conn
         statement_timeout_val = statement_timeout === nothing ? nothing : Int(statement_timeout)
         sslservername_val = sslservername === nothing ? nothing : String(sslservername)
         maxsize = max(0, Int(statement_cache_maxsize))
-        #TODO: if values have spaces, need to single-quote them
-        # also need to escape single quotes/backslahes then with backslashes
         socket, pid, skey, server_params = API.connect(host, port, dbname, user, password, debug, app_name, timeout, sslmode_val, sslrootcert_val, sslcert_val, sslkey_val, sslcapath_val, sslservername_val, statement_timeout_val)
         registry = Dict(API.DEFAULT_TYPE_REGISTRY)
         return new{Statement{typeof(style)}, typeof(style)}(ReentrantLock(), socket, host, user, password, dbname, port, app_name, timeout, sslmode_val, sslrootcert_val, sslcert_val, sslkey_val, sslcapath_val, sslservername_val, statement_timeout_val, pid, skey, Dict{String, Statement{typeof(style)}}(), maxsize, 0, server_params, registry, false, reconnect, debug, style, false, 0, 1)
@@ -121,10 +159,20 @@ function evict_lru_statement!(conn::Connection)
     return
 end
 
+"""
+    Postgres.get_cached_statements(conn) -> Dict{String, Statement}
+
+Return a copy of the connection's prepared-statement cache, keyed by SQL text.
+"""
 function get_cached_statements(conn::Connection)
     @lock conn.lock copy(conn.statements)
 end
 
+"""
+    Postgres.clear_statement_cache!(conn)
+
+Close all server-side prepared statements in the connection's cache and empty it.
+"""
 function clear_statement_cache!(conn::Connection)
     @lock conn.lock begin
         for (sql, stmt) in conn.statements
@@ -135,6 +183,12 @@ function clear_statement_cache!(conn::Connection)
     return conn
 end
 
+"""
+    Postgres.set_statement_cache_maxsize!(conn, maxsize)
+
+Set the maximum number of prepared statements the connection caches (LRU
+eviction). `0` disables caching and closes all currently cached statements.
+"""
 function set_statement_cache_maxsize!(conn::Connection, maxsize::Integer)
     @lock conn.lock begin
         conn.statement_cache_maxsize = max(0, Int(maxsize))
@@ -153,18 +207,41 @@ function set_statement_cache_maxsize!(conn::Connection, maxsize::Integer)
     return conn
 end
 
+"""
+    Postgres.get_server_parameter(conn, name) -> Union{String, Nothing}
+
+Return the server-reported value of runtime parameter `name` (e.g.
+`"server_version"`, `"TimeZone"`), or `nothing` if the server has not reported it.
+"""
 get_server_parameter(conn::Connection, param::String) = @lock conn.lock get(conn.server_parameters, param, nothing)
 
+"""
+    Postgres.get_server_parameters(conn) -> Dict{String, String}
+
+Return a copy of all runtime parameters the server has reported on this connection.
+"""
 get_server_parameters(conn::Connection) = @lock conn.lock copy(conn.server_parameters)
 
 # NOTE: runtime callback setters are gone — customize behavior by passing a custom
 # AbstractPostgresStyle to Connection(; style=...) and overloading the style-first
 # interface methods (query_logger / notice_callback / notification_callback).
 
+"""
+    Postgres.get_statement_timeout(conn) -> Union{Int, Nothing}
+
+Return the statement timeout (milliseconds) configured on the connection, or
+`nothing` if none was set.
+"""
 function get_statement_timeout(conn::Connection)
     return @lock conn.lock conn.statement_timeout
 end
 
+"""
+    Postgres.set_statement_timeout!(conn, timeout)
+
+Set the server `statement_timeout` for the connection, in milliseconds.
+`nothing` or `0` disables the timeout.
+"""
 function set_statement_timeout!(conn::Connection, timeout::Union{Integer, Nothing})
     timeout_val = timeout === nothing ? 0 : max(0, Int(timeout))
     DBInterface.execute(conn, "SET statement_timeout = $timeout_val")
@@ -172,24 +249,55 @@ function set_statement_timeout!(conn::Connection, timeout::Union{Integer, Nothin
     return conn
 end
 
+"""
+    Postgres.escape_identifier(name) -> String
+
+Quote a string for use as a SQL identifier (double-quoted, embedded quotes doubled).
+"""
 function escape_identifier(name::AbstractString)
     return string("\"", replace(name, "\"" => "\"\""), "\"")
 end
 
+"""
+    Postgres.escape_literal(val) -> String
+
+Quote a string for use as a SQL literal (single-quoted, embedded quotes
+doubled). Prefer query parameters (`\$1`, `\$2`, ...) over literal interpolation
+whenever possible.
+"""
 function escape_literal(val::AbstractString)
     return string("'", replace(val, "'" => "''"), "'")
 end
 
+"""
+    Postgres.listen!(conn, channel)
+
+Execute `LISTEN channel` so the connection receives notifications for
+`channel`. Use [`wait_for_notification`](@ref Postgres.wait_for_notification)
+to block until one arrives.
+"""
 function listen!(conn::Connection, channel::AbstractString)
     DBInterface.execute(conn, "LISTEN $(escape_identifier(channel))")
     return conn
 end
 
+"""
+    Postgres.unlisten!(conn, channel)
+
+Execute `UNLISTEN channel` to stop receiving notifications for `channel`.
+"""
 function unlisten!(conn::Connection, channel::AbstractString)
     DBInterface.execute(conn, "UNLISTEN $(escape_identifier(channel))")
     return conn
 end
 
+"""
+    Postgres.notify!(conn, channel, payload=nothing)
+
+Execute `NOTIFY channel` (with optional `payload`), delivering a
+[`Notification`](@ref Postgres.API.Notification) to all connections listening
+on `channel`.
+"""
 function notify!(conn::Connection, channel::AbstractString, payload::Union{AbstractString, Nothing}=nothing)
     channel_ident = escape_identifier(channel)
     sql = payload === nothing ? "NOTIFY $channel_ident" : "NOTIFY $channel_ident, $(escape_literal(payload))"
@@ -229,6 +337,15 @@ end
 
 const NOTIFICATION_POLL_INTERVAL_NS = Int64(100_000_000)
 
+"""
+    Postgres.wait_for_notification(conn; timeout=nothing) -> Union{Notification, Nothing}
+
+Block until a `NOTIFY` message arrives on the connection (see
+[`listen!`](@ref Postgres.listen!)) and return it as a
+[`Notification`](@ref Postgres.API.Notification). With a `timeout` (seconds),
+return `nothing` if no notification arrives in time. The connection lock is
+held while waiting, so use a dedicated connection for listening.
+"""
 function wait_for_notification(conn::Connection; timeout::Union{Real, Nothing}=nothing)
     start_time = time()
     @lock conn.lock begin
@@ -269,6 +386,13 @@ function wait_for_notification(conn::Connection; timeout::Union{Real, Nothing}=n
     end
 end
 
+"""
+    Postgres.copy_from(conn, sql, data)
+
+Execute a `COPY ... FROM STDIN` statement, streaming `data` (an `IO`, string,
+or byte vector) to the server. Supports all COPY formats, including
+`(FORMAT BINARY)`. Returns `conn`.
+"""
 function copy_from(conn::Connection, sql::AbstractString, data::IO; debug::Bool=false)
     log_enabled = API.query_logging_enabled(conn.style)
     start_ns = log_enabled ? time_ns() : 0
@@ -291,6 +415,13 @@ function copy_from(conn::Connection, sql::AbstractString, data; debug::Bool=fals
     return copy_from(conn, sql, buffer; debug=debug)
 end
 
+"""
+    Postgres.copy_to(conn, sql, [dest::IO])
+
+Execute a `COPY ... TO STDOUT` statement. With a `dest` IO, the copy stream is
+written to it and `dest` is returned; without one, the raw bytes are returned
+as a `Vector{UInt8}`.
+"""
 function copy_to(conn::Connection, sql::AbstractString, dest::IO; debug::Bool=false)
     log_enabled = API.query_logging_enabled(conn.style)
     start_ns = log_enabled ? time_ns() : 0
@@ -314,6 +445,16 @@ function copy_to(conn::Connection, sql::AbstractString; debug::Bool=false)
     return take!(buffer)
 end
 
+"""
+    Postgres.register_type!(conn, oid, julia_type; parser=nothing)
+
+Register a mapping from PostgreSQL type `oid` to `julia_type` in the
+connection's type registry. `parser` is a `(val::String, registry) -> value`
+function that converts the wire text; without one, values are returned as
+`String`. See also [`register_enum!`](@ref Postgres.register_enum!),
+[`register_composite!`](@ref Postgres.register_composite!), and
+[`register_range!`](@ref Postgres.register_range!).
+"""
 function register_type!(conn::Connection, oid::Integer, julia_type::Type; parser::Union{Function, Nothing}=nothing)
     @lock conn.lock API.register_type!(conn.type_registry, oid, julia_type; parser=parser)
     return conn
@@ -330,6 +471,12 @@ function lookup_type_oid(conn::Connection, name::AbstractString, schema::Abstrac
     return Int(rows[1].oid)
 end
 
+"""
+    Postgres.register_enum!(conn, name; schema="public", julia_type=Symbol)
+
+Look up the enum type `schema.name` on the server and register it so values
+are returned as `julia_type` (by default `Symbol`).
+"""
 function register_enum!(conn::Connection, name::AbstractString; schema::AbstractString="public", julia_type::Type=Symbol)
     oid = lookup_type_oid(conn, name, schema)
     parser = julia_type === Symbol ? (val, registry) -> Symbol(val) : nothing
@@ -337,6 +484,12 @@ function register_enum!(conn::Connection, name::AbstractString; schema::Abstract
     return conn
 end
 
+"""
+    Postgres.register_composite!(conn, name; schema="public")
+
+Look up the composite type `schema.name` on the server and register it so
+values are returned as `NamedTuple`s with the composite's field names.
+"""
 function register_composite!(conn::Connection, name::AbstractString; schema::AbstractString="public")
     rows = Tables.rowtable(DBInterface.execute(conn, """
         SELECT t.oid, a.attname, a.atttypid
@@ -367,6 +520,13 @@ function register_composite!(conn::Connection, name::AbstractString; schema::Abs
     return conn
 end
 
+"""
+    Postgres.register_range!(conn, name; schema="public")
+
+Look up the range type `schema.name` on the server and register it so values
+are returned as [`PostgresRange`](@ref Postgres.API.PostgresRange) of the
+range's element type.
+"""
 function register_range!(conn::Connection, name::AbstractString; schema::AbstractString="public")
     rows = Tables.rowtable(DBInterface.execute(conn, """
         SELECT t.oid, r.rngsubtype
@@ -384,6 +544,14 @@ function register_range!(conn::Connection, name::AbstractString; schema::Abstrac
     return conn
 end
 
+"""
+    Postgres.cancel_query!(conn)
+
+Send a PostgreSQL CancelRequest for the query currently running on `conn`
+(over a separate, short-lived connection, so it works while `conn` is busy).
+The cancelled query fails with a [`Postgres.Error`](@ref Postgres.API.Error)
+with SQLSTATE `57014`.
+"""
 function cancel_query!(conn::Connection)
     host = conn.host
     port = conn.port
@@ -427,15 +595,13 @@ function DBInterface.connect(::Type{Connection}, host::AbstractString, user::Abs
     Connection(host=host, user=user, password=passwd, dbname=dbname, port=port, debug=debug, reconnect=reconnect, application_name=application_name, connect_timeout=connect_timeout, sslmode=sslmode, sslrootcert=sslrootcert, sslcert=sslcert, sslkey=sslkey, sslcapath=sslcapath, sslservername=sslservername, statement_timeout=statement_timeout, statement_cache_maxsize=statement_cache_maxsize, style=style)
 end
 
-function DBInterface.connect(::Type{Connection}, dsn::String; debug::Bool=false, reconnect::Bool=false, statement_cache_maxsize::Union{Integer, Nothing}=nothing)
-    params = parse_dsn(dsn)
-    actual_maxsize = isnothing(statement_cache_maxsize) ? params.statement_cache_maxsize : statement_cache_maxsize
-    Connection(host=params.host, user=params.user, password=params.password, dbname=params.dbname, port=params.port, debug=debug, reconnect=reconnect, application_name=params.application_name, connect_timeout=params.connect_timeout, sslmode=params.sslmode, sslrootcert=params.sslrootcert, sslcert=params.sslcert, sslkey=params.sslkey, sslcapath=params.sslcapath, statement_timeout=params.statement_timeout, statement_cache_maxsize=actual_maxsize)
+function DBInterface.connect(::Type{Connection}, dsn::String; debug::Union{Bool, Nothing}=nothing, reconnect::Union{Bool, Nothing}=nothing, statement_cache_maxsize::Union{Integer, Nothing}=nothing, style::API.AbstractPostgresStyle=PostgresStyle())
+    return DBInterface.connect(Connection, parse_dsn(dsn); debug=debug, reconnect=reconnect, statement_cache_maxsize=statement_cache_maxsize, style=style)
 end
 
-function DBInterface.connect(::Type{Connection}, params::ConnectionParams; debug::Bool=false, reconnect::Bool=false, statement_cache_maxsize::Union{Integer, Nothing}=nothing)
+function DBInterface.connect(::Type{Connection}, params::ConnectionParams; debug::Union{Bool, Nothing}=nothing, reconnect::Union{Bool, Nothing}=nothing, statement_cache_maxsize::Union{Integer, Nothing}=nothing, style::API.AbstractPostgresStyle=PostgresStyle())
     actual_maxsize = isnothing(statement_cache_maxsize) ? params.statement_cache_maxsize : statement_cache_maxsize
-    Connection(host=params.host, user=params.user, password=params.password, dbname=params.dbname, port=params.port, debug=debug, reconnect=reconnect, application_name=params.application_name, connect_timeout=params.connect_timeout, sslmode=params.sslmode, sslrootcert=params.sslrootcert, sslcert=params.sslcert, sslkey=params.sslkey, sslcapath=params.sslcapath, statement_timeout=params.statement_timeout, statement_cache_maxsize=actual_maxsize)
+    Connection(host=params.host, user=params.user, password=params.password, dbname=params.dbname, port=params.port, debug=something(debug, params.debug), reconnect=something(reconnect, params.reconnect), application_name=params.application_name, connect_timeout=params.connect_timeout, sslmode=params.sslmode, sslrootcert=params.sslrootcert, sslcert=params.sslcert, sslkey=params.sslkey, sslcapath=params.sslcapath, sslservername=params.sslservername, statement_timeout=params.statement_timeout, statement_cache_maxsize=actual_maxsize, style=style)
 end
 
 function DBInterface.connect(f::Function, ::Type{Connection}, args...; kwargs...)
@@ -458,6 +624,21 @@ function DBInterface.close!(conn::Connection)
 end
 Base.close(conn::Connection) = DBInterface.close!(conn)
 
+"""
+    Postgres.ConnectionPool
+
+A pool of [`Connection`](@ref Postgres.Connection)s, created lazily up to
+`limit` and reused across [`acquire`](@ref Postgres.acquire)/[`release`](@ref
+Postgres.release) cycles (dead connections are replaced transparently):
+
+    ConnectionPool(Postgres.Connection, host, user, password; limit=10, kwargs...)
+    ConnectionPool(dsn::String; limit=10, kwargs...)
+    ConnectionPool(params::ConnectionParams; limit=10, kwargs...)
+    ConnectionPool(connector::Function; limit=10)
+
+Prefer [`with_connection`](@ref Postgres.with_connection) over manual
+acquire/release. Close all pooled connections with `DBInterface.close!(pool)`.
+"""
 struct ConnectionPool
     pool::Pools.Pool
     connector::Function
@@ -468,21 +649,17 @@ function ConnectionPool(connector::Function; limit::Integer=10)
     return ConnectionPool(pool, connector)
 end
 
-function ConnectionPool(::Type{Connection}, host::AbstractString, user::AbstractString, passwd::Union{AbstractString, Nothing}; dbname::AbstractString="", port::Integer=5432, debug::Bool=false, reconnect::Bool=false, application_name::Union{AbstractString, Nothing}=nothing, connect_timeout::Union{Integer, Nothing}=nothing, sslmode::Union{AbstractString, Nothing}=nothing, sslrootcert::Union{AbstractString, Nothing}=nothing, sslcert::Union{AbstractString, Nothing}=nothing, sslkey::Union{AbstractString, Nothing}=nothing, sslcapath::Union{AbstractString, Nothing}=nothing, statement_timeout::Union{Integer, Nothing}=nothing, statement_cache_maxsize::Integer=100, limit::Integer=10, style::API.AbstractPostgresStyle=PostgresStyle())
-    connector = () -> DBInterface.connect(Connection, host, user, passwd; dbname=dbname, port=port, debug=debug, reconnect=reconnect, application_name=application_name, connect_timeout=connect_timeout, sslmode=sslmode, sslrootcert=sslrootcert, sslcert=sslcert, sslkey=sslkey, sslcapath=sslcapath, statement_timeout=statement_timeout, statement_cache_maxsize=statement_cache_maxsize, style=style)
+function ConnectionPool(::Type{Connection}, host::AbstractString, user::AbstractString, passwd::Union{AbstractString, Nothing}; dbname::AbstractString="", port::Integer=5432, debug::Bool=false, reconnect::Bool=false, application_name::Union{AbstractString, Nothing}=nothing, connect_timeout::Union{Integer, Nothing}=nothing, sslmode::Union{AbstractString, Nothing}=nothing, sslrootcert::Union{AbstractString, Nothing}=nothing, sslcert::Union{AbstractString, Nothing}=nothing, sslkey::Union{AbstractString, Nothing}=nothing, sslcapath::Union{AbstractString, Nothing}=nothing, sslservername::Union{AbstractString, Nothing}=nothing, statement_timeout::Union{Integer, Nothing}=nothing, statement_cache_maxsize::Integer=100, limit::Integer=10, style::API.AbstractPostgresStyle=PostgresStyle())
+    connector = () -> DBInterface.connect(Connection, host, user, passwd; dbname=dbname, port=port, debug=debug, reconnect=reconnect, application_name=application_name, connect_timeout=connect_timeout, sslmode=sslmode, sslrootcert=sslrootcert, sslcert=sslcert, sslkey=sslkey, sslcapath=sslcapath, sslservername=sslservername, statement_timeout=statement_timeout, statement_cache_maxsize=statement_cache_maxsize, style=style)
     return ConnectionPool(connector; limit=limit)
 end
 
-function ConnectionPool(dsn::String; debug::Bool=false, reconnect::Bool=false, statement_cache_maxsize::Union{Integer, Nothing}=nothing, limit::Integer=10)
-    params = parse_dsn(dsn)
-    actual_maxsize = isnothing(statement_cache_maxsize) ? params.statement_cache_maxsize : statement_cache_maxsize
-    connector = () -> DBInterface.connect(Connection, params; debug=debug, reconnect=reconnect, statement_cache_maxsize=actual_maxsize)
-    return ConnectionPool(connector; limit=limit)
+function ConnectionPool(dsn::String; debug::Union{Bool, Nothing}=nothing, reconnect::Union{Bool, Nothing}=nothing, statement_cache_maxsize::Union{Integer, Nothing}=nothing, limit::Integer=10, style::API.AbstractPostgresStyle=PostgresStyle())
+    return ConnectionPool(parse_dsn(dsn); debug=debug, reconnect=reconnect, statement_cache_maxsize=statement_cache_maxsize, limit=limit, style=style)
 end
 
-function ConnectionPool(params::ConnectionParams; debug::Bool=false, reconnect::Bool=false, statement_cache_maxsize::Union{Integer, Nothing}=nothing, limit::Integer=10)
-    actual_maxsize = isnothing(statement_cache_maxsize) ? params.statement_cache_maxsize : statement_cache_maxsize
-    connector = () -> DBInterface.connect(Connection, params; debug=debug, reconnect=reconnect, statement_cache_maxsize=actual_maxsize)
+function ConnectionPool(params::ConnectionParams; debug::Union{Bool, Nothing}=nothing, reconnect::Union{Bool, Nothing}=nothing, statement_cache_maxsize::Union{Integer, Nothing}=nothing, limit::Integer=10, style::API.AbstractPostgresStyle=PostgresStyle())
+    connector = () -> DBInterface.connect(Connection, params; debug=debug, reconnect=reconnect, statement_cache_maxsize=statement_cache_maxsize, style=style)
     return ConnectionPool(connector; limit=limit)
 end
 
@@ -491,11 +668,23 @@ function pool_isvalid(conn::Connection)
     return valid
 end
 
+"""
+    Postgres.acquire(pool; forcenew=false) -> Connection
+
+Take a connection from the pool, creating one if none is available (blocking
+if the pool is at its limit). Return it with [`release`](@ref Postgres.release).
+"""
 function acquire(pool::ConnectionPool; forcenew::Bool=false)
     conn = Pools.acquire(pool.connector, pool.pool; forcenew=forcenew, isvalid=pool_isvalid)
     return conn
 end
 
+"""
+    Postgres.release(pool, conn)
+
+Return a connection previously taken with [`acquire`](@ref Postgres.acquire)
+to the pool.
+"""
 function release(pool::ConnectionPool, conn::Connection)
     if pool_isvalid(conn)
         Pools.release(pool.pool, conn)
@@ -505,6 +694,12 @@ function release(pool::ConnectionPool, conn::Connection)
     return pool
 end
 
+"""
+    Postgres.with_connection(f, pool; forcenew=false)
+
+Acquire a connection from the pool, call `f(conn)`, and release the connection
+back to the pool afterwards. Returns `f`'s result.
+"""
 function with_connection(f::Function, pool::ConnectionPool; forcenew::Bool=false)
     conn = acquire(pool; forcenew=forcenew)
     try
@@ -543,6 +738,15 @@ function execute_simple(conn::Connection, sql::String)
     return conn
 end
 
+"""
+    Postgres.start_transaction(conn)
+
+Begin a transaction (`BEGIN`). If a transaction is already open, create a
+savepoint instead, so transactions nest. Pair with [`commit`](@ref
+Postgres.commit) or [`rollback`](@ref Postgres.rollback); prefer
+[`transaction`](@ref Postgres.transaction) or
+[`@transaction`](@ref Postgres.@transaction) for automatic handling.
+"""
 function start_transaction(conn::Connection)
     @lock conn.lock begin
         checkconn(conn)
@@ -560,8 +764,18 @@ function start_transaction(conn::Connection)
     return conn
 end
 
+"""
+    Postgres.in_transaction(conn) -> Bool
+
+Whether the connection currently has an open transaction.
+"""
 in_transaction(conn::Connection) = @lock conn.lock conn.in_transaction
 
+"""
+    Postgres.commit(conn)
+
+Commit the current transaction (or release one level of transaction nesting).
+"""
 function commit(conn::Connection)
     @lock conn.lock begin
         checkconn(conn)
@@ -579,6 +793,12 @@ function commit(conn::Connection)
     return conn
 end
 
+"""
+    Postgres.rollback(conn)
+
+Roll back the current transaction (or, in a nested transaction, roll back to
+the enclosing savepoint).
+"""
 function rollback(conn::Connection)
     @lock conn.lock begin
         checkconn(conn)
@@ -597,6 +817,16 @@ function rollback(conn::Connection)
     return conn
 end
 
+"""
+    Postgres.transaction(f, conn)
+
+Run `f(conn)` inside a transaction: committed if `f` returns normally, rolled
+back if it throws. Nested calls use savepoints. Returns `f`'s result.
+
+    Postgres.transaction(conn) do conn
+        DBInterface.execute(conn, "INSERT INTO t VALUES (1)")
+    end
+"""
 function transaction(f::F, conn::Connection) where {F}
     start_transaction(conn)
     try
@@ -621,6 +851,12 @@ function DBInterface.transaction(f::F, conn::Connection) where {F}
     end
 end
 
+"""
+    Postgres.@transaction conn expr
+
+Run `expr` inside a transaction: committed if it completes, rolled back if it
+throws. Evaluates to `expr`'s value.
+"""
 macro transaction(conn, expr)
     quote
         local success = false
@@ -636,8 +872,6 @@ macro transaction(conn, expr)
         end
     end
 end
-
-# escape(conn::Connection, s::AbstractString) = API.escape(conn.pg, s)
 
 struct Describe
     resultset::Any
@@ -671,6 +905,12 @@ function Base.show(io::IO, desc::Describe)
     end
 end
 
+"""
+    Postgres.describe(conn, table; schema="public")
+
+Return a printable summary of a table's columns: name, type, nullability,
+default, primary-key flag, and foreign-key reference.
+"""
 function describe(conn::Connection, table::AbstractString; schema::String="public")
     Describe(DBInterface.execute(conn, """
         WITH column_info AS (
@@ -719,6 +959,22 @@ function describe(conn::Connection, table::AbstractString; schema::String="publi
         FROM
             column_info;
     """, (table, schema)))
+end
+
+# the supported API surface (`public` requires Julia 1.11+; the names are
+# parsed from a string so the file still loads on 1.10)
+@static if VERSION >= v"1.11"
+    eval(Meta.parse(
+        "public Connection, ConnectionPool, ConnectionParams, PostgresInterfaceError, " *
+        "Error, Notification, Numeric, PostgresRange, AbstractPostgresStyle, PostgresStyle, " *
+        "query_logging_enabled, query_logger, notice_callback, notification_callback, parse_dsn, " *
+        "transaction, @transaction, start_transaction, commit, rollback, in_transaction, " *
+        "cursor, copy_from, copy_to, listen!, unlisten!, notify!, wait_for_notification, " *
+        "register_type!, register_enum!, register_composite!, register_range!, " *
+        "command_tag, rows_affected, cancel_query!, escape_identifier, escape_literal, " *
+        "get_cached_statements, clear_statement_cache!, set_statement_cache_maxsize!, " *
+        "get_server_parameter, get_server_parameters, get_statement_timeout, set_statement_timeout!, " *
+        "acquire, release, with_connection, describe"))
 end
 
 end

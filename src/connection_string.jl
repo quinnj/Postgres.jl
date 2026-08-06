@@ -2,6 +2,21 @@ module ConnectionString
 
 using URIs
 
+"""
+    Postgres.ConnectionParams(; host="localhost", port=5432, user="", password=nothing,
+                              dbname="", kwargs...)
+
+Structured connection options, an alternative to DSN strings:
+
+    params = Postgres.ConnectionParams(host="127.0.0.1", user="postgres", dbname="postgres")
+    conn = DBInterface.connect(Postgres.Connection, params)
+
+Also produced by `Postgres.parse_dsn`. Supported keyword
+arguments mirror the connection keywords: `application_name`,
+`connect_timeout`, `sslmode`, `sslrootcert`, `sslcert`, `sslkey`, `sslcapath`,
+`sslservername`, `statement_timeout`, `statement_cache_maxsize`, `debug`, and
+`reconnect`.
+"""
 struct ConnectionParams
     host::String
     port::Int
@@ -15,14 +30,15 @@ struct ConnectionParams
     sslcert::Union{String, Nothing}
     sslkey::Union{String, Nothing}
     sslcapath::Union{String, Nothing}
+    sslservername::Union{String, Nothing}
     statement_timeout::Union{Int, Nothing}
     statement_cache_maxsize::Int
     debug::Bool
     reconnect::Bool
 end
 
-function ConnectionParams(; host::String="localhost", port::Int=5432, user::String="", password::Union{String, Nothing}=nothing, dbname::String="", application_name::Union{String, Nothing}=nothing, connect_timeout::Union{Int, Nothing}=nothing, sslmode::Union{String, Nothing}=nothing, sslrootcert::Union{String, Nothing}=nothing, sslcert::Union{String, Nothing}=nothing, sslkey::Union{String, Nothing}=nothing, sslcapath::Union{String, Nothing}=nothing, statement_timeout::Union{Int, Nothing}=nothing, statement_cache_maxsize::Int=100, debug::Bool=false, reconnect::Bool=false)
-    return ConnectionParams(host, port, user, password, dbname, application_name, connect_timeout, sslmode, sslrootcert, sslcert, sslkey, sslcapath, statement_timeout, statement_cache_maxsize, debug, reconnect)
+function ConnectionParams(; host::String="localhost", port::Int=5432, user::String="", password::Union{String, Nothing}=nothing, dbname::String="", application_name::Union{String, Nothing}=nothing, connect_timeout::Union{Int, Nothing}=nothing, sslmode::Union{String, Nothing}=nothing, sslrootcert::Union{String, Nothing}=nothing, sslcert::Union{String, Nothing}=nothing, sslkey::Union{String, Nothing}=nothing, sslcapath::Union{String, Nothing}=nothing, sslservername::Union{String, Nothing}=nothing, statement_timeout::Union{Int, Nothing}=nothing, statement_cache_maxsize::Int=100, debug::Bool=false, reconnect::Bool=false)
+    return ConnectionParams(host, port, user, password, dbname, application_name, connect_timeout, sslmode, sslrootcert, sslcert, sslkey, sslcapath, sslservername, statement_timeout, statement_cache_maxsize, debug, reconnect)
 end
 
 default_user() = get(ENV, "PGUSER", get(ENV, "USER", get(ENV, "USERNAME", "")))
@@ -81,6 +97,7 @@ function params_from_values(values::Dict{String, String})
         sslcert=get(merged, "sslcert", nothing),
         sslkey=get(merged, "sslkey", nothing),
         sslcapath=get(merged, "sslcapath", nothing),
+        sslservername=get(merged, "sslservername", nothing),
         statement_timeout=parse_optional_int(get(merged, "statement_timeout", nothing)),
         statement_cache_maxsize=parse(Int, get(merged, "statement_cache_maxsize", "100")),
     )
@@ -143,6 +160,15 @@ function parse_keyword_dsn(dsn::String)
     return values
 end
 
+"""
+    Postgres.parse_dsn(dsn) -> ConnectionParams
+
+Parse a libpq-style keyword string (`"host=127.0.0.1 user=postgres"`) or a
+PostgreSQL URI (`"postgresql://user:pass@host:5432/dbname"`) into
+`ConnectionParams`. Unset options fall back
+to the `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGAPPNAME`,
+`PGCONNECT_TIMEOUT`, and `PGSSL*` environment variables, then to defaults.
+"""
 function parse_dsn(dsn::String)
     lowered = lowercase(dsn)
     (startswith(lowered, "postgres://") || startswith(lowered, "postgresql://")) && return parse_uri(dsn)
@@ -178,7 +204,7 @@ function parse_uri(uri::String)
     query = String(parsed.query)
     if !isempty(query)
         params = URIs.queryparams(query)
-        for key in ("host", "port", "user", "password", "dbname", "application_name", "connect_timeout", "sslmode", "sslrootcert", "sslcert", "sslkey", "sslcapath", "statement_timeout", "statement_cache_maxsize")
+        for key in ("host", "port", "user", "password", "dbname", "application_name", "connect_timeout", "sslmode", "sslrootcert", "sslcert", "sslkey", "sslcapath", "sslservername", "statement_timeout", "statement_cache_maxsize")
             haskey(params, key) && (values[key] = params[key])
         end
     end

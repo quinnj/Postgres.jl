@@ -16,7 +16,21 @@ end
 
 Base.size(r::Result) = (length(r.rows),)
 Base.getindex(r::Result, i::Integer) = r.rows[i]
+
+"""
+    Postgres.command_tag(result) -> Union{String, Nothing}
+
+The PostgreSQL command completion tag for the executed statement, e.g.
+`"SELECT 5"`, `"INSERT 0 2"`, or `"UPDATE 3"`.
+"""
 command_tag(r::Result) = r.command_tag
+
+"""
+    Postgres.rows_affected(result) -> Union{Int, Nothing}
+
+The number of rows the statement affected (parsed from the command tag), or
+`nothing` when the statement doesn't report one.
+"""
 rows_affected(r::Result) = r.rows_affected
 
 getdata(r::ResultRow) = getfield(r, :data)
@@ -35,8 +49,6 @@ Tables.getcolumn(r::ResultRow, i::Int) = Tables.getcolumn(r, gettypes(r)[i], i, 
 Tables.getcolumn(r::ResultRow, nm::Symbol) = Tables.getcolumn(r, getlookup(r)[nm])
 
 Tables.schema(r::Result) = Tables.Schema(r.names, r.types)
-
-# DBInterface.lastrowid(result::Result) = API.lastrowid(result.result)
 
 function DBInterface.close!(::Result)
     return
@@ -273,6 +285,7 @@ function read_portal_batch!(cursor::Cursor)
     rows = ResultRow[]
     error_msg = nothing
     consumer_error = nothing
+    copy_statement = false
     done = false
     try
         while true
@@ -299,6 +312,19 @@ function read_portal_batch!(cursor::Cursor)
             elseif mt == UInt8('C')
                 API.skipbytes!(conn.socket, len)
                 done = true
+            elseif mt == UInt8('G')
+                # CopyInResponse: a COPY ... FROM STDIN statement was used with
+                # a cursor. Abort the copy with CopyFail so the stream returns
+                # to ready instead of deadlocking; a clear error is thrown
+                # below. A fresh Sync must follow: the one sent with
+                # Bind/Execute was ignored during copy-in mode.
+                API.skipbytes!(conn.socket, len)
+                copy_statement = true
+                API.writemessages(conn.socket, conn.debug, ('f', "COPY FROM STDIN is not supported via cursor"), ('S',))
+            elseif mt == UInt8('H') || mt == UInt8('d') || mt == UInt8('c')
+                # CopyOutResponse/CopyData/CopyDone: drain the copy-out stream
+                mt == UInt8('H') && (copy_statement = true)
+                API.skipbytes!(conn.socket, len)
             elseif mt == UInt8('N')
                 notice = API.noticeResponse(len, conn.socket)
                 API.notice_callback(conn.style, notice)
@@ -319,6 +345,10 @@ function read_portal_batch!(cursor::Cursor)
         close(conn.socket)
         error_msg === nothing || throw(error_msg)
         rethrow()
+    end
+    if copy_statement
+        cursor.done = true
+        throw(PostgresInterfaceError("COPY statements are not supported via cursor; use Postgres.copy_from or Postgres.copy_to"))
     end
     error_msg === nothing || throw(error_msg)
     consumer_error === nothing || throw(consumer_error)
@@ -349,7 +379,7 @@ function Base.iterate(cursor::Cursor, state=nothing)
     return row, nothing
 end
 
-function DBInterface.execute(stmt::Statement, params=nothing, ::Type{T}=Any; debug::Bool=false, binary::Bool=false) where {T}
+function DBInterface.execute(stmt::Statement, params=nothing, ::Type{T}=Any; debug::Bool=false) where {T}
     style = stmt.conn.style
     log_enabled = API.query_logging_enabled(style)
     start_ns = log_enabled ? time_ns() : 0
@@ -422,9 +452,24 @@ function cursor(stmt::Statement, params=nothing; fetchsize::Integer=1000, owns_t
     end
 end
 
+"""
+    Postgres.cursor(conn, sql, params=nothing; fetchsize=1000) -> Cursor
+    Postgres.cursor(stmt, params=nothing; fetchsize=1000) -> Cursor
+
+Execute a query and stream its result rows in batches of `fetchsize` instead
+of materializing them all at once. The returned cursor iterates rows; close it
+with `DBInterface.close!(cursor)`. A cursor requires a transaction: one is
+started (and committed on close) if the connection isn't already in one.
+"""
 function cursor(conn::Connection, sql::AbstractString, params=nothing; fetchsize::Integer=1000, debug::Bool=false)
     owns_transaction = false
     in_transaction(conn) || (start_transaction(conn); owns_transaction = true)
-    stmt = DBInterface.prepare(conn, sql; debug=debug)
-    return cursor(stmt, params; fetchsize=fetchsize, owns_transaction=owns_transaction)
+    try
+        stmt = DBInterface.prepare(conn, sql; debug=debug)
+        return cursor(stmt, params; fetchsize=fetchsize, owns_transaction=owns_transaction)
+    catch
+        # don't leave the transaction we started dangling on a failed cursor
+        owns_transaction && isopen(conn) && in_transaction(conn) && rollback(conn)
+        rethrow()
+    end
 end

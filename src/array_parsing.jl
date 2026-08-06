@@ -174,14 +174,6 @@ function parse_array(str::String, inner_type::Type{T}) where {T}
     return coerce_array(Any[value], inner_type)
 end
 
-function parse_to_julia_array(str::String, julia_type::Type)
-    try
-        return parse_array(str, julia_type)
-    catch
-        return str
-    end
-end
-
-export parse_array, parse_to_julia_array
+export parse_array
 
 end

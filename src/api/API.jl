@@ -1,13 +1,21 @@
 module API
 
-using UUIDs, Dates, Reseau, SASLAuth, MD5, Parsers, StructUtils, Logging, JSON, Random
+using UUIDs, Dates, Reseau, SASLAuth, MD5, Parsers, StructUtils, JSON, Random
 import ..PostgresInterfaceError
 
-export PostgresStyle, AbstractPostgresStyle, query_logging_enabled, query_logger, notice_callback, notification_callback, Error, Notification, Numeric, PostgresRange
+export PostgresStyle, AbstractPostgresStyle, query_logging_enabled, query_logger, notice_callback, notification_callback, Error, Notification, Numeric, PostgresRange, cancel_request
 
 const ReseauConn = Union{Reseau.TCP.Conn, Reseau.TLS.Conn}
 const SKIP_BUFFER_SIZE = 8192
 
+"""
+    Postgres.Error <: Exception
+
+A PostgreSQL server error (an `ErrorResponse` message). Carries the fields the
+server reported: `severity`, `code` (the SQLSTATE, e.g. `"23505"`), `message`,
+and optional context such as `detail`, `hint`, `position`, `schema`, `table`,
+`column`, and `constraint`.
+"""
 struct Error <: Exception
     severity::String
     code::String
@@ -28,6 +36,14 @@ struct Error <: Exception
     routine::Union{String, Nothing}
 end
 
+"""
+    Postgres.Notification
+
+An asynchronous `NOTIFY` message received from the server, with the notifying
+backend's `pid`, the `channel` name, and the `payload` string (empty when the
+notification had no payload). See `Postgres.listen!` and
+`Postgres.wait_for_notification`.
+"""
 struct Notification
     pid::Int32
     channel::String
@@ -51,28 +67,6 @@ function Base.showerror(io::IO, e::Error)
     return
 end
 
-# error code => (name, should_be_shown)
-const ERROR_CODE = Dict{Char, Tuple{String, Bool}}(
-    'S' => ("Severity", true),
-    'V' => ("Severity", false),
-    'C' => ("Code", false),
-    'M' => ("Message", true),
-    'D' => ("Detail", true),
-    'H' => ("Hint", true),
-    'P' => ("Position", false),
-    'p' => ("Internal Position", false),
-    'q' => ("Internal Query", false),
-    'W' => ("Where", true),
-    's' => ("Schema Name", true),
-    't' => ("Table Name", true),
-    'c' => ("Column Name", true),
-    'd' => ("Data Type Name", true),
-    'n' => ("Constraint Name", true),
-    'F' => ("File", false),
-    'L' => ("Line", false),
-    'R' => ("Routine", false),
-)
-
 function errorResponse(len, socket, debug)
     buf = read(socket, len)
     # parse error fields
@@ -94,7 +88,7 @@ function errorResponse(len, socket, debug)
     file = nothing
     line = nothing
     routine = nothing
-    while i < len
+    GC.@preserve buf while i < len
         ccode = Char(buf[i])
         i += 1
         val = unsafe_string(pointer(buf, i))
@@ -144,7 +138,7 @@ function noticeResponse(len, socket)
     buf = read(socket, len)
     i = 1
     notice = Dict{String, String}()
-    while i < length(buf)
+    GC.@preserve buf while i < length(buf)
         ccode = Char(buf[i])
         i += 1
         val = unsafe_string(pointer(buf, i))
@@ -161,9 +155,11 @@ function notificationResponse(len, socket)
     channel = ""
     payload = ""
     if !isempty(buf)
-        channel = unsafe_string(pointer(buf, i))
-        i += sizeof(channel) + 1
-        i <= length(buf) && (payload = unsafe_string(pointer(buf, i)))
+        GC.@preserve buf begin
+            channel = unsafe_string(pointer(buf, i))
+            i += sizeof(channel) + 1
+            i <= length(buf) && (payload = unsafe_string(pointer(buf, i)))
+        end
     end
     return Notification(pid, channel, payload)
 end
@@ -390,7 +386,7 @@ function waitfor(socket, debug::Bool, codes::Vararg{Char, N}) where {N}
                 # parameter status
                 buf = read(socket, len)
                 i = 1
-                while i < len
+                GC.@preserve buf while i < len
                     j = findnext(isequal(UInt8(0)), buf, i)
                     j === nothing && break
                     key = unsafe_string(pointer(buf, i), j - i)
@@ -428,6 +424,14 @@ function waitfor(socket, debug::Bool, codes::Vararg{Char, N}) where {N}
     return pid, skey, server_params
 end
 
+# password material must never reach the debug log: password-bearing messages
+# are written with debug=false and a redacted line is logged instead
+function write_password_message(socket, debug::Bool, password::String)
+    debug && @info "sending message: p, (password redacted)"
+    writemessage(socket, false, 'p', password)
+    return
+end
+
 function authRequest(debug, len, socket, user, password, client::Union{Nothing, SASLAuth.SCRAMSHA256Client}=nothing)
     auth_code = ntoh(read(socket, Int32))
     debug && @info "auth code: $auth_code"
@@ -440,7 +444,7 @@ function authRequest(debug, len, socket, user, password, client::Union{Nothing, 
         throw(Error("kerberos v5 authentication not supported"))
     elseif auth_code == 3
         # send cleartext password message
-        writemessage(socket, debug, 'p', password)
+        write_password_message(socket, debug, password)
         mt, len = readheader(socket, debug)
         if mt == UInt8('E')
             # error
@@ -464,7 +468,7 @@ function authRequest(debug, len, socket, user, password, client::Union{Nothing, 
         # Calculate the MD5 password
         pass = string("md5", bytes2hex(md5(vcat(Vector{UInt8}(bytes2hex(md5(string(password, user)))), salt))))
         # Send password message
-        writemessage(socket, debug, 'p', pass)
+        write_password_message(socket, debug, pass)
         mt, len = readheader(socket, debug)
         if mt == UInt8('E')
             # error
@@ -553,8 +557,17 @@ end
 connectsocket(host::AbstractString, port::Integer; connect_timeout::Union{Int, Nothing}=nothing) =
     connectsocket(host, port, connect_timeout)
 
+# `host:port` for Reseau, with IPv6 literals bracketed (`[::1]:5432`) so the
+# address parser doesn't reject the extra colons
+function hostport_address(host::AbstractString, port::Integer)
+    startswith(host, '/') && throw(PostgresInterfaceError("unix socket connections are not supported; provide a TCP host"))
+    h = String(host)
+    (startswith(h, '[') && endswith(h, ']')) && return string(h, ":", Int(port))
+    return occursin(':', h) ? string("[", h, "]:", Int(port)) : string(h, ":", Int(port))
+end
+
 function connectsocket(host::AbstractString, port::Integer, @nospecialize(connect_timeout::Union{Int, Nothing}))
-    address = string(host, ":", Int(port))
+    address = hostport_address(host, port)
     return if connect_timeout === nothing
         Reseau.TCP.connect(address)
     else
@@ -696,7 +709,7 @@ function describeprepared(socket, name::String, debug::Bool)
         ncols = Int(ntoh(read(socket, Int16)))
         buf = read(socket, len - 2)
         i = 1
-        while i < len - 2
+        GC.@preserve buf while i < len - 2
             ptr = pointer(buf, i)
             plen = Int(@ccall strlen(ptr::Ptr{Cvoid})::Csize_t)
             name = _symbol(ptr, plen)
@@ -772,7 +785,7 @@ end
 function commandComplete(len, socket)
     buf = read(socket, len)
     isempty(buf) && return ""
-    return unsafe_string(pointer(buf))
+    return GC.@preserve buf unsafe_string(pointer(buf))
 end
 
 function rows_affected_from_command_tag(tag::String)
@@ -789,6 +802,8 @@ function StructUtils.applyeach(::AbstractPostgresStyle, f, e::Exec)
     nrows = 0
     server_error = nothing
     consumer_error = nothing
+    copy_in_statement = false
+    copy_out_statement = false
     try
         while true
             mt, len = readheader(e.socket, e.debug)
@@ -821,6 +836,22 @@ function StructUtils.applyeach(::AbstractPostgresStyle, f, e::Exec)
             elseif mt == UInt8('T') || mt == UInt8('n') || mt == UInt8('I') || mt == UInt8('S')
                 # row description / no data / empty query response / parameter status
                 skipbytes!(e.socket, len)
+            elseif mt == UInt8('G')
+                # CopyInResponse: the statement was a COPY ... FROM STDIN, which
+                # execute doesn't support. Abort the copy with CopyFail so the
+                # server returns to ready and the connection stays usable; a
+                # clear client error is thrown below. A fresh Sync must follow:
+                # the one sent with Bind/Execute was ignored during copy-in
+                # mode, and the aborted extended-query sequence only reaches
+                # ReadyForQuery once a Sync arrives after the error.
+                skipbytes!(e.socket, len)
+                copy_in_statement = true
+                writemessages(e.socket, e.debug, ('f', "COPY FROM STDIN is not supported via execute"), ('S',))
+            elseif mt == UInt8('H') || mt == UInt8('d') || mt == UInt8('c')
+                # CopyOutResponse/CopyData/CopyDone: drain the copy-out stream
+                # through ReadyForQuery; a clear client error is thrown below
+                mt == UInt8('H') && (copy_out_statement = true)
+                skipbytes!(e.socket, len)
             elseif mt == UInt8('A')
                 # notification response
                 notification = notificationResponse(len, e.socket)
@@ -843,6 +874,11 @@ function StructUtils.applyeach(::AbstractPostgresStyle, f, e::Exec)
         server_error === nothing || throw(server_error)
         rethrow()
     end
+    # COPY misuse throws a clear client error (the server error from the
+    # aborted copy would be confusing); the stream was drained above, so the
+    # connection stays usable
+    copy_in_statement && throw(Error("COPY ... FROM STDIN is not supported via execute; use Postgres.copy_from"))
+    copy_out_statement && throw(Error("COPY ... TO STDOUT is not supported via execute; use Postgres.copy_to"))
     # server errors take precedence; otherwise surface a consumer error that
     # aborted materialization (the stream was still drained above)
     server_error === nothing || throw(server_error)
@@ -899,13 +935,20 @@ exec(socket::ReseauConn, query::String, debug::Bool) = exec(PostgresStyle(), soc
 function copy_in(style::S, socket, query::String, source::IO, debug::Bool) where {S <: AbstractPostgresStyle}
     writemessage(socket, debug, 'Q', query)
     error_msg = nothing
+    copy_started = false
     while true
         mt, len = readheader(socket, debug)
         if mt == UInt8('G')
             skipbytes!(socket, len)
+            copy_started = true
             break
         elseif mt == UInt8('E')
             error_msg = errorResponse(len, socket, debug)
+        elseif mt == UInt8('Z')
+            # ReadyForQuery without CopyInResponse: the statement errored or
+            # wasn't a COPY ... FROM STDIN; the stream is back at ready
+            skipbytes!(socket, len)
+            break
         elseif mt == UInt8('N')
             notice = noticeResponse(len, socket)
             notice_callback(style, notice)
@@ -917,6 +960,7 @@ function copy_in(style::S, socket, query::String, source::IO, debug::Bool) where
         end
     end
     error_msg === nothing || throw(error_msg)
+    copy_started || throw(Error("statement did not initiate COPY ... FROM STDIN"))
     buf = Vector{UInt8}(undef, 16384)
     while !eof(source)
         n = readbytes!(source, buf, length(buf))
@@ -951,16 +995,26 @@ end
 function copy_out(style::S, socket, query::String, dest::IO, debug::Bool) where {S <: AbstractPostgresStyle}
     writemessage(socket, debug, 'Q', query)
     error_msg = nothing
+    copy_started = false
+    wrong_direction = false
     while true
         mt, len = readheader(socket, debug)
         if mt == UInt8('H')
             skipbytes!(socket, len)
+            copy_started = true
         elseif mt == UInt8('d')
             write(dest, read(socket, len))
         elseif mt == UInt8('c')
             skipbytes!(socket, len)
         elseif mt == UInt8('C')
             skipbytes!(socket, len)
+        elseif mt == UInt8('G')
+            # CopyInResponse: the statement was COPY ... FROM STDIN. The server
+            # is now waiting on us for data, so abort the copy with CopyFail to
+            # return the stream to ready instead of deadlocking.
+            skipbytes!(socket, len)
+            wrong_direction = true
+            writemessage(socket, debug, 'f', "COPY FROM STDIN is not supported via copy_to")
         elseif mt == UInt8('E')
             error_msg = errorResponse(len, socket, debug)
         elseif mt == UInt8('N')
@@ -976,7 +1030,9 @@ function copy_out(style::S, socket, query::String, dest::IO, debug::Bool) where 
             skipbytes!(socket, len)
         end
     end
+    wrong_direction && throw(Error("statement initiated COPY ... FROM STDIN; use Postgres.copy_from"))
     error_msg === nothing || throw(error_msg)
+    copy_started || throw(Error("statement did not initiate COPY ... TO STDOUT"))
     return dest
 end
 
@@ -1003,15 +1059,6 @@ function cancel_request(host::String, port::Int, pid::Int32, skey::Int32, debug:
         close(socket)
     end
 end
-
-export cancel_request
-
-# function escape(conn::PGconn, s::AbstractString)
-#     str = C.PQescapeLiteral(ptr, s, sizeof(s))
-#     escaped = unsafe_string(str)
-#     C.PQfreemem(str)
-#     return escaped
-# end
 
 include("../array_parsing.jl")
 using .ArrayParsing
