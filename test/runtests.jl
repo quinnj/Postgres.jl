@@ -1557,6 +1557,18 @@ end
                     conn5 = DBInterface.connect(Postgres.Connection, params_reconnect; reconnect=false)
                     @test !conn5.reconnect
                     DBInterface.close!(conn5)
+
+                    # A connection-level debug setting applies to the normal
+                    # prepare/describe/execute path without a per-call flag.
+                    debug_conn = DBInterface.connect(Postgres.Connection,
+                        cfg.host, cfg.user, cfg.password; dbname=cfg.dbname,
+                        port=cfg.port)
+                    debug_conn.debug = true
+                    debug_result = @test_logs (:info, r"sending message") match_mode=:any begin
+                            DBInterface.execute(debug_conn, "SELECT 1 AS n")
+                        end
+                    @test only(debug_result).n == 1
+                    DBInterface.close!(debug_conn)
                 end
 
                 @testset "SSL Modes" begin
