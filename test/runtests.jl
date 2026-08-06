@@ -681,6 +681,10 @@ end
         @test Postgres.API.parse_value(1184, "2024-02-13 05:28:17+02", registry) == DateTime(2024, 2, 13, 3, 28, 17)
         @test Postgres.API.parse_value(1184, "2024-02-13 05:28:17+02:30", registry) == DateTime(2024, 2, 13, 2, 58, 17)
         @test Postgres.API.parse_value(1184, "2024-02-13 05:28:17Z", registry) == DateTime(2024, 2, 13, 5, 28, 17)
+        # LMT-era offsets in named zones carry a seconds field; dropping it
+        # silently shifted the decoded value
+        @test Postgres.API.parse_value(1184, "1880-01-01 05:21:10+05:21:10", registry) == DateTime(1880, 1, 1, 0, 0, 0)
+        @test Postgres.API.parse_value(1184, "1879-12-31 18:38:50-05:21:10", registry) == DateTime(1880, 1, 1, 0, 0, 0)
 
         @test Postgres.API.parse_interval("1 year 2 mons 3 days 04:05:06.789") == Dates.CompoundPeriod(Dates.Year(1), Dates.Month(2), Dates.Day(3), Dates.Hour(4), Dates.Minute(5), Dates.Second(6), Dates.Millisecond(789))
         @test Postgres.API.parse_interval("-04:05:06.789") == Dates.CompoundPeriod(Dates.Hour(-4), Dates.Minute(-5), Dates.Second(-6), Dates.Millisecond(-789))
@@ -746,6 +750,27 @@ end
         @test Postgres.API.pg_parse_date("10000-01-01") == Date(10000, 1, 1)
         @test Postgres.API.pg_parse_datetime("294276-12-31 23:59:59") == DateTime(294276, 12, 31, 23, 59, 59)
         @test Postgres.API.parse_value(1184, "10000-01-02 03:04:05+02", registry) == DateTime(10000, 1, 2, 1, 4, 5)
+        # ... but only genuine ISO renderings: an ISO year is zero-padded to
+        # at least 4 digits, so "03-04-2020" (Postgres-style for 2020-03-04
+        # after a mid-session SET DateStyle) must throw, not decode as year 3
+        @test_throws ArgumentError Postgres.API.pg_parse_date("03-04-2020")
+        @test_throws ArgumentError Postgres.API.pg_parse_date("123-01-01")
+        # adversarial input: bounded digits (no Int overflow), checked layout
+        @test_throws ArgumentError Postgres.API.pg_parse_date("99999999999999999999-01-01")
+        @test_throws ArgumentError Postgres.API.pg_parse_date("12345678-9")
+        @test_throws ArgumentError Postgres.API.pg_parse_datetime("999999999-  03:04:05    ")
+
+        # postgres permits time '24:00:00'; Julia's Time does not
+        @test_throws Postgres.PostgresInterfaceError Postgres.API.pg_parse_time("24:00:00")
+        @test Postgres.API.pg_parse_time("23:59:59.999") == Time(23, 59, 59, 999)
+
+        # range bounds may end in multibyte text; byte-index slicing threw
+        # StringIndexError on every such value
+        uni_range = Postgres.API.parse_range_of(String, "[α,ω)", 25, registry)
+        @test uni_range.lower == "α"
+        @test uni_range.upper == "ω"
+        @test uni_range.lower_inclusive
+        @test !uni_range.upper_inclusive
 
         range = Postgres.API.parse_range("[1,5)", 23, registry)
         @test range == Postgres.PostgresRange{Int32}(1, 5, true, false, false)
@@ -1062,6 +1087,25 @@ end
                     @test trow.s.lower == "x"
                     @test trow.s.upper_inclusive
                     @test trow.e.empty
+                    # bounds ending in multibyte text arrive unquoted
+                    uni_row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT textrange('α','ω') AS r")))
+                    @test uni_row.r.lower == "α"
+                    @test uni_row.r.upper == "ω"
+
+                    # arrays of registered custom types decode as arrays, not
+                    # raw literal strings
+                    enumarr = only(Tables.rowtable(DBInterface.execute(conn, "SELECT ARRAY['sad','happy']::mood[] AS a, ARRAY['ok',NULL]::mood[] AS b")))
+                    @test isequal(collect(enumarr.a), Any[:sad, :happy])
+                    @test isequal(collect(enumarr.b), Any[:ok, missing])
+                    comparr = only(Tables.rowtable(DBInterface.execute(conn, "SELECT ARRAY[ROW('A',1)::address, ROW('B',2)::address] AS a")))
+                    @test comparr.a[1] == (street="A", number=1)
+                    @test comparr.a[2] == (street="B", number=2)
+                    rangearr = only(Tables.rowtable(DBInterface.execute(conn, "SELECT ARRAY['[1,3)'::int4range, '[5,7)'::int4range] AS a")))
+                    @test rangearr.a[1].lower == 1
+                    @test rangearr.a[2].upper == 7
+                    textrangearr = only(Tables.rowtable(DBInterface.execute(conn, "SELECT ARRAY[textrange('a','c'), textrange('α','ω')] AS a")))
+                    @test textrangearr.a[1].upper == "c"
+                    @test textrangearr.a[2].lower == "α"
                     DBInterface.execute(conn, "DROP TYPE textrange CASCADE")
                 end
                 @testset "Transactions" begin
@@ -1119,8 +1163,54 @@ end
                         @test err isa Postgres.API.Error
                         @test err.code == "23503"
                         @test !Postgres.in_transaction(conn)
+                        # the failed COMMIT's own ReadyForQuery says the
+                        # transaction is over; the tracked server status must
+                        # not stay stale-true from the preceding INSERT
+                        @test !(@lock conn.lock conn.server_in_transaction)
                         @test isempty(Tables.rowtable(DBInterface.execute(conn, "SELECT * FROM deferred_child")))
                     end
+
+                    # a transaction opened with raw SQL belongs to the caller:
+                    # driver helpers must nest inside it (savepoints), never
+                    # commit it, and never destroy it on their rollback
+                    DBInterface.execute(conn, "DROP TABLE IF EXISTS rawtx_test")
+                    DBInterface.execute(conn, "CREATE TABLE rawtx_test (id int)")
+                    DBInterface.execute(conn, "BEGIN")
+                    DBInterface.execute(conn, "INSERT INTO rawtx_test VALUES (1)")
+                    Postgres.transaction(conn) do tx
+                        DBInterface.execute(tx, "INSERT INTO rawtx_test VALUES (2)")
+                    end
+                    # a failing block rolls back only its own level, leaving
+                    # the caller's transaction alive and usable
+                    raw_err = try
+                        Postgres.transaction(conn) do tx
+                            DBInterface.execute(tx, "INSERT INTO rawtx_test VALUES (3)")
+                            DBInterface.execute(tx, "SELECT 1/0")
+                        end
+                        nothing
+                    catch e
+                        e
+                    end
+                    @test raw_err isa Postgres.API.Error
+                    # a cursor sees the open transaction and must not own
+                    # (and so commit) it on close — nor start any driver-level
+                    # nesting of its own
+                    raw_cur = Postgres.cursor(conn, "SELECT id FROM rawtx_test ORDER BY id"; fetchsize=1)
+                    @test !Postgres.in_transaction(conn)
+                    @test [row.id for row in raw_cur] == [1, 2]
+                    DBInterface.close!(raw_cur)
+                    @test @lock conn.lock conn.server_in_transaction
+                    # the caller's ROLLBACK is still in control of all of it
+                    DBInterface.execute(conn, "ROLLBACK")
+                    @test isempty(Tables.rowtable(DBInterface.execute(conn, "SELECT id FROM rawtx_test")))
+                    # ... and after a raw COMMIT, the driver-level work sticks
+                    DBInterface.execute(conn, "BEGIN")
+                    Postgres.transaction(conn) do tx
+                        DBInterface.execute(tx, "INSERT INTO rawtx_test VALUES (4)")
+                    end
+                    DBInterface.execute(conn, "COMMIT")
+                    @test only(Tables.rowtable(DBInterface.execute(conn, "SELECT id FROM rawtx_test"))).id == 4
+                    DBInterface.execute(conn, "DROP TABLE rawtx_test")
 
                     # COMMIT/ROLLBACK end the transaction server-side even when
                     # they fail, so client state must not be left behind
@@ -1419,8 +1509,12 @@ end
                     DBInterface.execute(tx_conn, "BEGIN")
                     @test @lock tx_conn.lock tx_conn.server_in_transaction
                     close(tx_conn.socket)
-                    @test only(Tables.rowtable(DBInterface.execute(tx_conn, "SELECT 1 AS a"))).a == 1
+                    # trigger the reconnect via checkconn directly: a full
+                    # statement would refresh the flag from its own
+                    # ReadyForQuery and mask a missing reset
+                    @lock tx_conn.lock Postgres.checkconn(tx_conn)
                     @test !(@lock tx_conn.lock tx_conn.server_in_transaction)
+                    @test only(Tables.rowtable(DBInterface.execute(tx_conn, "SELECT 1 AS a"))).a == 1
                     DBInterface.close!(tx_conn)
                 end
 
@@ -1648,6 +1742,18 @@ end
                         DBInterface.execute(conn, "SET IntervalStyle = 'postgres'")
                     end
                     @test only(Tables.rowtable(DBInterface.execute(conn, "SELECT '1 day'::interval AS i"))).i == Dates.Day(1)
+
+                    # postgres's time '24:00:00' has no Julia representation
+                    @test_throws Postgres.PostgresInterfaceError Tables.rowtable(DBInterface.execute(conn, "SELECT '24:00:00'::time AS t"))
+                    # LMT-era timestamptz offsets carry seconds ("+05:21:10");
+                    # dropping them silently shifted the value
+                    DBInterface.execute(conn, "SET TimeZone = 'Asia/Kolkata'")
+                    try
+                        lmt_row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT '1880-01-01 00:00:00+00'::timestamptz AS t")))
+                        @test lmt_row.t == DateTime(1880, 1, 1, 0, 0, 0)
+                    finally
+                        DBInterface.execute(conn, "RESET TimeZone")
+                    end
                     # the session uses ISO dates and postgres intervals, which
                     # the text parsers require
                     style_row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT current_setting('DateStyle') AS ds, current_setting('IntervalStyle') AS is")))

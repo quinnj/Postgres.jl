@@ -264,7 +264,10 @@ end
     isempty(digits) && return 0
     hours = parse(Int, digits[1:2])
     mins = length(digits) >= 4 ? parse(Int, digits[3:4]) : 0
-    return sign * (hours * 3600 + mins * 60)
+    # pre-standardization (LMT-era) timestamps in named zones carry a seconds
+    # field ("+05:21:10"); dropping it silently shifts the decoded value
+    secs = length(digits) >= 6 ? parse(Int, digits[5:6]) : 0
+    return sign * (hours * 3600 + mins * 60 + secs)
 end
 
 # ── hand-rolled postgres text-format date/time parsing ──────────────────────
@@ -279,7 +282,11 @@ end
 
 # The year is normally 4 digits but PostgreSQL emits more beyond year 9999, so
 # scan it rather than assuming a fixed width. Returns the date and the offset
-# just past it.
+# just past it. The digit-count bound and separator checks matter: an ISO year
+# is zero-padded to at least 4 digits, so accepting fewer would silently
+# mis-decode other DateStyle renderings ("03-04-2020" is Postgres-style for
+# 2020-03-04, not year 3), and an unbounded scan would overflow Int on
+# adversarial input.
 @inline function _pg_date_at_end(c, o::Int)
     y = 0
     i = o
@@ -288,12 +295,14 @@ end
         y = y * 10 + _pg_digit(c[i])
         i += 1
     end
-    (i > n || c[i] != UInt8('-')) && throw(ArgumentError("invalid postgres date"))
-    i += 1
-    m = _pg_digit(c[i]) * 10 + _pg_digit(c[i+1])
-    i += 3
-    d = _pg_digit(c[i]) * 10 + _pg_digit(c[i+1])
-    return Date(y, m, d), i + 2
+    ndigits = i - o
+    (4 <= ndigits <= 9) || throw(ArgumentError("invalid postgres date"))
+    (i + 5 <= n && c[i] == UInt8('-') && c[i+3] == UInt8('-') &&
+     _pg_isdigit(c[i+1]) && _pg_isdigit(c[i+2]) && _pg_isdigit(c[i+4]) && _pg_isdigit(c[i+5])) ||
+        throw(ArgumentError("invalid postgres date"))
+    m = _pg_digit(c[i+1]) * 10 + _pg_digit(c[i+2])
+    d = _pg_digit(c[i+4]) * 10 + _pg_digit(c[i+5])
+    return Date(y, m, d), i + 6
 end
 
 @inline _pg_date_at(c, o::Int)::Date = first(_pg_date_at_end(c, o))
@@ -343,6 +352,8 @@ function pg_parse_time(s::AbstractString)::Time
     c = codeunits(s)
     length(c) >= 8 || throw(ArgumentError("invalid postgres time"))
     h, mi, se, ms = _pg_hms_at(c, 1)
+    # postgres permits '24:00:00' as a time value; Julia's Time does not
+    h == 24 && throw(PostgresInterfaceError("postgres time value \"$s\" cannot be represented as a Julia Time"))
     return Time(h, mi, se, ms)
 end
 
@@ -632,7 +643,9 @@ function parse_range(val::String, typeId::Int, registry::Dict{Int, TypeInfo})
     lowercase(val) == "empty" && return _range_typed(T, missing, missing, false, false, true)
     lower_inclusive = val[1] == '['
     upper_inclusive = val[end] == ']'
-    inner = val[2:end - 1]
+    # the brackets are ASCII but the bounds may not be: slice by character
+    # index, or a bound ending in a multibyte character throws StringIndexError
+    inner = val[2:prevind(val, lastindex(val))]
     left, right = split_range_values(inner)
     lower = parse_range_value(left, typeId, registry)
     upper = parse_range_value(right, typeId, registry)
@@ -647,7 +660,8 @@ function parse_range_of(::Type{T}, val::String, typeId::Int, registry::Dict{Int,
     lowercase(val) == "empty" && return PostgresRange{T}(missing, missing, false, false, true)
     lower_inclusive = val[1] == '['
     upper_inclusive = val[end] == ']'
-    left, right = split_range_values(val[2:end - 1])
+    # character slicing, as in parse_range: bounds may end in multibyte text
+    left, right = split_range_values(val[2:prevind(val, lastindex(val))])
     lower = parse_range_value(left, typeId, registry)
     upper = parse_range_value(right, typeId, registry)
     l = lower === missing ? missing : convert(T, lower)

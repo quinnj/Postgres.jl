@@ -106,6 +106,11 @@ mutable struct Connection{T, S <: API.AbstractPostgresStyle} <: DBInterface.Conn
     # the server's own ReadyForQuery transaction status: unlike in_transaction
     # it also sees a transaction opened by raw SQL (`execute(conn, "BEGIN")`)
     server_in_transaction::Bool
+    # whether the outermost driver-managed transaction level issued the BEGIN:
+    # when start_transaction found a raw-SQL transaction already open, the base
+    # level is a savepoint inside the caller's transaction, and the final
+    # commit/rollback must not COMMIT/ROLLBACK the caller's work
+    owns_base_transaction::Bool
 
     function Connection(; host::AbstractString="", user::AbstractString="", password::Union{AbstractString, Nothing}=nothing, dbname::AbstractString="", port::Integer=5432, debug::Bool=false, reconnect::Bool=false, application_name::Union{AbstractString, Nothing}=nothing, connect_timeout::Union{Integer, Nothing}=nothing, sslmode::Union{AbstractString, Nothing}=nothing, sslrootcert::Union{AbstractString, Nothing}=nothing, sslcert::Union{AbstractString, Nothing}=nothing, sslkey::Union{AbstractString, Nothing}=nothing, sslcapath::Union{AbstractString, Nothing}=nothing, sslservername::Union{AbstractString, Nothing}=nothing, statement_timeout::Union{Integer, Nothing}=nothing, statement_cache_maxsize::Integer=100, style::API.AbstractPostgresStyle=PostgresStyle())
         host = String(host)
@@ -125,7 +130,7 @@ mutable struct Connection{T, S <: API.AbstractPostgresStyle} <: DBInterface.Conn
         maxsize = max(0, Int(statement_cache_maxsize))
         socket, pid, skey, server_params = API.connect(host, port, dbname, user, password, debug, app_name, timeout, sslmode_val, sslrootcert_val, sslcert_val, sslkey_val, sslcapath_val, sslservername_val, statement_timeout_val)
         registry = Dict(API.DEFAULT_TYPE_REGISTRY)
-        return new{Statement{typeof(style)}, typeof(style)}(ReentrantLock(), socket, host, user, password, dbname, port, app_name, timeout, sslmode_val, sslrootcert_val, sslcert_val, sslkey_val, sslcapath_val, sslservername_val, statement_timeout_val, pid, skey, Dict{String, Statement{typeof(style)}}(), maxsize, 0, server_params, registry, false, reconnect, debug, style, false, 0, 1, false)
+        return new{Statement{typeof(style)}, typeof(style)}(ReentrantLock(), socket, host, user, password, dbname, port, app_name, timeout, sslmode_val, sslrootcert_val, sslcert_val, sslkey_val, sslcapath_val, sslservername_val, statement_timeout_val, pid, skey, Dict{String, Statement{typeof(style)}}(), maxsize, 0, server_params, registry, false, reconnect, debug, style, false, 0, 1, false, true)
     end
 end
 
@@ -555,13 +560,22 @@ end
 
 function lookup_type_oid(conn::Connection, name::AbstractString, schema::AbstractString)
     rows = Tables.rowtable(DBInterface.execute(conn, """
-        SELECT t.oid
+        SELECT t.oid, t.typarray
         FROM pg_type t
         JOIN pg_namespace n ON n.oid = t.typnamespace
         WHERE t.typname = \$1 AND n.nspname = \$2
     """, (name, schema)))
     isempty(rows) && throw(PostgresInterfaceError("type $(schema).$(name) not found"))
-    return Int(rows[1].oid)
+    return Int(rows[1].oid), Int(rows[1].typarray)
+end
+
+# Register the type's array OID alongside it, so `ARRAY[...]::name[]` values
+# decode as arrays of the registered type instead of the raw literal string.
+function register_array_type!(conn::Connection, arrayoid::Int, oid::Int, @nospecialize(julia_type::Type))
+    arrayoid == 0 && return conn
+    register_type!(conn, arrayoid, Vector{julia_type};
+                   parser=(val, registry) -> API.parse_array_by_oid(val, oid, registry))
+    return conn
 end
 
 """
@@ -571,9 +585,10 @@ Look up the enum type `schema.name` on the server and register it so values
 are returned as `julia_type` (by default `Symbol`).
 """
 function register_enum!(conn::Connection, name::AbstractString; schema::AbstractString="public", julia_type::Type=Symbol)
-    oid = lookup_type_oid(conn, name, schema)
+    oid, arrayoid = lookup_type_oid(conn, name, schema)
     parser = julia_type === Symbol ? (val, registry) -> Symbol(val) : nothing
     register_type!(conn, oid, julia_type; parser=parser)
+    register_array_type!(conn, arrayoid, oid, julia_type)
     return conn
 end
 
@@ -585,7 +600,7 @@ values are returned as `NamedTuple`s with the composite's field names.
 """
 function register_composite!(conn::Connection, name::AbstractString; schema::AbstractString="public")
     rows = Tables.rowtable(DBInterface.execute(conn, """
-        SELECT t.oid, a.attname, a.atttypid
+        SELECT t.oid, t.typarray, a.attname, a.atttypid
         FROM pg_type t
         JOIN pg_namespace n ON n.oid = t.typnamespace
         JOIN pg_class c ON c.oid = t.typrelid
@@ -595,6 +610,7 @@ function register_composite!(conn::Connection, name::AbstractString; schema::Abs
     """, (name, schema)))
     isempty(rows) && throw(PostgresInterfaceError("composite type $(schema).$(name) not found"))
     oid = Int(rows[1].oid)
+    arrayoid = Int(rows[1].typarray)
     field_names = [Symbol(row.attname) for row in rows]
     field_oids = Int[row.atttypid for row in rows]
     tuple_type = NamedTuple{Tuple(field_names)}
@@ -610,6 +626,7 @@ function register_composite!(conn::Connection, name::AbstractString; schema::Abs
         return tuple_type(Tuple(values))
     end
     register_type!(conn, oid, tuple_type; parser=parser)
+    register_array_type!(conn, arrayoid, oid, tuple_type)
     return conn
 end
 
@@ -619,10 +636,15 @@ end
 Look up the range type `schema.name` on the server and register it so values
 are returned as [`PostgresRange`](@ref Postgres.API.PostgresRange) of the
 range's element type.
+
+The element type is captured when the range is registered, so register it
+first: a range over a custom enum or composite must come after the
+corresponding [`register_enum!`](@ref Postgres.register_enum!) /
+[`register_composite!`](@ref Postgres.register_composite!) call.
 """
 function register_range!(conn::Connection, name::AbstractString; schema::AbstractString="public")
     rows = Tables.rowtable(DBInterface.execute(conn, """
-        SELECT t.oid, r.rngsubtype
+        SELECT t.oid, t.typarray, r.rngsubtype
         FROM pg_type t
         JOIN pg_namespace n ON n.oid = t.typnamespace
         JOIN pg_range r ON r.rngtypid = t.oid
@@ -630,6 +652,7 @@ function register_range!(conn::Connection, name::AbstractString; schema::Abstrac
     """, (name, schema)))
     isempty(rows) && throw(PostgresInterfaceError("range type $(schema).$(name) not found"))
     oid = Int(rows[1].oid)
+    arrayoid = Int(rows[1].typarray)
     subtype_oid = Int(rows[1].rngsubtype)
     subtype_type = API.type_info(conn.type_registry, subtype_oid).julia_type
     # bind the element type here rather than rediscovering it per value: the
@@ -637,6 +660,7 @@ function register_range!(conn::Connection, name::AbstractString; schema::Abstrac
     # over anything else would register successfully and then fail on every value
     parser = (val, registry) -> API.parse_range_of(subtype_type, val, subtype_oid, registry)
     register_type!(conn, oid, PostgresRange{subtype_type}; parser=parser)
+    register_array_type!(conn, arrayoid, oid, PostgresRange{subtype_type})
     return conn
 end
 
@@ -887,8 +911,16 @@ include("execute.jl")
 # does not exist"). Also one network round trip instead of three. Callers
 # must hold conn.lock.
 function execute_simple(conn::Connection, sql::String)
-    status = API.exec(conn.style, conn.socket, sql, conn.debug)
-    conn.server_in_transaction = API.in_transaction_status(status)
+    # capture the ReadyForQuery status through a Ref so a failed statement
+    # (a COMMIT hitting a deferred constraint) still refreshes the tracking:
+    # the server ended the transaction either way, and a stale flag draws a
+    # spurious ROLLBACK on the next pool release
+    status_ref = Ref{UInt8}(UInt8('I'))
+    try
+        API.exec(conn.style, conn.socket, sql, conn.debug, status_ref)
+    finally
+        conn.server_in_transaction = API.in_transaction_status(status_ref[])
+    end
     return conn
 end
 
@@ -905,7 +937,17 @@ function start_transaction(conn::Connection)
     @lock conn.lock begin
         checkconn(conn)
         if !conn.in_transaction
-            execute_simple(conn, "BEGIN")
+            if conn.server_in_transaction
+                # a transaction opened with raw SQL (execute(conn, "BEGIN"))
+                # belongs to the caller: nest inside it with a savepoint, as
+                # for driver-owned nesting, so our commit can't commit — and
+                # our rollback can't destroy — their work
+                execute_simple(conn, "SAVEPOINT sp_0")
+                conn.owns_base_transaction = false
+            else
+                execute_simple(conn, "BEGIN")
+                conn.owns_base_transaction = true
+            end
             conn.in_transaction = true
             conn.transaction_depth = 1
         else
@@ -959,7 +1001,13 @@ function commit(conn::Connection)
             # transaction state must be cleared either way — leaving it set
             # would block reconnects and make the next cursor skip its BEGIN
             try
-                execute_simple(conn, "COMMIT")
+                if conn.owns_base_transaction
+                    execute_simple(conn, "COMMIT")
+                else
+                    # the base transaction is the caller's raw-SQL one: keep
+                    # this level's work pending inside it and leave it open
+                    execute_simple(conn, "RELEASE SAVEPOINT sp_0")
+                end
             finally
                 conn.in_transaction = false
                 conn.transaction_depth = 0
@@ -993,7 +1041,13 @@ function rollback(conn::Connection)
             # as in commit: the transaction is over server-side regardless of
             # how ROLLBACK fares, so don't leave client state describing it
             try
-                execute_simple(conn, "ROLLBACK")
+                if conn.owns_base_transaction
+                    execute_simple(conn, "ROLLBACK")
+                else
+                    # undo only this level; a plain ROLLBACK would destroy the
+                    # caller's raw-SQL transaction along with it
+                    execute_simple(conn, "ROLLBACK TO SAVEPOINT sp_0")
+                end
             finally
                 conn.in_transaction = false
                 conn.transaction_depth = 0
@@ -1026,6 +1080,11 @@ end
 
 Run `f(conn)` inside a transaction: committed if `f` returns normally, rolled
 back if it throws. Nested calls use savepoints. Returns `f`'s result.
+
+A transaction already opened with raw SQL (`execute(conn, "BEGIN")`) is
+treated as the enclosing level: the block nests inside it with a savepoint
+and leaves it open, so the caller's own `COMMIT`/`ROLLBACK` stays in control
+of their transaction.
 
     Postgres.transaction(conn) do conn
         DBInterface.execute(conn, "INSERT INTO t VALUES (1)")

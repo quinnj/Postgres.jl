@@ -455,8 +455,14 @@ function DBInterface.execute(stmt::Statement, params=nothing, ::Type{T}=Any; deb
             else
                 API.exec(style, socket::Reseau.TLS.Conn, stmt.name, stmt.params, stmt.names, stmt.typeIds, stmt.conn.type_registry, debug, 0)
             end
-            result = T === Any ? makeresult(e) : StructUtils.arraylike(T) ? StructUtils.make(T, e, style) : only(StructUtils.make(Vector{T}, e, style))
-            stmt.conn.server_in_transaction = API.in_transaction_status(e.tx_status[])
+            # in a finally: a failed statement still drained to ReadyForQuery
+            # and its status is authoritative — skipping the copy on the error
+            # path leaves the transaction tracking stale
+            try
+                result = T === Any ? makeresult(e) : StructUtils.arraylike(T) ? StructUtils.make(T, e, style) : only(StructUtils.make(Vector{T}, e, style))
+            finally
+                stmt.conn.server_in_transaction = API.in_transaction_status(e.tx_status[])
+            end
         end
         log_enabled && API.query_logger(style, :execute, (sql=stmt.sql, params=params, duration_ns=time_ns() - start_ns, success=true))
         return result
@@ -485,8 +491,12 @@ function DBInterface.execute(conn::Connection, sql::AbstractString, params=nothi
             else
                 API.exec(style, socket::Reseau.TLS.Conn, stmtname, params_vec, names, types, conn.type_registry, debug, 0)
             end
-            result = T === Any ? makeresult(e) : StructUtils.arraylike(T) ? StructUtils.make(T, e, style) : only(StructUtils.make(Vector{T}, e, style))
-            conn.server_in_transaction = API.in_transaction_status(e.tx_status[])
+            # in a finally, as in the statement-execute method above
+            try
+                result = T === Any ? makeresult(e) : StructUtils.arraylike(T) ? StructUtils.make(T, e, style) : only(StructUtils.make(Vector{T}, e, style))
+            finally
+                conn.server_in_transaction = API.in_transaction_status(e.tx_status[])
+            end
         end
         log_enabled && API.query_logger(style, :execute, (sql=sql_str, params=params, duration_ns=time_ns() - start_ns, success=true))
         return result
@@ -522,7 +532,11 @@ started (and committed on close) if the connection isn't already in one.
 """
 function cursor(conn::Connection, sql::AbstractString, params=nothing; fetchsize::Integer=1000, debug::Bool=false)
     owns_transaction = false
-    in_transaction(conn) || (start_transaction(conn); owns_transaction = true)
+    # a transaction opened with raw SQL counts as "already in one": the server
+    # status sees it even though the client flag doesn't, and owning it here
+    # would mean committing the caller's transaction on cursor close
+    already_in_tx = @lock conn.lock (conn.in_transaction || conn.server_in_transaction)
+    already_in_tx || (start_transaction(conn); owns_transaction = true)
     try
         stmt = DBInterface.prepare(conn, sql; debug=debug)
         return cursor(stmt, params; fetchsize=fetchsize, owns_transaction=owns_transaction)

@@ -783,7 +783,14 @@ function align_session_formats!(socket, server_params::Dict{String, String}, deb
     # be treated as unknown, i.e. corrected — assuming it is already right is
     # how intervals silently decode to zero.
     datestyle = get(server_params, "DateStyle", "")
-    if !startswith(datestyle, "ISO")
+    if isempty(datestyle)
+        # unreported (a pooler may not forward ParameterStatus): setting just
+        # the format half preserves whatever field order is configured
+        # server-side, which we can't see — naming an order here would flip a
+        # DMY session to MDY
+        exec(PostgresStyle(), socket, "SET DateStyle = 'ISO'", debug)
+        server_params["DateStyle"] = "ISO"
+    elseif !startswith(datestyle, "ISO")
         wanted = string("ISO, ", date_order(datestyle))
         exec(PostgresStyle(), socket, string("SET DateStyle = '", wanted, "'"), debug)
         server_params["DateStyle"] = wanted
@@ -1041,7 +1048,7 @@ function exec(style::S, socket::ReseauConn, stmtname::String, params::Vector{Uni
     return Exec{S}(style, socket, names, typeIds, type_registry, debug, Ref{Union{Nothing, String}}(nothing), Ref{Union{Nothing, Int}}(nothing), Ref{UInt8}(UInt8('I')))
 end
 
-function exec(style::S, socket::ReseauConn, query::String, debug::Bool) where {S <: AbstractPostgresStyle}
+function exec(style::S, socket::ReseauConn, query::String, debug::Bool, tx_status_ref::Union{Nothing, Base.RefValue{UInt8}}=nothing) where {S <: AbstractPostgresStyle}
     writemessages(socket, debug, ('Q', query))
     server_error = nothing
     tx_status = UInt8('I')
@@ -1054,6 +1061,11 @@ function exec(style::S, socket::ReseauConn, query::String, debug::Bool) where {S
                 server_error = errorResponse(len, socket, debug)
             elseif mt == UInt8('Z')
                 tx_status = read_ready_status(socket, len)
+                # publish through the Ref as well: a failed statement (a
+                # COMMIT hitting a deferred constraint) throws below, but its
+                # ReadyForQuery status is authoritative and the caller's
+                # transaction tracking must not go stale
+                tx_status_ref === nothing || (tx_status_ref[] = tx_status)
                 break
             elseif mt == UInt8('N')
                 notice_callback(style, noticeResponse(len, socket))
