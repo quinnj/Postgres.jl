@@ -1108,13 +1108,18 @@ end
                     @test_throws Postgres.API.Error Postgres.copy_from(conn, "COPY nonexistent_copy_tbl FROM STDIN", "1\n")
                     @test Tables.rowtable(DBInterface.execute(conn, "SELECT 1 AS a"))[1].a == 1
 
-                    # non-COPY and wrong-direction statements are rejected
-                    # cleanly, without desyncing or deadlocking the connection
-                    @test_throws Postgres.API.Error Postgres.copy_from(conn, "SELECT 1", "1\n")
-                    @test_throws Postgres.API.Error Postgres.copy_to(conn, "SELECT 1")
-                    @test_throws Postgres.API.Error Postgres.copy_from(conn, "COPY copy_test TO STDOUT", "1\talpha\n")
-                    @test_throws Postgres.API.Error Postgres.copy_to(conn, "COPY copy_test FROM STDIN")
+                    # non-COPY, wrong-direction, and multi-statement COPY calls
+                    # are rejected cleanly, without desyncing or deadlocking
+                    @test_throws Postgres.PostgresInterfaceError Postgres.copy_from(conn, "SELECT 1", "1\n")
+                    @test_throws Postgres.PostgresInterfaceError Postgres.copy_to(conn, "SELECT 1")
+                    @test_throws Postgres.PostgresInterfaceError Postgres.copy_from(conn, "COPY copy_test TO STDOUT", "1\talpha\n")
+                    @test_throws Postgres.PostgresInterfaceError Postgres.copy_to(conn, "COPY copy_test FROM STDIN")
+                    @test_throws Postgres.PostgresInterfaceError Postgres.copy_from(conn, "COPY copy_test (id, name) FROM STDIN; COPY copy_test (id, name) FROM STDIN", "9\tomega\n")
                     @test Tables.rowtable(DBInterface.execute(conn, "SELECT 2 AS a"))[1].a == 2
+
+                    # a genuine mid-stream server error during copy-out wins
+                    # over the misuse error and the connection stays usable
+                    @test_throws Postgres.API.Error Postgres.copy_to(conn, "COPY (SELECT 1/0) TO STDOUT")
 
                     # COPY via execute throws a clear client error pointing at
                     # copy_from/copy_to and keeps the connection usable
@@ -1124,16 +1129,16 @@ end
                     catch e
                         e
                     end
-                    @test err isa Postgres.API.Error
-                    @test occursin("copy_from", err.message)
+                    @test err isa Postgres.PostgresInterfaceError
+                    @test occursin("copy_from", err.msg)
                     err = try
                         DBInterface.execute(conn, "COPY copy_test TO STDOUT")
                         nothing
                     catch e
                         e
                     end
-                    @test err isa Postgres.API.Error
-                    @test occursin("copy_to", err.message)
+                    @test err isa Postgres.PostgresInterfaceError
+                    @test occursin("copy_to", err.msg)
                     @test Tables.rowtable(DBInterface.execute(conn, "SELECT 3 AS a"))[1].a == 3
 
                     # COPY via cursor errors cleanly, keeps the connection

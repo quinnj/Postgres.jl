@@ -4,7 +4,7 @@
 [![docs](https://img.shields.io/badge/docs-dev-blue.svg)](https://JuliaDatabases.github.io/Postgres.jl/dev/)
 [![codecov](https://codecov.io/gh/JuliaDatabases/Postgres.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/JuliaDatabases/Postgres.jl)
 
-Postgres.jl is a pure-Julia PostgreSQL client that implements the v3 wire protocol with `DBInterface` and `Tables` integration.
+Postgres.jl is a PostgreSQL client written in Julia that implements the v3 wire protocol with `DBInterface` and `Tables` integration.
 
 ## Installation
 

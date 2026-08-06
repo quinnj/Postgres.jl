@@ -14,7 +14,10 @@ const SKIP_BUFFER_SIZE = 8192
 A PostgreSQL server error (an `ErrorResponse` message). Carries the fields the
 server reported: `severity`, `code` (the SQLSTATE, e.g. `"23505"`), `message`,
 and optional context such as `detail`, `hint`, `position`, `schema`, `table`,
-`column`, and `constraint`.
+`column`, and `constraint`. A small number of protocol-level failures detected
+client-side (unsupported authentication methods, protocol desync) also use
+this type, with an empty `code`; other client-side failures throw
+`Postgres.PostgresInterfaceError`.
 """
 struct Error <: Exception
     severity::String
@@ -874,11 +877,16 @@ function StructUtils.applyeach(::AbstractPostgresStyle, f, e::Exec)
         server_error === nothing || throw(server_error)
         rethrow()
     end
-    # COPY misuse throws a clear client error (the server error from the
-    # aborted copy would be confusing); the stream was drained above, so the
-    # connection stays usable
-    copy_in_statement && throw(Error("COPY ... FROM STDIN is not supported via execute; use Postgres.copy_from"))
-    copy_out_statement && throw(Error("COPY ... TO STDOUT is not supported via execute; use Postgres.copy_to"))
+    # COPY misuse throws a clear client error; the stream was drained above,
+    # so the connection stays usable. For copy-in the server error is just the
+    # CopyFail artifact, so the client error wins; for copy-out a server error
+    # is a genuine mid-stream failure (e.g. inside COPY (SELECT ...) TO
+    # STDOUT) and is more informative than the misuse error.
+    copy_in_statement && throw(PostgresInterfaceError("COPY ... FROM STDIN is not supported via execute; use Postgres.copy_from"))
+    if copy_out_statement
+        server_error === nothing || throw(server_error)
+        throw(PostgresInterfaceError("COPY ... TO STDOUT is not supported via execute; use Postgres.copy_to"))
+    end
     # server errors take precedence; otherwise surface a consumer error that
     # aborted materialization (the stream was still drained above)
     server_error === nothing || throw(server_error)
@@ -960,7 +968,7 @@ function copy_in(style::S, socket, query::String, source::IO, debug::Bool) where
         end
     end
     error_msg === nothing || throw(error_msg)
-    copy_started || throw(Error("statement did not initiate COPY ... FROM STDIN"))
+    copy_started || throw(PostgresInterfaceError("statement did not initiate COPY ... FROM STDIN"))
     buf = Vector{UInt8}(undef, 16384)
     while !eof(source)
         n = readbytes!(source, buf, length(buf))
@@ -969,12 +977,20 @@ function copy_in(style::S, socket, query::String, source::IO, debug::Bool) where
     end
     writemessage(socket, debug, 'c')
     error_msg = nothing
+    second_copy = false
     while true
         mt, len = readheader(socket, debug)
         if mt == UInt8('E')
             error_msg = errorResponse(len, socket, debug)
         elseif mt == UInt8('C')
             skipbytes!(socket, len)
+        elseif mt == UInt8('G')
+            # a second CopyInResponse (multi-statement query string): the
+            # server is waiting for more copy data, so abort with CopyFail
+            # instead of deadlocking; a clear error is thrown below
+            skipbytes!(socket, len)
+            second_copy = true
+            writemessage(socket, debug, 'f', "copy_from supports a single COPY FROM STDIN statement")
         elseif mt == UInt8('N')
             notice = noticeResponse(len, socket)
             notice_callback(style, notice)
@@ -988,6 +1004,7 @@ function copy_in(style::S, socket, query::String, source::IO, debug::Bool) where
             skipbytes!(socket, len)
         end
     end
+    second_copy && throw(PostgresInterfaceError("copy_from supports a single COPY ... FROM STDIN statement per call"))
     error_msg === nothing || throw(error_msg)
     return
 end
@@ -1030,9 +1047,9 @@ function copy_out(style::S, socket, query::String, dest::IO, debug::Bool) where 
             skipbytes!(socket, len)
         end
     end
-    wrong_direction && throw(Error("statement initiated COPY ... FROM STDIN; use Postgres.copy_from"))
+    wrong_direction && throw(PostgresInterfaceError("statement initiated COPY ... FROM STDIN; use Postgres.copy_from"))
     error_msg === nothing || throw(error_msg)
-    copy_started || throw(Error("statement did not initiate COPY ... TO STDOUT"))
+    copy_started || throw(PostgresInterfaceError("statement did not initiate COPY ... TO STDOUT"))
     return dest
 end
 

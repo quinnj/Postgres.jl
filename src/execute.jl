@@ -285,7 +285,8 @@ function read_portal_batch!(cursor::Cursor)
     rows = ResultRow[]
     error_msg = nothing
     consumer_error = nothing
-    copy_statement = false
+    copy_in_statement = false
+    copy_out_statement = false
     done = false
     try
         while true
@@ -319,11 +320,11 @@ function read_portal_batch!(cursor::Cursor)
                 # below. A fresh Sync must follow: the one sent with
                 # Bind/Execute was ignored during copy-in mode.
                 API.skipbytes!(conn.socket, len)
-                copy_statement = true
+                copy_in_statement = true
                 API.writemessages(conn.socket, conn.debug, ('f', "COPY FROM STDIN is not supported via cursor"), ('S',))
             elseif mt == UInt8('H') || mt == UInt8('d') || mt == UInt8('c')
                 # CopyOutResponse/CopyData/CopyDone: drain the copy-out stream
-                mt == UInt8('H') && (copy_statement = true)
+                mt == UInt8('H') && (copy_out_statement = true)
                 API.skipbytes!(conn.socket, len)
             elseif mt == UInt8('N')
                 notice = API.noticeResponse(len, conn.socket)
@@ -346,9 +347,17 @@ function read_portal_batch!(cursor::Cursor)
         error_msg === nothing || throw(error_msg)
         rethrow()
     end
-    if copy_statement
+    # same precedence as the execute path: for copy-in the server error is
+    # just the CopyFail artifact; for copy-out a server error is a genuine
+    # mid-stream failure and wins over the misuse error
+    if copy_in_statement
         cursor.done = true
-        throw(PostgresInterfaceError("COPY statements are not supported via cursor; use Postgres.copy_from or Postgres.copy_to"))
+        throw(PostgresInterfaceError("COPY ... FROM STDIN is not supported via cursor; use Postgres.copy_from"))
+    end
+    if copy_out_statement
+        cursor.done = true
+        error_msg === nothing || throw(error_msg)
+        throw(PostgresInterfaceError("COPY ... TO STDOUT is not supported via cursor; use Postgres.copy_to"))
     end
     error_msg === nothing || throw(error_msg)
     consumer_error === nothing || throw(consumer_error)

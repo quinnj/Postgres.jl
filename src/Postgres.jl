@@ -307,7 +307,7 @@ end
 
 function update_server_parameters!(conn::Connection, buf::Vector{UInt8})
     i = 1
-    while i < length(buf)
+    GC.@preserve buf while i < length(buf)
         j = findnext(isequal(UInt8(0)), buf, i)
         j === nothing && break
         key = unsafe_string(pointer(buf, i), j - i)
