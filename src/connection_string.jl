@@ -41,6 +41,14 @@ function ConnectionParams(; host::String="localhost", port::Int=5432, user::Stri
     return ConnectionParams(host, port, user, password, dbname, application_name, connect_timeout, sslmode, sslrootcert, sslcert, sslkey, sslcapath, sslservername, statement_timeout, statement_cache_maxsize, debug, reconnect)
 end
 
+function Base.show(io::IO, params::ConnectionParams)
+    password = params.password === nothing ? "nothing" : "***"
+    print(io, "Postgres.ConnectionParams(host=", repr(params.host),
+          ", port=", params.port, ", user=", repr(params.user),
+          ", password=", password, ", dbname=", repr(params.dbname), ")")
+end
+Base.show(io::IO, ::MIME"text/plain", params::ConnectionParams) = show(io, params)
+
 default_user() = get(ENV, "PGUSER", get(ENV, "USER", get(ENV, "USERNAME", "")))
 
 function parse_optional_int(value::Union{String, Nothing}, key::String="")
@@ -112,22 +120,32 @@ end
 # Ignored keywords that change security or connection-selection behavior when
 # set: silently dropping "channel_binding=require" or a CRL file would leave
 # the caller believing a protection is in place. The values listed are the
-# no-op defaults for each keyword; any other value draws a warning.
+# no-op defaults for each keyword; any other value is rejected.
 const SECURITY_SENSITIVE_IGNORED = Dict(
     "channel_binding" => ("", "prefer", "disable"),
     "target_session_attrs" => ("", "any"),
     "options" => ("",),
+    "gssencmode" => ("", "prefer", "disable"),
+    "sslnegotiation" => ("", "postgres"),
+    "sslcompression" => ("", "0"),
     "sslcrl" => ("",),
     "sslcrldir" => ("",),
+    "sslpassword" => ("",),
     "requiressl" => ("", "0"),
+    "requirepeer" => ("",),
+    "hostaddr" => ("",),
+    "client_encoding" => ("", "UTF8", "UTF-8", "utf8", "utf-8"),
+    "passfile" => ("",),
+    "service" => ("",),
+    "load_balance_hosts" => ("", "disable"),
+    "replication" => ("", "0", "false", "off"),
 )
 
-function warn_ignored_param(key::String, value::String)
+function check_ignored_param(key::String, value::String)
     inert = get(SECURITY_SENSITIVE_IGNORED, key, nothing)
     inert === nothing && return
     value in inert && return
-    @warn "connection parameter \"$key=$value\" is not supported by Postgres.jl and is ignored"
-    return
+    throw(ArgumentError("connection parameter \"$key=$value\" is not supported by Postgres.jl and cannot be safely ignored"))
 end
 
 # An unrecognized key is almost always a typo, and silently dropping it is
@@ -138,7 +156,7 @@ function check_known_params(values::Dict{String, String})
     for (key, value) in values
         (key in KNOWN_PARAMS || key in IGNORED_PARAMS) ||
             throw(ArgumentError("unrecognized connection parameter \"$key\"; recognized parameters are $(join(sort!(collect(KNOWN_PARAMS)), ", "))"))
-        key in IGNORED_PARAMS && warn_ignored_param(key, value)
+        key in IGNORED_PARAMS && check_ignored_param(key, value)
     end
     return values
 end
@@ -185,51 +203,67 @@ function parse_keyword_dsn(dsn::String)
             i = nextind(dsn, i)
         end
         i > lastindex(dsn) && break
+
         key_start = i
-        while i <= lastindex(dsn) && dsn[i] != '='
+        while i <= lastindex(dsn) && dsn[i] != '=' &&
+              !isspace(dsn[i]) && dsn[i] != ';'
             i = nextind(dsn, i)
         end
-        i > lastindex(dsn) && break
-        key = lowercase(strip(dsn[key_start:prevind(dsn, i)]))
+        key_end = prevind(dsn, i)
+        key = key_end < key_start ? "" : lowercase(String(dsn[key_start:key_end]))
+        isempty(key) && throw(ArgumentError("empty connection parameter name"))
+        while i <= lastindex(dsn) && isspace(dsn[i])
+            i = nextind(dsn, i)
+        end
+        (i <= lastindex(dsn) && dsn[i] == '=') ||
+            throw(ArgumentError("connection parameter \"$key\" is missing '='"))
         i = nextind(dsn, i)
         while i <= lastindex(dsn) && isspace(dsn[i])
             i = nextind(dsn, i)
         end
+
         buf = IOBuffer()
         if i <= lastindex(dsn) && dsn[i] == '\''
             i = nextind(dsn, i)
+            closed_quote = false
             while i <= lastindex(dsn)
                 c = dsn[i]
                 if c == '\\'
                     i = nextind(dsn, i)
-                    if i <= lastindex(dsn)
-                        write(buf, dsn[i])
-                        i = nextind(dsn, i)
-                    end
+                    i <= lastindex(dsn) ||
+                        throw(ArgumentError("dangling escape in value for connection parameter \"$key\""))
+                    write(buf, dsn[i])
+                    i = nextind(dsn, i)
                 elseif c == '\''
                     i = nextind(dsn, i)
+                    closed_quote = true
                     break
                 else
                     write(buf, c)
                     i = nextind(dsn, i)
                 end
             end
+            closed_quote ||
+                throw(ArgumentError("unterminated quoted value for connection parameter \"$key\""))
+            if i <= lastindex(dsn) && !isspace(dsn[i]) && dsn[i] != ';'
+                throw(ArgumentError("unexpected text after quoted value for connection parameter \"$key\""))
+            end
         else
             while i <= lastindex(dsn) && !isspace(dsn[i]) && dsn[i] != ';'
                 c = dsn[i]
                 if c == '\\'
                     i = nextind(dsn, i)
-                    if i <= lastindex(dsn)
-                        write(buf, dsn[i])
-                        i = nextind(dsn, i)
-                    end
+                    i <= lastindex(dsn) ||
+                        throw(ArgumentError("dangling escape in value for connection parameter \"$key\""))
+                    write(buf, dsn[i])
+                    i = nextind(dsn, i)
                 else
                     write(buf, c)
                     i = nextind(dsn, i)
                 end
             end
         end
-        !isempty(key) && (values[key] = String(take!(buf)))
+        values[key] = String(take!(buf))
     end
     return values
 end
@@ -281,7 +315,7 @@ function parse_uri(uri::String)
         for (key, value) in params
             (key in KNOWN_PARAMS || key in IGNORED_PARAMS) ||
                 throw(ArgumentError("unrecognized connection parameter \"$key\" in URI; recognized parameters are $(join(sort!(collect(KNOWN_PARAMS)), ", "))"))
-            key in IGNORED_PARAMS && warn_ignored_param(key, value)
+            key in IGNORED_PARAMS && check_ignored_param(key, value)
             # keys we accept but don't implement must not reach params_from_values
             key in KNOWN_PARAMS && (values[key] = value)
         end

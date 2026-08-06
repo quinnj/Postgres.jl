@@ -1,4 +1,5 @@
 using Test
+using Aqua
 using Dates
 using UUIDs
 using DBInterface
@@ -18,6 +19,14 @@ struct LoggingStyle <: Postgres.API.AbstractPostgresStyle end
 Postgres.API.query_logging_enabled(::LoggingStyle) = true
 Postgres.API.query_logger(::LoggingStyle, event::Symbol, info::NamedTuple) = (push!(LOGGED_EVENTS, (event=event, info=info)); nothing)
 Postgres.API.notice_callback(::LoggingStyle, notice) = (NOTICE_SEEN[] = true; nothing)
+
+const FAILING_LOGGER_CALLS = Ref(0)
+struct FailingLoggerStyle <: Postgres.API.AbstractPostgresStyle end
+Postgres.API.query_logging_enabled(::FailingLoggerStyle) = true
+function Postgres.API.query_logger(::FailingLoggerStyle, event::Symbol, info::NamedTuple)
+    FAILING_LOGGER_CALLS[] += 1
+    error("logger failed")
+end
 
 
 # Integration tests for Postgres.jl protocol and API behavior.
@@ -155,7 +164,7 @@ cp /certs/root.crt "\$certdir/root.crt"
 chown postgres:postgres "\$certdir/server.crt" "\$certdir/server.key" "\$certdir/root.crt"
 chmod 0644 "\$certdir/server.crt" "\$certdir/root.crt"
 chmod 0600 "\$certdir/server.key"
-exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file="\$certdir/server.crt" -c ssl_key_file="\$certdir/server.key" -c ssl_ca_file="\$certdir/root.crt"
+exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file="\$certdir/server.crt" -c ssl_key_file="\$certdir/server.key" -c ssl_ca_file="\$certdir/root.crt" -c hba_file=/certs/pg_hba.conf
 """
     return ["sh", "-c", setup_script]
 end
@@ -169,6 +178,11 @@ function generate_ssl_material(dir::AbstractString)
     server_csr = joinpath(dir, "server.csr")
     server_cert = joinpath(dir, "server.crt")
     server_config = joinpath(dir, "server-openssl.cnf")
+    client_key = joinpath(dir, "client.key")
+    client_csr = joinpath(dir, "client.csr")
+    client_cert = joinpath(dir, "client.crt")
+    client_config = joinpath(dir, "client-openssl.cnf")
+    hba_file = joinpath(dir, "pg_hba.conf")
 
     open(server_config, "w") do io
         write(io, """
@@ -191,13 +205,44 @@ IP.1 = 127.0.0.1
 """)
     end
 
+    open(client_config, "w") do io
+        write(io, """
+[req]
+distinguished_name = req_distinguished_name
+prompt = no
+req_extensions = v3_req
+
+[req_distinguished_name]
+CN = postgres_mtls
+
+[v3_req]
+basicConstraints = CA:FALSE
+keyUsage = digitalSignature, keyEncipherment
+extendedKeyUsage = clientAuth
+""")
+    end
+
+    open(hba_file, "w") do io
+        write(io, """
+local all all trust
+hostssl all postgres_mtls 0.0.0.0/0 trust clientcert=verify-full
+hostssl all postgres_mtls ::/0 trust clientcert=verify-full
+host all all 0.0.0.0/0 trust
+host all all ::/0 trust
+""")
+    end
+
     run_openssl("req", "-x509", "-newkey", "rsa:2048", "-days", "1", "-nodes", "-keyout", root_key, "-out", root_cert, "-subj", "/CN=Postgres.jl Test Root CA")
     run_openssl("req", "-x509", "-newkey", "rsa:2048", "-days", "1", "-nodes", "-keyout", wrong_root_key, "-out", wrong_root_cert, "-subj", "/CN=Postgres.jl Wrong Root CA")
     run_openssl("req", "-new", "-newkey", "rsa:2048", "-nodes", "-keyout", server_key, "-out", server_csr, "-config", server_config)
     run_openssl("x509", "-req", "-in", server_csr, "-CA", root_cert, "-CAkey", root_key, "-CAcreateserial", "-out", server_cert, "-days", "1", "-sha256", "-extensions", "v3_req", "-extfile", server_config)
+    run_openssl("req", "-new", "-newkey", "rsa:2048", "-nodes", "-keyout", client_key, "-out", client_csr, "-config", client_config)
+    run_openssl("x509", "-req", "-in", client_csr, "-CA", root_cert, "-CAkey", root_key, "-CAcreateserial", "-out", client_cert, "-days", "1", "-sha256", "-extensions", "v3_req", "-extfile", client_config)
     chmod(server_key, 0o600)
+    chmod(client_key, 0o600)
 
-    return (rootcert=root_cert, wrongrootcert=wrong_root_cert, certdir=dir)
+    return (rootcert=root_cert, wrongrootcert=wrong_root_cert,
+            clientcert=client_cert, clientkey=client_key, certdir=dir)
 end
 
 function with_ssl_postgres(f::Function)
@@ -425,6 +470,8 @@ function random_array_string(rng::AbstractRNG)
 end
 
 @testset "Postgres" begin
+    Aqua.test_all(Postgres)
+
     @testset "Export Surface" begin
         exported = Set([:DBInterface, :Postgres])
         @static if VERSION >= v"1.11"
@@ -523,20 +570,40 @@ end
         @test_throws ArgumentError Postgres.parse_dsn("host=h ssl_mode=verify-full")
         @test_throws ArgumentError Postgres.parse_dsn("postgresql://u@h/db?ssl_mode=require")
 
-        # real libpq keywords this driver doesn't implement are accepted and
-        # ignored: providers routinely put them in the URI they hand users.
-        # The ones that request a security or connection-selection behavior
-        # warn, so the caller isn't left believing a protection is in place
-        @test (@test_logs (:warn, r"channel_binding=require.*ignored") Postgres.parse_dsn("postgresql://u:p@h/db?sslmode=require&channel_binding=require")).sslmode == "require"
-        @test (@test_logs (:warn, r"target_session_attrs=read-write.*ignored") Postgres.parse_dsn("postgresql://u@h/db?target_session_attrs=read-write")).dbname == "db"
-        @test (@test_logs (:warn, r"options=.*ignored") Postgres.parse_dsn("host=h options=-csearch_path=x")).host == "h"
-        @test_logs (:warn, r"sslcrl=.*ignored") Postgres.parse_dsn("host=h sslcrl=/tmp/crl.pem")
-        @test_logs (:warn, r"requiressl=1.*ignored") Postgres.parse_dsn("host=h requiressl=1")
+        # A libpq option that requests behavior this driver cannot enforce is
+        # rejected. Warning and connecting would falsely report a security or
+        # routing guarantee to the caller.
+        @test_throws ArgumentError Postgres.parse_dsn("postgresql://u:p@h/db?sslmode=require&channel_binding=require")
+        @test_throws ArgumentError Postgres.parse_dsn("postgresql://u@h/db?target_session_attrs=read-write")
+        @test_throws ArgumentError Postgres.parse_dsn("host=h options=-csearch_path=x")
+        @test_throws ArgumentError Postgres.parse_dsn("host=h sslcrl=/tmp/crl.pem")
+        @test_throws ArgumentError Postgres.parse_dsn("host=h requiressl=1")
+        @test_throws ArgumentError Postgres.parse_dsn("host=h gssencmode=require")
+        @test_throws ArgumentError Postgres.parse_dsn("host=h requirepeer=postgres")
+        @test_throws ArgumentError Postgres.parse_dsn("host=h hostaddr=203.0.113.1")
+        @test_throws ArgumentError Postgres.parse_dsn("host=h client_encoding=LATIN1")
         # the no-op defaults for those keywords stay silent, as do keywords
         # with no security consequence
         @test_logs Postgres.parse_dsn("host=h channel_binding=prefer target_session_attrs=any requiressl=0")
         @test_logs Postgres.parse_dsn("host=h keepalives=1 client_encoding=UTF8")
         @test_logs Postgres.parse_dsn("postgresql://u@h/db?channel_binding=disable")
+
+        # Displaying structured connection options must never reveal a secret.
+        shown = repr(Postgres.ConnectionParams(host="h", user="u", password="top-secret", dbname="d"))
+        plain_shown = repr(MIME"text/plain"(), Postgres.ConnectionParams(
+            host="h", user="u", password="top-secret", dbname="d"))
+        @test !occursin("top-secret", shown)
+        @test !occursin("top-secret", plain_shown)
+        @test occursin("password=***", shown)
+        @test occursin("password=***", plain_shown)
+
+        # Malformed keyword DSNs must never degrade to a usable partial
+        # configuration. In particular, a discarded security option could
+        # change which endpoint or transport is selected.
+        @test_throws ArgumentError Postgres.parse_dsn("host=h broken")
+        @test_throws ArgumentError Postgres.parse_dsn("host='unterminated")
+        @test_throws ArgumentError Postgres.parse_dsn("host=abc\\")
+        @test_throws ArgumentError Postgres.parse_dsn("host='h'trailing")
 
         # invalid values for a recognized parameter are reported against that
         # parameter rather than silently defaulting
@@ -613,6 +680,19 @@ end
         @test Postgres.API.cstring_at(UInt8['a', 'b'], 1) == ("ab", 3)
         @test Postgres.API.cstring_at(UInt8['a', 0x00, 'c', 0x00], 3) == ("c", 5)
         @test Postgres.API.cstring_at(UInt8['a', 0x00], 5) == ("", 3)
+        @test_throws EOFError Postgres.API.skipbytes!(IOBuffer(UInt8[0x01]), 2)
+        @test Postgres.API.read_ready_status(IOBuffer(UInt8['T']), 1) == UInt8('T')
+        @test_throws Postgres.API.Error Postgres.API.read_ready_status(IOBuffer(UInt8[]), 0)
+        @test Postgres.API.commandComplete(7, IOBuffer(UInt8[codeunits("SELECT\0")...])) == "SELECT"
+        @test_throws Postgres.API.Error Postgres.API.commandComplete(0, IOBuffer())
+        @test_throws Postgres.API.Error Postgres.API.commandComplete(4, IOBuffer(UInt8['O', 'K', 0x00, 0x00]))
+        let socket = IOBuffer()
+            write(socket, UInt8('D'))
+            write(socket, hton(Postgres.API.MAX_PREAUTH_MESSAGE_LEN + Int32(5)))
+            seekstart(socket)
+            @test_throws Postgres.API.Error Postgres.API.readheader(
+                socket, false, Postgres.API.MAX_PREAUTH_MESSAGE_LEN)
+        end
 
         # a malformed DataRow must fail with a clear protocol error rather
         # than reading past the buffer or leaving the row partly unfilled
@@ -653,8 +733,10 @@ end
         # server would truncate mid-statement
         @test Postgres.escape_identifier("a\"b") == "\"a\"\"b\""
         @test Postgres.escape_literal("a'b") == "'a''b'"
+        @test Postgres.escape_literal("a\\b") == "E'a\\\\b'"
         @test_throws Postgres.PostgresInterfaceError Postgres.escape_identifier("a\0b")
         @test_throws Postgres.PostgresInterfaceError Postgres.escape_literal("a\0b")
+        @test_throws Postgres.PostgresInterfaceError Postgres.Connection(host="127.0.0.1", port=1, user="u\0x")
 
         # severity must come from the non-localized 'V' field when the server
         # sends it: 'S' is translated, so comparing it to "FATAL" would depend
@@ -727,6 +809,8 @@ end
         # ... and high-bit bytes as backslash-octal escapes
         @test Postgres.API.parse_value(18, "\\200", registry) == Char(0x80)
         @test Postgres.API.parse_value(18, "\\377", registry) == Char(0xff)
+        @test Postgres.API.parse_value(18, "\\x80", registry) == Char(0x80)
+        @test Postgres.API.parse_value(18, "\\xFF", registry) == Char(0xff)
         # a backslash byte renders as a lone backslash, not an escape
         @test Postgres.API.parse_value(18, "\\", registry) == '\\'
         @test Postgres.API.pg_parse_char("\\310") == Char(0xc8)
@@ -830,8 +914,6 @@ end
             @test Postgres.API.parse_array_by_oid(Postgres._param(values), 25, registry) == values
         end
     end
-
-    include("trim_compile_tests.jl")
 
     if !docker_available()
         @info "Docker not available; skipping Postgres integration tests."
@@ -956,6 +1038,34 @@ end
                     stmt = DBInterface.prepare(conn, raw"SELECT $1::int AS val")
                     res = Tables.rowtable(DBInterface.execute(stmt, (1,)))
                     @test res[1].val == 1
+                    @test all(ismissing, stmt.params)
+
+                    failing_stmt = DBInterface.prepare(conn, raw"SELECT 10 / $1::int AS val")
+                    @test_throws Postgres.API.Error DBInterface.execute(failing_stmt, (0,))
+                    @test all(ismissing, failing_stmt.params)
+                    mismatch_stmt = DBInterface.prepare(conn,
+                        raw"SELECT $1::text AS a, $2::text AS b")
+                    @test_throws Postgres.PostgresInterfaceError DBInterface.execute(
+                        mismatch_stmt, ("must-not-remain",))
+                    @test all(ismissing, mismatch_stmt.params)
+
+                    # Each prepare call returns an independent caller handle,
+                    # even when both handles share one cache-owned server
+                    # statement. Closing one must not close the other.
+                    held = DBInterface.prepare(conn, "SELECT 42 AS val")
+                    alias = DBInterface.prepare(conn, "SELECT 42 AS val")
+                    @test held !== alias
+                    DBInterface.close!(alias)
+                    @test only(DBInterface.execute(held)).val == 42
+                    function_value = DBInterface.execute(conn, "SELECT 42 AS val", nothing) do result
+                        only(result).val
+                    end
+                    @test function_value == 42
+                    @test only(DBInterface.execute(held)).val == 42
+
+                    DBInterface.close!(held)
+                    DBInterface.close!(mismatch_stmt)
+                    DBInterface.close!(failing_stmt)
                     DBInterface.close!(stmt)
                     @test_throws Postgres.PostgresInterfaceError DBInterface.execute(stmt, (1,))
                 end
@@ -1106,7 +1216,55 @@ end
                     textrangearr = only(Tables.rowtable(DBInterface.execute(conn, "SELECT ARRAY[textrange('a','c'), textrange('α','ω')] AS a")))
                     @test textrangearr.a[1].upper == "c"
                     @test textrangearr.a[2].lower == "α"
+
+                    # Registry metadata must describe values the parser can
+                    # actually produce, including empty and all-NULL results.
+                    @test_throws ArgumentError Postgres.register_type!(conn, 900_000, Int)
+                    @test_throws ArgumentError Postgres.register_enum!(conn, "mood"; julia_type=Int)
+                    Postgres.register_enum!(conn, "mood"; julia_type=String)
+                    empty_enum = DBInterface.execute(conn, "SELECT mood FROM custom_types WHERE false")
+                    @test Tables.schema(empty_enum).types[1] === String
+                    null_enum = DBInterface.execute(conn, "SELECT NULL::mood AS mood")
+                    @test Tables.schema(null_enum).types[1] == Union{Missing, String}
+                    @test ismissing(only(null_enum).mood)
+                    string_enum = only(DBInterface.execute(conn, "SELECT 'happy'::mood AS mood"))
+                    @test string_enum.mood == "happy"
                     DBInterface.execute(conn, "DROP TYPE textrange CASCADE")
+                end
+
+                @testset "Describe Schema Isolation" begin
+                    DBInterface.execute(conn, "DROP SCHEMA IF EXISTS postgres_describe_a CASCADE")
+                    DBInterface.execute(conn, "DROP SCHEMA IF EXISTS postgres_describe_b CASCADE")
+                    DBInterface.execute(conn, "CREATE SCHEMA postgres_describe_a")
+                    DBInterface.execute(conn, "CREATE SCHEMA postgres_describe_b")
+                    try
+                        DBInterface.execute(conn, "CREATE TABLE postgres_describe_a.parent_a (id int PRIMARY KEY)")
+                        DBInterface.execute(conn, "CREATE TABLE postgres_describe_b.parent_b (id int PRIMARY KEY)")
+                        DBInterface.execute(conn, """
+                            CREATE TABLE postgres_describe_a.child (
+                                id int PRIMARY KEY,
+                                parent_id int,
+                                CONSTRAINT shared_fk FOREIGN KEY (parent_id)
+                                    REFERENCES postgres_describe_a.parent_a(id)
+                            )
+                        """)
+                        DBInterface.execute(conn, """
+                            CREATE TABLE postgres_describe_b.child (
+                                id int PRIMARY KEY,
+                                parent_id int,
+                                CONSTRAINT shared_fk FOREIGN KEY (parent_id)
+                                    REFERENCES postgres_describe_b.parent_b(id)
+                            )
+                        """)
+                        description = Postgres.describe(conn, "child"; schema="postgres_describe_a")
+                        rows = Tables.rowtable(description.resultset)
+                        @test length(rows) == 2
+                        parent_row = only(filter(row -> row.column_name == "parent_id", rows))
+                        @test parent_row.foreign_key_reference == "parent_a.id"
+                    finally
+                        DBInterface.execute(conn, "DROP SCHEMA IF EXISTS postgres_describe_a CASCADE")
+                        DBInterface.execute(conn, "DROP SCHEMA IF EXISTS postgres_describe_b CASCADE")
+                    end
                 end
                 @testset "Transactions" begin
                     DBInterface.execute(conn, "DROP TABLE IF EXISTS trans_test")
@@ -1170,6 +1328,50 @@ end
                         @test isempty(Tables.rowtable(DBInterface.execute(conn, "SELECT * FROM deferred_child")))
                     end
 
+                    # PostgreSQL changes COMMIT to ROLLBACK when a statement
+                    # error was caught inside the body. The helper must not
+                    # return the body value as if the write committed.
+                    DBInterface.execute(conn, "DROP TABLE IF EXISTS caught_error_tx")
+                    DBInterface.execute(conn, "CREATE TABLE caught_error_tx (id int)")
+                    for wrapper in (:plain, :helper, :macro)
+                        err = try
+                            if wrapper === :plain
+                                Postgres.start_transaction(conn)
+                                DBInterface.execute(conn, "INSERT INTO caught_error_tx VALUES (1)")
+                                try
+                                    DBInterface.execute(conn, "SELECT 1/0")
+                                catch
+                                end
+                                Postgres.commit(conn)
+                            elseif wrapper === :helper
+                                Postgres.transaction(conn) do tx
+                                    DBInterface.execute(tx, "INSERT INTO caught_error_tx VALUES (1)")
+                                    try
+                                        DBInterface.execute(tx, "SELECT 1/0")
+                                    catch
+                                    end
+                                    :body_value
+                                end
+                            else
+                                Postgres.@transaction conn begin
+                                    DBInterface.execute(conn, "INSERT INTO caught_error_tx VALUES (1)")
+                                    try
+                                        DBInterface.execute(conn, "SELECT 1/0")
+                                    catch
+                                    end
+                                    :body_value
+                                end
+                            end
+                            nothing
+                        catch e
+                            e
+                        end
+                        @test err isa Postgres.PostgresInterfaceError
+                        @test occursin("completed ROLLBACK", sprint(showerror, err))
+                        @test !Postgres.in_transaction(conn)
+                        @test isempty(Tables.rowtable(DBInterface.execute(conn, "SELECT * FROM caught_error_tx")))
+                    end
+
                     # a transaction opened with raw SQL belongs to the caller:
                     # driver helpers must nest inside it (savepoints), never
                     # commit it, and never destroy it on their rollback
@@ -1203,6 +1405,20 @@ end
                     # the caller's ROLLBACK is still in control of all of it
                     DBInterface.execute(conn, "ROLLBACK")
                     @test isempty(Tables.rowtable(DBInterface.execute(conn, "SELECT id FROM rawtx_test")))
+
+                    # Driver savepoints must not shadow a caller savepoint with
+                    # the same name. A failed helper must also release its own
+                    # savepoint after rolling back to it.
+                    DBInterface.execute(conn, "BEGIN")
+                    DBInterface.execute(conn, "SAVEPOINT sp_0")
+                    DBInterface.execute(conn, "INSERT INTO rawtx_test VALUES (10)")
+                    @test_throws ErrorException Postgres.transaction(conn) do tx
+                        DBInterface.execute(tx, "INSERT INTO rawtx_test VALUES (20)")
+                        error("fail nested work")
+                    end
+                    DBInterface.execute(conn, "ROLLBACK TO SAVEPOINT sp_0")
+                    @test isempty(Tables.rowtable(DBInterface.execute(conn, "SELECT id FROM rawtx_test")))
+                    DBInterface.execute(conn, "ROLLBACK")
                     # ... and after a raw COMMIT, the driver-level work sticks
                     DBInterface.execute(conn, "BEGIN")
                     Postgres.transaction(conn) do tx
@@ -1265,6 +1481,18 @@ end
                         DBInterface.execute(conn, "INVALID SQL")
                     end
                     @test length(Tables.rowtable(DBInterface.execute(conn, "SELECT * FROM macro_test"))) == 2
+
+                    # An early return must commit before it leaves the caller.
+                    early_return = function(c)
+                        Postgres.@transaction c begin
+                            DBInterface.execute(c, "INSERT INTO macro_test (value) VALUES (4)")
+                            return :early
+                        end
+                        return :late
+                    end
+                    @test early_return(conn) === :early
+                    @test !Postgres.in_transaction(conn)
+                    @test only(Tables.rowtable(DBInterface.execute(conn, "SELECT count(*)::int AS n FROM macro_test"))).n == 3
                 end
 
                 @testset "Nested Transactions" begin
@@ -1370,6 +1598,48 @@ end
                     Postgres.clear_statement_cache!(conn_cache)
                     @test length(Postgres.get_cached_statements(conn_cache)) == 0
                     DBInterface.close!(conn_cache)
+
+                    # Retained handles survive eviction and cache disablement,
+                    # but private re-prepare must never exceed or repopulate
+                    # the configured cache.
+                    retained_conn = DBInterface.connect(Postgres.Connection,
+                        cfg.host, cfg.user, cfg.password; dbname=cfg.dbname,
+                        port=cfg.port, statement_cache_maxsize=1)
+                    retained_a = DBInterface.prepare(retained_conn, "SELECT 101 AS n")
+                    retained_b = DBInterface.prepare(retained_conn, "SELECT 102 AS n")
+                    @test length(Postgres.get_cached_statements(retained_conn)) == 1
+                    @test only(DBInterface.execute(retained_a)).n == 101
+                    retained_cache = Postgres.get_cached_statements(retained_conn)
+                    @test length(retained_cache) == 1
+                    @test haskey(retained_cache, "SELECT 102 AS n")
+                    replacement_a = DBInterface.prepare(retained_conn, "SELECT 101 AS n")
+                    @test only(DBInterface.execute(retained_a)).n == 101
+                    @test length(Postgres.get_cached_statements(retained_conn)) == 1
+                    Postgres.set_statement_cache_maxsize!(retained_conn, 0)
+                    @test only(DBInterface.execute(retained_b)).n == 102
+                    @test isempty(Postgres.get_cached_statements(retained_conn))
+                    for retained in (retained_a, retained_b, replacement_a)
+                        DBInterface.close!(retained)
+                    end
+                    DBInterface.close!(retained_conn)
+
+                    # Connection-form bulk helpers own and close the private
+                    # statements they create when caching is disabled.
+                    bulk_conn = DBInterface.connect(Postgres.Connection,
+                        cfg.host, cfg.user, cfg.password; dbname=cfg.dbname,
+                        port=cfg.port, statement_cache_maxsize=0)
+                    DBInterface.execute(bulk_conn, "CREATE TEMP TABLE cache_bulk_test (id int)")
+                    for i in 1:3
+                        DBInterface.executemany(bulk_conn,
+                            raw"INSERT INTO cache_bulk_test VALUES ($1)", ([i],))
+                        resultsets = DBInterface.executemultiple(
+                            bulk_conn, raw"SELECT $1::int AS n", (i,))
+                        @test only(only(resultsets)).n == i
+                        prepared_count = only(DBInterface.execute(bulk_conn,
+                            "SELECT count(*)::int AS n FROM pg_prepared_statements")).n
+                        @test prepared_count == 0
+                    end
+                    DBInterface.close!(bulk_conn)
                 end
 
                 @testset "Do-Block Helpers" begin
@@ -1483,7 +1753,22 @@ end
                         @test ids == [2]
                     end
                     DBInterface.close!(pool)
+                    @test !isopen(pool)
                     @test !isopen(conn_a)
+                    @test_throws Postgres.PostgresInterfaceError Postgres.acquire(pool)
+                    DBInterface.close!(pool)
+
+                    # Closing a pool is terminal even when a connection is
+                    # still checked out. Its later release must close it, not
+                    # add it back to the closed pool.
+                    active_pool = Postgres.ConnectionPool(Postgres.Connection, cfg.host, cfg.user, cfg.password;
+                        dbname=cfg.dbname, port=cfg.port, limit=1)
+                    active_conn = Postgres.acquire(active_pool)
+                    DBInterface.close!(active_pool)
+                    @test isopen(active_conn)
+                    Postgres.release(active_pool, active_conn)
+                    @test !isopen(active_conn)
+                    @test_throws Postgres.PostgresInterfaceError Postgres.acquire(active_pool)
                 end
 
                 @testset "Transaction Prevents Reconnect" begin
@@ -1525,9 +1810,98 @@ end
                     @test only(Tables.rowtable(DBInterface.execute(timeout_conn, "SELECT current_setting('statement_timeout') AS t"))).t == "200ms"
                     @test_throws Postgres.API.Error DBInterface.execute(timeout_conn, "SELECT pg_sleep(1)")
                     Postgres.set_statement_timeout!(timeout_conn, 0)
+                    @test Postgres.get_statement_timeout(timeout_conn) == 0
+                    Postgres.start_transaction(timeout_conn)
+                    @test_throws Postgres.PostgresInterfaceError Postgres.set_statement_timeout!(timeout_conn, 777)
+                    @test Postgres.get_statement_timeout(timeout_conn) == 0
+                    Postgres.rollback(timeout_conn)
                     rows = Tables.rowtable(DBInterface.execute(timeout_conn, "SELECT 1 AS a"))
                     @test rows[1].a == 1
                     DBInterface.close!(timeout_conn)
+                end
+
+                @testset "Server Parameters And UTF8 Startup" begin
+                    original_app = only(DBInterface.execute(conn,
+                        "SELECT current_setting('application_name') AS value")).value
+                    @test Postgres.get_server_parameter(conn, "application_name") == original_app
+                    try
+                        DBInterface.execute(conn, "SET application_name = 'postgres_jl_changed'")
+                        @test Postgres.get_server_parameter(conn, "application_name") == "postgres_jl_changed"
+                        Postgres.start_transaction(conn)
+                        DBInterface.execute(conn, "SET LOCAL application_name = 'postgres_jl_local'")
+                        @test Postgres.get_server_parameter(conn, "application_name") == "postgres_jl_local"
+                        Postgres.commit(conn)
+                        @test Postgres.get_server_parameter(conn, "application_name") == "postgres_jl_changed"
+                    finally
+                        Postgres.in_transaction(conn) && Postgres.rollback(conn)
+                        DBInterface.execute(conn, "RESET application_name")
+                    end
+                    @test Postgres.get_server_parameter(conn, "application_name") == original_app
+
+                    dangerous_literal = "\\' OR true --"
+                    try
+                        DBInterface.execute(conn, "SET standard_conforming_strings = off")
+                        @test Postgres.get_server_parameter(conn,
+                            "standard_conforming_strings") == "off"
+                        literal_row = only(DBInterface.execute(conn,
+                            "SELECT $(Postgres.escape_literal(dangerous_literal))::text AS value"))
+                        @test literal_row.value == dangerous_literal
+                    finally
+                        DBInterface.execute(conn, "RESET standard_conforming_strings")
+                    end
+
+                    role_name = "postgres_jl_utf8_" * replace(string(uuid4()), "-" => "")
+                    role_ident = Postgres.escape_identifier(role_name)
+                    role_conn = nothing
+                    DBInterface.execute(conn, "CREATE ROLE $role_ident LOGIN PASSWORD 'postgres_jl_test'")
+                    try
+                        DBInterface.execute(conn,
+                            "ALTER ROLE $role_ident SET client_encoding = 'LATIN1'")
+                        DBInterface.execute(conn,
+                            "ALTER ROLE $role_ident SET statement_timeout = '444ms'")
+                        role_conn = DBInterface.connect(Postgres.Connection, cfg.host,
+                            role_name, "postgres_jl_test"; dbname=cfg.dbname,
+                            port=cfg.port, reconnect=true)
+                        settings = only(DBInterface.execute(role_conn, """
+                            SELECT current_setting('client_encoding') AS encoding,
+                                   current_setting('statement_timeout') AS timeout
+                        """))
+                        @test settings.encoding == "UTF8"
+                        @test settings.timeout == "444ms"
+                        @test Postgres.get_server_parameter(role_conn,
+                            "client_encoding") == "UTF8"
+                        @test only(DBInterface.execute(role_conn,
+                            raw"SELECT $1::text AS value", ("雪",))).value == "雪"
+
+                        # An explicit disable must override the role default on
+                        # this session and after automatic reconnect.
+                        Postgres.set_statement_timeout!(role_conn, nothing)
+                        @test Postgres.get_statement_timeout(role_conn) == 0
+                        close(role_conn.socket)
+                        @test only(DBInterface.execute(role_conn,
+                            "SELECT current_setting('statement_timeout') AS value")).value == "0"
+                    finally
+                        role_conn === nothing || DBInterface.close!(role_conn)
+                        DBInterface.execute(conn, "DROP ROLE IF EXISTS $role_ident")
+                    end
+                end
+
+
+                @testset "Query Logger Isolation" begin
+                    FAILING_LOGGER_CALLS[] = 0
+                    log_conn = DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, cfg.password;
+                        dbname=cfg.dbname, port=cfg.port, style=FailingLoggerStyle())
+                    try
+                        @test_logs (:warn, r"query logger failed") DBInterface.execute(log_conn, "CREATE TEMP TABLE logger_test (id int)")
+                        calls = FAILING_LOGGER_CALLS[]
+                        @test_logs (:warn, r"query logger failed") DBInterface.execute(log_conn, "INSERT INTO logger_test VALUES (1)")
+                        @test FAILING_LOGGER_CALLS[] == calls + 1
+                        @test_logs (:warn, r"query logger failed") begin
+                            @test only(Tables.rowtable(DBInterface.execute(log_conn, "SELECT count(*)::int AS n FROM logger_test"))).n == 1
+                        end
+                    finally
+                        DBInterface.close!(log_conn)
+                    end
                 end
 
                 @testset "Listen/Notify" begin
@@ -1591,6 +1965,13 @@ end
                     @test_throws Postgres.PostgresInterfaceError Postgres.copy_from(conn, "COPY copy_test TO STDOUT", "1\talpha\n")
                     @test_throws Postgres.PostgresInterfaceError Postgres.copy_to(conn, "COPY copy_test FROM STDIN")
                     @test_throws Postgres.PostgresInterfaceError Postgres.copy_from(conn, "COPY copy_test (id, name) FROM STDIN; COPY copy_test (id, name) FROM STDIN", "9\tomega\n")
+                    @test_throws Postgres.PostgresInterfaceError Postgres.copy_from(conn,
+                        "COPY copy_test (id, name) FROM STDIN; COPY copy_test TO STDOUT",
+                        "10\tmixed\n")
+                    @test_throws Postgres.PostgresInterfaceError Postgres.copy_to(conn,
+                        "COPY (SELECT 7) TO STDOUT; COPY (SELECT 8) TO STDOUT")
+                    @test_throws Postgres.PostgresInterfaceError Postgres.copy_to(conn,
+                        "COPY (SELECT 7) TO STDOUT; SELECT 8")
                     @test Tables.rowtable(DBInterface.execute(conn, "SELECT 2 AS a"))[1].a == 2
 
                     # a genuine mid-stream server error during copy-out wins
@@ -1646,6 +2027,59 @@ end
                     @test values == [1, 2, 3, 4, 5]
                     DBInterface.close!(cur)
                     @test !Postgres.in_transaction(conn)
+
+                    # The documented Statement overload must own a transaction
+                    # when called outside one, or the first Sync drops a
+                    # suspended multi-batch portal.
+                    cursor_stmt = DBInterface.prepare(conn,
+                        "SELECT generate_series(1, 5) AS n")
+                    statement_cursor = Postgres.cursor(cursor_stmt; fetchsize=2)
+                    @test [row.n for row in statement_cursor] == [1, 2, 3, 4, 5]
+                    DBInterface.close!(statement_cursor)
+                    @test !Postgres.in_transaction(conn)
+                    @test first(DBInterface.execute(cursor_stmt)).n == 1
+                    DBInterface.close!(cursor_stmt)
+
+                    mismatch_cursor_stmt = DBInterface.prepare(conn,
+                        raw"SELECT $1::text AS a, $2::text AS b")
+                    @test_throws Postgres.PostgresInterfaceError Postgres.cursor(
+                        mismatch_cursor_stmt, ("must-not-remain",); fetchsize=1)
+                    @test all(ismissing, mismatch_cursor_stmt.params)
+                    @test !Postgres.in_transaction(conn)
+                    DBInterface.close!(mismatch_cursor_stmt)
+
+                    # A fully exhausted named portal still exists until Close
+                    # or transaction end. Cursor close must release it now,
+                    # even inside a caller-owned long transaction.
+                    Postgres.start_transaction(conn)
+                    portal_stmt = DBInterface.prepare(conn,
+                        "SELECT generate_series(1, 5) AS n")
+                    portal_cursor = Postgres.cursor(portal_stmt; fetchsize=2)
+                    @test length(collect(portal_cursor)) == 5
+                    portal_name = portal_cursor.portal
+                    @test only(DBInterface.execute(conn,
+                        "SELECT count(*)::int AS n FROM pg_cursors WHERE name = \$1",
+                        (portal_name,))).n == 1
+                    DBInterface.close!(portal_cursor)
+                    @test only(DBInterface.execute(conn,
+                        "SELECT count(*)::int AS n FROM pg_cursors WHERE name = \$1",
+                        (portal_name,))).n == 0
+                    DBInterface.close!(portal_stmt)
+                    Postgres.rollback(conn)
+
+                    # With caching disabled, the connection-form cursor owns
+                    # its private prepared statement and closes it with the
+                    # portal.
+                    private_cursor_conn = DBInterface.connect(Postgres.Connection,
+                        cfg.host, cfg.user, cfg.password; dbname=cfg.dbname,
+                        port=cfg.port, statement_cache_maxsize=0)
+                    private_cursor = Postgres.cursor(private_cursor_conn,
+                        "SELECT generate_series(1, 3) AS n"; fetchsize=1)
+                    @test length(collect(private_cursor)) == 3
+                    DBInterface.close!(private_cursor)
+                    @test only(DBInterface.execute(private_cursor_conn,
+                        "SELECT count(*)::int AS n FROM pg_prepared_statements")).n == 0
+                    DBInterface.close!(private_cursor_conn)
 
                     # closing an already-closed cursor must not reach into a
                     # transaction the caller opened afterwards and commit it
@@ -1776,6 +2210,8 @@ end
                             order_row = only(Tables.rowtable(DBInterface.execute(german_conn, "SELECT current_setting('DateStyle') AS ds, '01/02/2020'::date AS d")))
                             @test order_row.ds == "ISO, DMY"
                             @test order_row.d == Date(2020, 2, 1)
+                            @test Postgres.get_server_parameter(german_conn, "DateStyle") == "ISO, DMY"
+                            @test Postgres.get_server_parameter(german_conn, "IntervalStyle") == "postgres"
                         finally
                             DBInterface.close!(german_conn)
                         end
@@ -1792,7 +2228,6 @@ end
                     @test complex_interval.interval_col == Dates.CompoundPeriod(Dates.Year(1), Dates.Month(2), Dates.Day(3), Dates.Hour(4), Dates.Minute(5), Dates.Second(6), Dates.Millisecond(789))
                 end
 
-                run_postgres_trim_compile_tests(cfg)
             finally
                 isopen(conn) && DBInterface.close!(conn)
             end
@@ -1822,6 +2257,76 @@ end
 
                     @test connection_error(ssl_cfg.host, ssl_cfg; sslmode="verify-full") !== nothing
                     @test connection_error(ssl_cfg.host, ssl_cfg; sslmode="verify-full", sslrootcert=tls.wrongrootcert) !== nothing
+
+                    ca_dir = joinpath(tls.certdir, "ca-directory")
+                    mkpath(ca_dir)
+                    cp(tls.rootcert, joinpath(ca_dir, "root.crt"))
+                    capath_conn = DBInterface.connect(Postgres.Connection,
+                        ssl_cfg.host, ssl_cfg.user, ssl_cfg.password;
+                        dbname=ssl_cfg.dbname, port=ssl_cfg.port,
+                        sslmode="verify-full", sslcapath=ca_dir)
+                    try
+                        @test connection_uses_ssl(capath_conn)
+                    finally
+                        DBInterface.close!(capath_conn)
+                    end
+
+                    # Require and verify a client certificate for one role.
+                    # This covers the TLS 1.2 mTLS path and the cancel request,
+                    # which must present the same client identity.
+                    mtls_admin = DBInterface.connect(Postgres.Connection,
+                        ssl_cfg.host, ssl_cfg.user, ssl_cfg.password;
+                        dbname=ssl_cfg.dbname, port=ssl_cfg.port, sslmode="require")
+                    try
+                        DBInterface.execute(mtls_admin, "DROP ROLE IF EXISTS postgres_mtls")
+                        DBInterface.execute(mtls_admin, "CREATE ROLE postgres_mtls LOGIN")
+                        no_cert_error = try
+                            no_cert_conn = DBInterface.connect(Postgres.Connection,
+                                ssl_cfg.host, "postgres_mtls", nothing;
+                                dbname=ssl_cfg.dbname, port=ssl_cfg.port,
+                                sslmode="verify-full", sslrootcert=tls.rootcert)
+                            DBInterface.close!(no_cert_conn)
+                            nothing
+                        catch err
+                            err
+                        end
+                        @test no_cert_error !== nothing
+
+                        mtls_conn = DBInterface.connect(Postgres.Connection,
+                            ssl_cfg.host, "postgres_mtls", nothing;
+                            dbname=ssl_cfg.dbname, port=ssl_cfg.port,
+                            sslmode="verify-full", sslrootcert=tls.rootcert,
+                            sslcert=tls.clientcert, sslkey=tls.clientkey)
+                        try
+                            tls_row = only(DBInterface.execute(mtls_conn, """
+                                SELECT ssl, version, client_dn
+                                FROM pg_stat_ssl
+                                WHERE pid = pg_backend_pid()
+                            """))
+                            @test tls_row.ssl
+                            @test tls_row.version == "TLSv1.2"
+                            @test occursin("CN=postgres_mtls", tls_row.client_dn)
+
+                            mtls_task = errormonitor(Threads.@spawn begin
+                                try
+                                    DBInterface.execute(mtls_conn, "SELECT pg_sleep(5)")
+                                    :completed
+                                catch err
+                                    err
+                                end
+                            end)
+                            sleep(0.5)
+                            Postgres.cancel_query!(mtls_conn)
+                            mtls_result = fetch(mtls_task)
+                            @test mtls_result isa Postgres.API.Error
+                            @test mtls_result.code == "57014"
+                        finally
+                            DBInterface.close!(mtls_conn)
+                        end
+                    finally
+                        DBInterface.execute(mtls_admin, "DROP ROLE IF EXISTS postgres_mtls")
+                        DBInterface.close!(mtls_admin)
+                    end
 
                     # against a TLS-capable server the cancel key goes over TLS
                     # and the request is delivered. The connection uses the

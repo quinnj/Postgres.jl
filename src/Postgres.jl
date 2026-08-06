@@ -17,6 +17,8 @@ struct PostgresInterfaceError <: Exception
 end
 Base.showerror(io::IO, e::PostgresInterfaceError) = print(io, e.msg)
 
+@noinline _reject_nul(what::String) = throw(PostgresInterfaceError("$what cannot contain a NUL byte"))
+
 include("api/API.jl")
 using .API
 include("connection_string.jl")
@@ -24,6 +26,17 @@ using .ConnectionString
 
 const Pools = ConcurrentUtilities.Pools
 const ReseauConn = Union{Reseau.TCP.Conn, Reseau.TLS.Conn}
+
+# Observability must not change whether a database operation succeeds. A
+# callback failure is reported, but never replaces the query result or error.
+function query_log_safely(style, event::Symbol, info::NamedTuple)
+    try
+        API.query_logger(style, event, info)
+    catch err
+        @warn "Postgres query logger failed" event exception=(err, catch_backtrace())
+    end
+    return nothing
+end
 
 """
     Postgres.Connection
@@ -48,13 +61,14 @@ Supported keyword arguments. All are also available as DSN/URI options except
   Only `verify-full` verifies the server's certificate; `require` encrypts
   without authenticating the server, and the default `prefer` falls back to an
   unencrypted connection if the server declines TLS. `sslcapath` is a
-  *fallback* CA file used only when `sslrootcert` is unset (it is ignored
-  otherwise); libpq-style hashed CA directories are not supported.
+  fallback CA bundle or directory used only when `sslrootcert` is unset (it is
+  ignored otherwise).
   `sslservername` overrides the TLS server
   name when the host is a pre-resolved address — note that under
   `verify-full` this is also the name the certificate is verified against,
   so it must name the server you intend to authenticate.
-- `statement_cache_maxsize`: LRU prepared-statement cache size (default 100; `0` disables)
+- `statement_cache_maxsize`: LRU backend cache size for explicit named prepared
+  statements (default 100; `0` disables)
 - `reconnect`: automatically reconnect and re-prepare statements if the
   connection is found dead (default `false`; never reconnects mid-transaction)
 - `style`: a custom [`AbstractPostgresStyle`](@ref Postgres.API.AbstractPostgresStyle)
@@ -63,10 +77,12 @@ Supported keyword arguments. All are also available as DSN/URI options except
   but bind parameter values are not — treat a debug log as sensitive as the
   data the connection carries.
 
-Connections are safe for concurrent use from multiple tasks: operations are
-serialized on an internal lock. Close with `DBInterface.close!(conn)` or
-`close(conn)`; the do-block form `DBInterface.connect(f, Postgres.Connection, ...)`
-closes automatically.
+Individual operations are serialized on an internal lock. Keep each manual
+transaction and streaming cursor on one task and do not run unrelated work on
+that connection until the scope ends. Use a [`ConnectionPool`](@ref) for
+concurrent work. `cancel_query!` is the intentional cross-task exception.
+Close with `DBInterface.close!(conn)` or `close(conn)`; the do-block form
+`DBInterface.connect(f, Postgres.Connection, ...)` closes automatically.
 """
 mutable struct Connection{T, S <: API.AbstractPostgresStyle} <: DBInterface.Connection
     const lock::ReentrantLock
@@ -102,6 +118,7 @@ mutable struct Connection{T, S <: API.AbstractPostgresStyle} <: DBInterface.Conn
     const style::S
     in_transaction::Bool # track transaction state
     transaction_depth::Int # track nested transactions (SAVEPOINTs)
+    transaction_savepoints::Vector{String} # driver-owned names, outermost first
     generation::Int # increment on reconnect to invalidate statements
     # the server's own ReadyForQuery transaction status: unlike in_transaction
     # it also sees a transaction opened by raw SQL (`execute(conn, "BEGIN")`)
@@ -127,10 +144,18 @@ mutable struct Connection{T, S <: API.AbstractPostgresStyle} <: DBInterface.Conn
         sslcapath_val = sslcapath === nothing ? nothing : String(sslcapath)
         statement_timeout_val = statement_timeout === nothing ? nothing : Int(statement_timeout)
         sslservername_val = sslservername === nothing ? nothing : String(sslservername)
+        occursin('\0', host) && _reject_nul("host")
+        occursin('\0', user) && _reject_nul("user")
+        occursin('\0', dbname) && _reject_nul("dbname")
+        password !== nothing && occursin('\0', password) && _reject_nul("password")
+        app_name !== nothing && occursin('\0', app_name) && _reject_nul("application_name")
+        sslservername_val !== nothing && occursin('\0', sslservername_val) && _reject_nul("sslservername")
+        xor(sslcert_val === nothing, sslkey_val === nothing) &&
+            throw(PostgresInterfaceError("sslcert and sslkey must be provided together"))
         maxsize = max(0, Int(statement_cache_maxsize))
         socket, pid, skey, server_params = API.connect(host, port, dbname, user, password, debug, app_name, timeout, sslmode_val, sslrootcert_val, sslcert_val, sslkey_val, sslcapath_val, sslservername_val, statement_timeout_val)
         registry = Dict(API.DEFAULT_TYPE_REGISTRY)
-        return new{Statement{typeof(style)}, typeof(style)}(ReentrantLock(), socket, host, user, password, dbname, port, app_name, timeout, sslmode_val, sslrootcert_val, sslcert_val, sslkey_val, sslcapath_val, sslservername_val, statement_timeout_val, pid, skey, Dict{String, Statement{typeof(style)}}(), maxsize, 0, server_params, registry, false, reconnect, debug, style, false, 0, 1, false, true)
+        return new{Statement{typeof(style)}, typeof(style)}(ReentrantLock(), socket, host, user, password, dbname, port, app_name, timeout, sslmode_val, sslrootcert_val, sslcert_val, sslkey_val, sslcapath_val, sslservername_val, statement_timeout_val, pid, skey, Dict{String, Statement{typeof(style)}}(), maxsize, 0, server_params, registry, false, reconnect, debug, style, false, 0, String[], 1, false, true)
     end
 end
 
@@ -173,7 +198,10 @@ function evict_lru_statement!(conn::Connection)
     end
     oldest_sql === nothing && return
     stmt = pop!(conn.statements, oldest_sql)
-    !stmt.closed && API.close_statement(conn.socket, stmt.name, conn.debug)
+    if !stmt.closed
+        API.close_statement(conn.socket, stmt.name, conn.debug, conn.server_parameters)
+        stmt.closed = true
+    end
     return
 end
 
@@ -183,7 +211,7 @@ end
 Return a copy of the connection's prepared-statement cache, keyed by SQL text.
 """
 function get_cached_statements(conn::Connection)
-    @lock conn.lock copy(conn.statements)
+    @lock conn.lock Dict(sql => statement_handle(stmt) for (sql, stmt) in conn.statements)
 end
 
 """
@@ -194,7 +222,10 @@ Close all server-side prepared statements in the connection's cache and empty it
 function clear_statement_cache!(conn::Connection)
     @lock conn.lock begin
         for (sql, stmt) in conn.statements
-            !stmt.closed && API.close_statement(conn.socket, stmt.name, conn.debug)
+            if !stmt.closed
+                API.close_statement(conn.socket, stmt.name, conn.debug, conn.server_parameters)
+                stmt.closed = true
+            end
         end
         empty!(conn.statements)
     end
@@ -212,7 +243,10 @@ function set_statement_cache_maxsize!(conn::Connection, maxsize::Integer)
         conn.statement_cache_maxsize = max(0, Int(maxsize))
         if conn.statement_cache_maxsize == 0
             for (sql, stmt) in conn.statements
-                !stmt.closed && API.close_statement(conn.socket, stmt.name, conn.debug)
+                if !stmt.closed
+                    API.close_statement(conn.socket, stmt.name, conn.debug, conn.server_parameters)
+                    stmt.closed = true
+                end
             end
             empty!(conn.statements)
             return conn
@@ -258,16 +292,21 @@ end
     Postgres.set_statement_timeout!(conn, timeout)
 
 Set the server `statement_timeout` for the connection, in milliseconds.
-`nothing` or `0` disables the timeout.
+`nothing` or `0` disables the timeout. This setting is session state and cannot
+be changed while a transaction is open. An explicit disable is retained across
+automatic reconnects as `0`.
 """
 function set_statement_timeout!(conn::Connection, timeout::Union{Integer, Nothing})
     timeout_val = timeout === nothing ? 0 : max(0, Int(timeout))
-    DBInterface.execute(conn, "SET statement_timeout = $timeout_val")
-    @lock conn.lock conn.statement_timeout = timeout === nothing ? nothing : timeout_val
+    @lock conn.lock begin
+        checkconn(conn)
+        (conn.in_transaction || conn.server_in_transaction) &&
+            throw(PostgresInterfaceError("statement_timeout cannot be changed while a transaction is open"))
+        DBInterface.execute(conn, "SET statement_timeout = $timeout_val")
+        conn.statement_timeout = timeout_val
+    end
     return conn
 end
-
-@noinline _reject_nul(what::String) = throw(PostgresInterfaceError("$what cannot contain a NUL byte"))
 
 """
     Postgres.escape_identifier(name) -> String
@@ -287,15 +326,15 @@ Quote a string for use as a SQL literal (single-quoted, embedded quotes
 doubled). Throws if `val` contains a NUL byte.
 
 Prefer query parameters (`\$1`, `\$2`, ...) over literal interpolation
-whenever possible — parameters are never parsed as SQL. This helper assumes
-the server's `standard_conforming_strings` is `on` (the default since
-PostgreSQL 9.1); with it turned off, backslashes in the literal are escape
-characters and doubling quotes alone is not sufficient to make interpolation
-safe.
+whenever possible — parameters are never parsed as SQL. Inputs containing a
+backslash use PostgreSQL's explicit escape-string syntax, with backslashes and
+quotes escaped so the result is independent of `standard_conforming_strings`.
 """
 function escape_literal(val::AbstractString)
     occursin('\0', val) && _reject_nul("literal")
-    return string("'", replace(val, "'" => "''"), "'")
+    escaped = replace(val, "'" => "''")
+    occursin('\\', escaped) || return string("'", escaped, "'")
+    return string("E'", replace(escaped, "\\" => "\\\\"), "'")
 end
 
 """
@@ -500,9 +539,9 @@ function copy_from(conn::Connection, sql::AbstractString, data::IO; debug::Bool=
             checkconn(conn)
             API.copy_in(conn.style, conn.socket, sql_str, data, debug || conn.debug)
         end
-        log_enabled && API.query_logger(conn.style, :copy_from, (sql=sql_str, duration_ns=time_ns() - start_ns, success=true))
+        log_enabled && query_log_safely(conn.style, :copy_from, (sql=sql_str, duration_ns=time_ns() - start_ns, success=true))
     catch err
-        log_enabled && API.query_logger(conn.style, :copy_from, (sql=sql_str, duration_ns=time_ns() - start_ns, success=false, error=err))
+        log_enabled && query_log_safely(conn.style, :copy_from, (sql=sql_str, duration_ns=time_ns() - start_ns, success=false, error=err))
         rethrow()
     end
     return conn
@@ -529,9 +568,9 @@ function copy_to(conn::Connection, sql::AbstractString, dest::IO; debug::Bool=fa
             checkconn(conn)
             API.copy_out(conn.style, conn.socket, sql_str, dest, debug || conn.debug)
         end
-        log_enabled && API.query_logger(conn.style, :copy_to, (sql=sql_str, duration_ns=time_ns() - start_ns, success=true))
+        log_enabled && query_log_safely(conn.style, :copy_to, (sql=sql_str, duration_ns=time_ns() - start_ns, success=true))
     catch err
-        log_enabled && API.query_logger(conn.style, :copy_to, (sql=sql_str, duration_ns=time_ns() - start_ns, success=false, error=err))
+        log_enabled && query_log_safely(conn.style, :copy_to, (sql=sql_str, duration_ns=time_ns() - start_ns, success=false, error=err))
         rethrow()
     end
     return dest
@@ -548,12 +587,14 @@ end
 
 Register a mapping from PostgreSQL type `oid` to `julia_type` in the
 connection's type registry. `parser` is a `(val::String, registry) -> value`
-function that converts the wire text; without one, values are returned as
-`String`. See also [`register_enum!`](@ref Postgres.register_enum!),
+function that converts the wire text. If `parser` is omitted, `julia_type`
+must be `String`. See also [`register_enum!`](@ref Postgres.register_enum!),
 [`register_composite!`](@ref Postgres.register_composite!), and
 [`register_range!`](@ref Postgres.register_range!).
 """
 function register_type!(conn::Connection, oid::Integer, julia_type::Type; parser::Union{Function, Nothing}=nothing)
+    parser === nothing && julia_type !== String &&
+        throw(ArgumentError("parser is required when julia_type is not String"))
     @lock conn.lock API.register_type!(conn.type_registry, oid, julia_type; parser=parser)
     return conn
 end
@@ -582,9 +623,12 @@ end
     Postgres.register_enum!(conn, name; schema="public", julia_type=Symbol)
 
 Look up the enum type `schema.name` on the server and register it so values
-are returned as `julia_type` (by default `Symbol`).
+are returned as `julia_type` (by default `Symbol`). The supported types are
+`Symbol` and `String`.
 """
 function register_enum!(conn::Connection, name::AbstractString; schema::AbstractString="public", julia_type::Type=Symbol)
+    (julia_type === Symbol || julia_type === String) ||
+        throw(ArgumentError("julia_type for register_enum! must be Symbol or String"))
     oid, arrayoid = lookup_type_oid(conn, name, schema)
     parser = julia_type === Symbol ? (val, registry) -> Symbol(val) : nothing
     register_type!(conn, oid, julia_type; parser=parser)
@@ -725,6 +769,7 @@ function checkconn(conn::Connection)
         empty!(conn.statements)
         conn.in_transaction = false
         conn.transaction_depth = 0
+        empty!(conn.transaction_savepoints)
         # the server-side transaction died with the old socket; a stale flag
         # would trigger a spurious ROLLBACK on the fresh session
         conn.server_in_transaction = false
@@ -774,7 +819,9 @@ Base.close(conn::Connection) = DBInterface.close!(conn)
 
 A pool of [`Connection`](@ref Postgres.Connection)s, created lazily up to
 `limit` and reused across [`acquire`](@ref Postgres.acquire)/[`release`](@ref
-Postgres.release) cycles (dead connections are replaced transparently):
+Postgres.release) cycles. Locally closed connections are replaced. A peer close
+that the local socket has not observed can surface on the borrower's first
+operation; an ambiguous failed operation is never retried automatically.
 
     ConnectionPool(Postgres.Connection, host, user, password; limit=10, kwargs...)
     ConnectionPool(dsn::String; limit=10, kwargs...)
@@ -787,12 +834,16 @@ acquire/release. Close all pooled connections with `DBInterface.close!(pool)`.
 struct ConnectionPool
     pool::Pools.Pool
     connector::Function
+    closed::Threads.Atomic{Bool}
+    lifecycle_lock::ReentrantLock
 end
 
 function ConnectionPool(connector::Function; limit::Integer=10)
     pool = Pools.Pool{Connection}(max(1, Int(limit)))
-    return ConnectionPool(pool, connector)
+    return ConnectionPool(pool, connector, Threads.Atomic{Bool}(false), ReentrantLock())
 end
+
+Base.isopen(pool::ConnectionPool) = !pool.closed[]
 
 function ConnectionPool(::Type{Connection}, host::AbstractString, user::AbstractString, passwd::Union{AbstractString, Nothing}; dbname::AbstractString="", port::Integer=5432, debug::Bool=false, reconnect::Bool=false, application_name::Union{AbstractString, Nothing}=nothing, connect_timeout::Union{Integer, Nothing}=nothing, sslmode::Union{AbstractString, Nothing}=nothing, sslrootcert::Union{AbstractString, Nothing}=nothing, sslcert::Union{AbstractString, Nothing}=nothing, sslkey::Union{AbstractString, Nothing}=nothing, sslcapath::Union{AbstractString, Nothing}=nothing, sslservername::Union{AbstractString, Nothing}=nothing, statement_timeout::Union{Integer, Nothing}=nothing, statement_cache_maxsize::Integer=100, limit::Integer=10, style::API.AbstractPostgresStyle=PostgresStyle())
     connector = () -> DBInterface.connect(Connection, host, user, passwd; dbname=dbname, port=port, debug=debug, reconnect=reconnect, application_name=application_name, connect_timeout=connect_timeout, sslmode=sslmode, sslrootcert=sslrootcert, sslcert=sslcert, sslkey=sslkey, sslcapath=sslcapath, sslservername=sslservername, statement_timeout=statement_timeout, statement_cache_maxsize=statement_cache_maxsize, style=style)
@@ -820,7 +871,17 @@ Take a connection from the pool, creating one if none is available (blocking
 if the pool is at its limit). Return it with [`release`](@ref Postgres.release).
 """
 function acquire(pool::ConnectionPool; forcenew::Bool=false)
+    pool.closed[] && throw(PostgresInterfaceError("connection pool is closed"))
     conn = Pools.acquire(pool.connector, pool.pool; forcenew=forcenew, isvalid=pool_isvalid)
+    closed = @lock pool.lifecycle_lock pool.closed[]
+    if closed
+        try
+            DBInterface.close!(conn)
+        finally
+            Pools.release(pool.pool)
+        end
+        throw(PostgresInterfaceError("connection pool is closed"))
+    end
     return conn
 end
 
@@ -841,6 +902,7 @@ function reset_pooled_connection!(conn::Connection)
             finally
                 conn.in_transaction = false
                 conn.transaction_depth = 0
+                empty!(conn.transaction_savepoints)
             end
         end
         return true
@@ -863,9 +925,23 @@ the next borrower starts from a clean session; if it can't be rolled back it
 is closed rather than reused.
 """
 function release(pool::ConnectionPool, conn::Connection)
-    if pool_isvalid(conn) && reset_pooled_connection!(conn)
-        Pools.release(pool.pool, conn)
-    else
+    reusable = !pool.closed[] && pool_isvalid(conn) && reset_pooled_connection!(conn)
+    if reusable
+        returned = @lock pool.lifecycle_lock begin
+            if pool.closed[]
+                false
+            else
+                Pools.release(pool.pool, conn)
+                true
+            end
+        end
+        returned && return pool
+    end
+    try
+        DBInterface.close!(conn)
+    catch
+        # already unusable; the permit still has to be returned
+    finally
         Pools.release(pool.pool)
     end
     return pool
@@ -887,15 +963,18 @@ function with_connection(f::Function, pool::ConnectionPool; forcenew::Bool=false
 end
 
 function DBInterface.close!(pool::ConnectionPool)
-    Base.@lock pool.pool.lock begin
-        for conn in pool.pool.values
-            try
-                DBInterface.close!(conn)
-            catch
-                # ignore close errors for pooled connections
+    Base.@lock pool.lifecycle_lock begin
+        pool.closed[] = true
+        Base.@lock pool.pool.lock begin
+            for conn in pool.pool.values
+                try
+                    DBInterface.close!(conn)
+                catch
+                    # ignore close errors for pooled connections
+                end
             end
+            empty!(pool.pool.values)
         end
-        empty!(pool.pool.values)
     end
     return pool
 end
@@ -910,18 +989,28 @@ include("execute.jl")
 # mid-sequence and drop the unnamed statement ("unnamed prepared statement
 # does not exist"). Also one network round trip instead of three. Callers
 # must hold conn.lock.
-function execute_simple(conn::Connection, sql::String)
+function execute_simple(conn::Connection, sql::String; expected_tag::Union{Nothing, String}=nothing)
     # capture the ReadyForQuery status through a Ref so a failed statement
     # (a COMMIT hitting a deferred constraint) still refreshes the tracking:
     # the server ended the transaction either way, and a stale flag draws a
     # spurious ROLLBACK on the next pool release
     status_ref = Ref{UInt8}(UInt8('I'))
+    command_tag_ref = Ref{Union{Nothing, String}}(nothing)
     try
-        API.exec(conn.style, conn.socket, sql, conn.debug, status_ref)
+        API.exec(conn.style, conn.socket, sql, conn.debug, status_ref,
+                 command_tag_ref, conn.server_parameters)
     finally
         conn.server_in_transaction = API.in_transaction_status(status_ref[])
     end
+    if expected_tag !== nothing && command_tag_ref[] != expected_tag
+        actual = something(command_tag_ref[], "no command tag")
+        throw(PostgresInterfaceError("expected $expected_tag but PostgreSQL completed $actual"))
+    end
     return conn
+end
+
+function new_transaction_savepoint!()
+    return string("postgres_jl_", replace(string(UUIDs.uuid4()), "-" => ""))
 end
 
 """
@@ -942,18 +1031,21 @@ function start_transaction(conn::Connection)
                 # belongs to the caller: nest inside it with a savepoint, as
                 # for driver-owned nesting, so our commit can't commit — and
                 # our rollback can't destroy — their work
-                execute_simple(conn, "SAVEPOINT sp_0")
+                savepoint = new_transaction_savepoint!()
+                execute_simple(conn, "SAVEPOINT $savepoint"; expected_tag="SAVEPOINT")
+                push!(conn.transaction_savepoints, savepoint)
                 conn.owns_base_transaction = false
             else
-                execute_simple(conn, "BEGIN")
+                execute_simple(conn, "BEGIN"; expected_tag="BEGIN")
                 conn.owns_base_transaction = true
             end
             conn.in_transaction = true
             conn.transaction_depth = 1
         else
             # Start a SAVEPOINT for nested transactions
-            savepoint = "sp_$(conn.transaction_depth)"
-            execute_simple(conn, "SAVEPOINT $savepoint")
+            savepoint = new_transaction_savepoint!()
+            execute_simple(conn, "SAVEPOINT $savepoint"; expected_tag="SAVEPOINT")
+            push!(conn.transaction_savepoints, savepoint)
             conn.transaction_depth += 1
         end
     end
@@ -973,6 +1065,7 @@ function clear_transaction_state!(conn::Connection)
     @lock conn.lock begin
         conn.in_transaction = false
         conn.transaction_depth = 0
+        empty!(conn.transaction_savepoints)
         conn.server_in_transaction = false
     end
     return
@@ -992,6 +1085,7 @@ function commit(conn::Connection)
         if !isopen(conn.socket)
             conn.in_transaction = false
             conn.transaction_depth = 0
+            empty!(conn.transaction_savepoints)
             disconnected()
         end
         checkconn(conn)
@@ -1002,20 +1096,24 @@ function commit(conn::Connection)
             # would block reconnects and make the next cursor skip its BEGIN
             try
                 if conn.owns_base_transaction
-                    execute_simple(conn, "COMMIT")
+                    execute_simple(conn, "COMMIT"; expected_tag="COMMIT")
                 else
                     # the base transaction is the caller's raw-SQL one: keep
                     # this level's work pending inside it and leave it open
-                    execute_simple(conn, "RELEASE SAVEPOINT sp_0")
+                    savepoint = only(conn.transaction_savepoints)
+                    execute_simple(conn, "RELEASE SAVEPOINT $savepoint"; expected_tag="RELEASE")
                 end
             finally
                 conn.in_transaction = false
                 conn.transaction_depth = 0
+                empty!(conn.transaction_savepoints)
             end
         else
             # Release SAVEPOINT for nested transaction
+            savepoint = last(conn.transaction_savepoints)
+            execute_simple(conn, "RELEASE SAVEPOINT $savepoint"; expected_tag="RELEASE")
+            pop!(conn.transaction_savepoints)
             conn.transaction_depth -= 1
-            # Don't need to release SAVEPOINT explicitly, just commit will handle it
         end
     end
     return conn
@@ -1034,6 +1132,7 @@ function rollback(conn::Connection)
         if !isopen(conn.socket)
             conn.in_transaction = false
             conn.transaction_depth = 0
+            empty!(conn.transaction_savepoints)
             disconnected()
         end
         checkconn(conn)
@@ -1042,21 +1141,26 @@ function rollback(conn::Connection)
             # how ROLLBACK fares, so don't leave client state describing it
             try
                 if conn.owns_base_transaction
-                    execute_simple(conn, "ROLLBACK")
+                    execute_simple(conn, "ROLLBACK"; expected_tag="ROLLBACK")
                 else
                     # undo only this level; a plain ROLLBACK would destroy the
                     # caller's raw-SQL transaction along with it
-                    execute_simple(conn, "ROLLBACK TO SAVEPOINT sp_0")
+                    savepoint = only(conn.transaction_savepoints)
+                    execute_simple(conn, "ROLLBACK TO SAVEPOINT $savepoint"; expected_tag="ROLLBACK")
+                    execute_simple(conn, "RELEASE SAVEPOINT $savepoint"; expected_tag="RELEASE")
                 end
             finally
                 conn.in_transaction = false
                 conn.transaction_depth = 0
+                empty!(conn.transaction_savepoints)
             end
         else
             # Rollback to SAVEPOINT for nested transaction
+            savepoint = last(conn.transaction_savepoints)
+            execute_simple(conn, "ROLLBACK TO SAVEPOINT $savepoint"; expected_tag="ROLLBACK")
+            execute_simple(conn, "RELEASE SAVEPOINT $savepoint"; expected_tag="RELEASE")
+            pop!(conn.transaction_savepoints)
             conn.transaction_depth -= 1
-            savepoint = "sp_$(conn.transaction_depth)"
-            execute_simple(conn, "ROLLBACK TO SAVEPOINT $savepoint")
         end
     end
     return conn
@@ -1114,6 +1218,24 @@ function DBInterface.transaction(f::F, conn::Connection) where {F}
     end
 end
 
+struct TransactionReturn{T} <: Exception
+    value::T
+end
+
+function rewrite_transaction_returns(expr)
+    expr isa Expr || return expr
+    if expr.head === :return
+        value = isempty(expr.args) ? nothing : rewrite_transaction_returns(only(expr.args))
+        marker = GlobalRef(@__MODULE__, :TransactionReturn)
+        return Expr(:call, GlobalRef(Core, :throw), Expr(:call, marker, value))
+    elseif expr.head === :function || expr.head === :(->) || expr.head === :quote
+        # A return in a nested function belongs to that function, not to the
+        # scope that contains this transaction macro.
+        return expr
+    end
+    return Expr(expr.head, map(rewrite_transaction_returns, expr.args)...)
+end
+
 """
     Postgres.@transaction conn expr
 
@@ -1121,6 +1243,7 @@ Run `expr` inside a transaction: committed if it completes, rolled back if it
 throws. Evaluates to `expr`'s value.
 """
 macro transaction(conn, expr)
+    body = rewrite_transaction_returns(expr)
     quote
         # bind once: the connection expression may have side effects
         # (`@transaction acquire(pool) ...` would otherwise take a different
@@ -1129,7 +1252,17 @@ macro transaction(conn, expr)
         local success = false
         start_transaction(c)
         try
-            result = $(esc(expr))
+            local result
+            try
+                result = $(esc(body))
+            catch err
+                if err isa TransactionReturn
+                    commit(c)
+                    success = true
+                    return err.value
+                end
+                rethrow()
+            end
             commit(c)
             success = true
             result
@@ -1203,13 +1336,29 @@ function describe(conn::Connection, table::AbstractString; schema::String="publi
             FROM
                 information_schema.columns c
             LEFT JOIN
-                information_schema.key_column_usage kcu ON c.table_name = kcu.table_name AND c.column_name = kcu.column_name
+                information_schema.key_column_usage kcu ON
+                    c.table_catalog = kcu.table_catalog AND
+                    c.table_schema = kcu.table_schema AND
+                    c.table_name = kcu.table_name AND
+                    c.column_name = kcu.column_name
             LEFT JOIN
-                information_schema.table_constraints tc ON kcu.constraint_name = tc.constraint_name
+                information_schema.table_constraints tc ON
+                    kcu.constraint_catalog = tc.constraint_catalog AND
+                    kcu.constraint_schema = tc.constraint_schema AND
+                    kcu.constraint_name = tc.constraint_name AND
+                    kcu.table_schema = tc.table_schema AND
+                    kcu.table_name = tc.table_name
             LEFT JOIN
-                information_schema.referential_constraints rc ON tc.constraint_name = rc.constraint_name
+                information_schema.referential_constraints rc ON
+                    tc.constraint_catalog = rc.constraint_catalog AND
+                    tc.constraint_schema = rc.constraint_schema AND
+                    tc.constraint_name = rc.constraint_name
             LEFT JOIN
-                information_schema.key_column_usage fk ON rc.unique_constraint_name = fk.constraint_name AND fk.table_schema = c.table_schema
+                information_schema.key_column_usage fk ON
+                    rc.unique_constraint_catalog = fk.constraint_catalog AND
+                    rc.unique_constraint_schema = fk.constraint_schema AND
+                    rc.unique_constraint_name = fk.constraint_name AND
+                    kcu.position_in_unique_constraint = fk.ordinal_position
             WHERE
                 c.table_name = \$1 AND c.table_schema = \$2
         )

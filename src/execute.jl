@@ -88,6 +88,8 @@ mutable struct Cursor{S <: API.AbstractPostgresStyle}
     index::Int
     done::Bool
     rowcount::Int
+    portal_closed::Bool
+    owned_statement::Union{Nothing, Statement{S}}
     owns_transaction::Bool
 end
 
@@ -104,34 +106,52 @@ function checkstmt(stmt::Statement)
     checkconn(stmt.conn)
     stmt.closed && throw(PostgresInterfaceError("statement has been closed"))
     if stmt.cached
-        if stmt.generation != stmt.conn.generation || !haskey(stmt.conn.statements, stmt.sql)
-            # if the connection was reset, we need to re-prepare the statement
-            stmt.name = API.prepare(stmt.conn.socket, stmt.sql, stmt.conn.debug)
-            stmt.conn.statements[stmt.sql] = stmt
+        cached = get(stmt.conn.statements, stmt.sql, nothing)
+        if stmt.generation != stmt.conn.generation || cached === nothing ||
+           cached.name != stmt.name || cached.generation != stmt.conn.generation
+            # The cache entry was evicted, cleared, replaced, or lost on
+            # reconnect. Keep this caller handle valid as an independent
+            # server statement; do not silently repopulate or overrun the
+            # current cache policy.
+            stmt.name = API.prepare(stmt.conn.socket, stmt.sql, stmt.conn.debug,
+                                    stmt.conn.server_parameters)
             stmt.generation = stmt.conn.generation
+            stmt.cached = false
+        else
+            touch_statement!(stmt.conn, cached)
+            stmt.last_used = cached.last_used
         end
-        touch_statement!(stmt.conn, stmt)
     elseif stmt.generation != stmt.conn.generation
-        stmt.name = API.prepare(stmt.conn.socket, stmt.sql, stmt.conn.debug)
+        stmt.name = API.prepare(stmt.conn.socket, stmt.sql, stmt.conn.debug,
+                                stmt.conn.server_parameters)
         stmt.generation = stmt.conn.generation
     end
-    !stmt.cached && touch_statement!(stmt.conn, stmt)
+    stmt.cached || touch_statement!(stmt.conn, stmt)
     return
+end
+
+function statement_handle(stmt::Statement)
+    params = Union{String, Missing}[missing for _ = 1:stmt.nparams]
+    return Statement{_style_type(stmt.conn)}(
+        stmt.conn, stmt.name, stmt.sql, stmt.nfields, stmt.names, stmt.typeIds,
+        stmt.nparams, params, false, true, stmt.generation, stmt.last_used)
 end
 
 function DBInterface.prepare(conn::Connection, sql::AbstractString; debug::Bool=false)
     sql_str = String(sql)
+    actual_debug = debug || conn.debug
     @lock conn.lock begin
         checkconn(conn)
         # check if we've already prepared this sql before
         if haskey(conn.statements, sql_str)
-            stmt = conn.statements[sql_str]
-            touch_statement!(conn, stmt)
-            return stmt
+            cached = conn.statements[sql_str]
+            touch_statement!(conn, cached)
+            return statement_handle(cached)
         end
         if conn.statement_cache_maxsize == 0
-            name = API.prepare(conn.socket, sql_str, debug)
-            nparams, names, types = API.describeprepared(conn.socket, name, debug)
+            name = API.prepare(conn.socket, sql_str, actual_debug, conn.server_parameters)
+            nparams, names, types = API.describeprepared(
+                conn.socket, name, actual_debug, conn.server_parameters)
             params = Union{String, Missing}[missing for _ = 1:nparams]
             last_used = next_statement_clock!(conn)
             return Statement{_style_type(conn)}(conn, name, sql_str, length(names), names, types, nparams, params, false, false, conn.generation, last_used)
@@ -141,13 +161,14 @@ function DBInterface.prepare(conn::Connection, sql::AbstractString; debug::Bool=
             evict_lru_statement!(conn)
         end
         # new statement to prepare
-        name = API.prepare(conn.socket, sql_str, debug)
-        nparams, names, types = API.describeprepared(conn.socket, name, debug)
+        name = API.prepare(conn.socket, sql_str, actual_debug, conn.server_parameters)
+        nparams, names, types = API.describeprepared(
+            conn.socket, name, actual_debug, conn.server_parameters)
         params = Union{String, Missing}[missing for _ = 1:nparams]
         last_used = next_statement_clock!(conn)
-        stmt = Statement{_style_type(conn)}(conn, name, sql_str, length(names), names, types, nparams, params, false, true, conn.generation, last_used)
-        conn.statements[sql_str] = stmt
-        return stmt
+        cached = Statement{_style_type(conn)}(conn, name, sql_str, length(names), names, types, nparams, params, false, true, conn.generation, last_used)
+        conn.statements[sql_str] = cached
+        return statement_handle(cached)
     end
 end
 
@@ -155,12 +176,14 @@ function DBInterface.close!(stmt::Statement)
     @lock stmt.conn.lock begin
         stmt.closed && return
         if !isopen(stmt.conn.socket)
-            stmt.cached && haskey(stmt.conn.statements, stmt.sql) && delete!(stmt.conn.statements, stmt.sql)
             stmt.closed = true
             return
         end
-        stmt.cached && haskey(stmt.conn.statements, stmt.sql) && stmt.conn.statements[stmt.sql] === stmt && delete!(stmt.conn.statements, stmt.sql)
-        API.close_statement(stmt.conn.socket, stmt.name, stmt.conn.debug)
+        # Cached backend statements belong to the connection cache, not to a
+        # caller handle. Closing one handle must not invalidate independent
+        # handles or remove the cache entry.
+        stmt.cached || API.close_statement(stmt.conn.socket, stmt.name, stmt.conn.debug,
+                                           stmt.conn.server_parameters)
         stmt.closed = true
     end
     return
@@ -191,15 +214,20 @@ end
 
 function DBInterface.close!(cursor::Cursor)
     owns_transaction = cursor.owns_transaction
+    owned_statement = cursor.owned_statement
+    cursor.owned_statement = nothing
     closed_cleanly = false
     try
         @lock cursor.conn.lock begin
-            if !cursor.done
+            if !cursor.portal_closed && isopen(cursor.conn.socket)
                 API.writemessages(cursor.conn.socket, cursor.conn.debug, ('C', UInt8('P'), cursor.portal), ('S',))
-                API.waitfor(cursor.conn.socket, cursor.conn.debug, '3', 'Z')
+                API.waitfor(cursor.conn.socket, cursor.conn.debug, '3', 'Z';
+                            server_parameters=cursor.conn.server_parameters)
+                cursor.portal_closed = true
             end
             cursor.done = true
             empty!(cursor.buffer)
+            owned_statement === nothing || DBInterface.close!(owned_statement)
         end
         closed_cleanly = true
     finally
@@ -213,10 +241,17 @@ function DBInterface.close!(cursor::Cursor)
                 finish_cursor_transaction!(cursor.conn)
             else
                 try
-                    finish_cursor_transaction!(cursor.conn)
+                    abort_cursor_transaction!(cursor.conn)
                 catch
                     # already unwinding; don't mask the original error
                 end
+            end
+        end
+        if !closed_cleanly && owned_statement !== nothing && !owned_statement.closed
+            try
+                DBInterface.close!(owned_statement)
+            catch
+                # Preserve the portal-close error already in flight.
             end
         end
     end
@@ -283,6 +318,15 @@ end
 function build_params(params, nparams::Int, sql::AbstractString)
     dest = Union{String, Missing}[missing for _ = 1:nparams]
     bind_params!(dest, params, sql)
+    return dest
+end
+
+function build_unchecked_params(params)
+    dest = Union{String, Missing}[]
+    params === nothing && return dest
+    for param in params
+        push!(dest, _param(param))
+    end
     return dest
 end
 
@@ -380,10 +424,13 @@ function read_portal_batch!(cursor::Cursor)
             elseif mt == UInt8('A')
                 notification = API.notificationResponse(len, conn.socket)
                 API.notification_callback(conn.style, notification)
+            elseif mt == UInt8('S')
+                API.parameterStatus!(conn.server_parameters, len, conn.socket)
             elseif mt == UInt8('E')
                 error_msg = API.errorResponse(len, conn.socket, conn.debug)
             elseif mt == UInt8('Z')
-                API.skipbytes!(conn.socket, len)
+                status = API.read_ready_status(conn.socket, len)
+                conn.server_in_transaction = API.in_transaction_status(status)
                 break
             else
                 API.skipbytes!(conn.socket, len)
@@ -438,6 +485,7 @@ end
 
 function DBInterface.execute(stmt::Statement, params=nothing, ::Type{T}=Any; debug::Bool=false) where {T}
     style = stmt.conn.style
+    actual_debug = debug || stmt.conn.debug
     log_enabled = API.query_logging_enabled(style)
     start_ns = log_enabled ? time_ns() : 0
     result = nothing
@@ -445,29 +493,40 @@ function DBInterface.execute(stmt::Statement, params=nothing, ::Type{T}=Any; deb
         @lock stmt.conn.lock begin
             # check that connection/statement are ok
             checkstmt(stmt)
-            bind_params!(stmt.params, params, stmt.sql)
-            # isa-split the socket union with per-branch typeasserts (identical calls in
-            # both branches get tail-merged back into one dynamic call by the optimizer),
-            # so the exec call resolves statically under `juliac --trim`
-            socket = stmt.conn.socket
-            e = if socket isa Reseau.TCP.Conn
-                API.exec(style, socket::Reseau.TCP.Conn, stmt.name, stmt.params, stmt.names, stmt.typeIds, stmt.conn.type_registry, debug, 0)
-            else
-                API.exec(style, socket::Reseau.TLS.Conn, stmt.name, stmt.params, stmt.names, stmt.typeIds, stmt.conn.type_registry, debug, 0)
+            e = try
+                bind_params!(stmt.params, params, stmt.sql)
+                # isa-split the socket union with per-branch typeasserts
+                # (identical calls in both branches get tail-merged back into
+                # one dynamic call by the optimizer).
+                socket = stmt.conn.socket
+                e = if socket isa Reseau.TCP.Conn
+                    API.exec(style, socket::Reseau.TCP.Conn, stmt.name, stmt.params,
+                             stmt.names, stmt.typeIds, stmt.conn.type_registry,
+                             actual_debug, 0, stmt.conn.server_parameters)
+                else
+                    API.exec(style, socket::Reseau.TLS.Conn, stmt.name, stmt.params,
+                             stmt.names, stmt.typeIds, stmt.conn.type_registry,
+                             actual_debug, 0, stmt.conn.server_parameters)
+                end
+                e
+            finally
+                # Bound strings can contain credentials or personal data. The
+                # vector must be cleared even if local parameter validation or
+                # the server Bind fails.
+                fill!(stmt.params, missing)
             end
             # in a finally: a failed statement still drained to ReadyForQuery
-            # and its status is authoritative — skipping the copy on the error
-            # path leaves the transaction tracking stale
+            # and its status is authoritative.
             try
                 result = T === Any ? makeresult(e) : StructUtils.arraylike(T) ? StructUtils.make(T, e, style) : only(StructUtils.make(Vector{T}, e, style))
             finally
                 stmt.conn.server_in_transaction = API.in_transaction_status(e.tx_status[])
             end
         end
-        log_enabled && API.query_logger(style, :execute, (sql=stmt.sql, params=params, duration_ns=time_ns() - start_ns, success=true))
+        log_enabled && query_log_safely(style, :execute, (sql=stmt.sql, params=params, duration_ns=time_ns() - start_ns, success=true))
         return result
     catch err
-        log_enabled && API.query_logger(style, :execute, (sql=stmt.sql, params=params, duration_ns=time_ns() - start_ns, success=false, error=err))
+        log_enabled && query_log_safely(style, :execute, (sql=stmt.sql, params=params, duration_ns=time_ns() - start_ns, success=false, error=err))
         rethrow()
     end
 end
@@ -475,21 +534,24 @@ end
 function DBInterface.execute(conn::Connection, sql::AbstractString, params=nothing, ::Type{T}=Any; debug::Bool=false) where {T}
     sql_str = String(sql)
     style = conn.style
+    actual_debug = debug || conn.debug
     log_enabled = API.query_logging_enabled(style)
     start_ns = log_enabled ? time_ns() : 0
     result = nothing
     try
         @lock conn.lock begin
             checkconn(conn)
-            stmtname = API.prepare(conn.socket, sql_str, debug; name="")
-            nparams, names, types = API.describeprepared(conn.socket, stmtname, debug)
-            params_vec = build_params(params, nparams, sql_str)
+            params_vec = build_unchecked_params(params)
             # see the statement-execute method: socket union isa-split for --trim
             socket = conn.socket
             e = if socket isa Reseau.TCP.Conn
-                API.exec(style, socket::Reseau.TCP.Conn, stmtname, params_vec, names, types, conn.type_registry, debug, 0)
+                API.exec_unnamed(style, socket::Reseau.TCP.Conn, sql_str, params_vec,
+                                 conn.type_registry, actual_debug, 0,
+                                 conn.server_parameters)
             else
-                API.exec(style, socket::Reseau.TLS.Conn, stmtname, params_vec, names, types, conn.type_registry, debug, 0)
+                API.exec_unnamed(style, socket::Reseau.TLS.Conn, sql_str, params_vec,
+                                 conn.type_registry, actual_debug, 0,
+                                 conn.server_parameters)
             end
             # in a finally, as in the statement-execute method above
             try
@@ -498,26 +560,75 @@ function DBInterface.execute(conn::Connection, sql::AbstractString, params=nothi
                 conn.server_in_transaction = API.in_transaction_status(e.tx_status[])
             end
         end
-        log_enabled && API.query_logger(style, :execute, (sql=sql_str, params=params, duration_ns=time_ns() - start_ns, success=true))
+        log_enabled && query_log_safely(style, :execute, (sql=sql_str, params=params, duration_ns=time_ns() - start_ns, success=true))
         return result
     catch err
-        log_enabled && API.query_logger(style, :execute, (sql=sql_str, params=params, duration_ns=time_ns() - start_ns, success=false, error=err))
+        log_enabled && query_log_safely(style, :execute, (sql=sql_str, params=params, duration_ns=time_ns() - start_ns, success=false, error=err))
         rethrow()
     end
 end
 
-function cursor(stmt::Statement, params=nothing; fetchsize::Integer=1000, owns_transaction::Bool=false)
+# DBInterface's generic connection overload prepares a statement without
+# closing it. That leaks named server statements when this driver's cache is
+# disabled. Keep the handle lifetime explicit for both bulk fallbacks.
+function DBInterface.executemany(conn::Connection, sql::AbstractString, params)
+    stmt = DBInterface.prepare(conn, sql)
+    try
+        return DBInterface.executemany(stmt, params)
+    finally
+        DBInterface.close!(stmt)
+    end
+end
+
+function DBInterface.executemultiple(conn::Connection, sql::AbstractString, params)
+    stmt = DBInterface.prepare(conn, sql)
+    try
+        return DBInterface.executemultiple(stmt, params)
+    finally
+        DBInterface.close!(stmt)
+    end
+end
+
+function cursor(stmt::Statement, params=nothing; fetchsize::Integer=1000,
+                owns_transaction::Bool=false, owns_statement::Bool=false)
     conn = stmt.conn
-    @lock conn.lock begin
-        checkstmt(stmt)
-        bind_params!(stmt.params, params, stmt.sql)
-        portal = string(UUIDs.uuid4())
-        types = Type[API.juliatype(x -> x, i, conn.type_registry) for i in stmt.typeIds]
-        lookup = Dict(x => i for (i, x) in enumerate(stmt.names))
-        cursor = Cursor{_style_type(conn)}(conn, portal, stmt.names, stmt.typeIds, types, lookup, max(1, Int(fetchsize)), ResultRow[], 1, false, 0, owns_transaction)
-        API.writemessages(conn.socket, conn.debug, ('B', portal, stmt.name, Int16(0), Int16(length(stmt.params)), API.Params(stmt.params), Int16(0)), ('E', portal, Int32(cursor.fetchsize)), ('S',))
-        read_portal_batch!(cursor)
-        return cursor
+    started_here = false
+    if !owns_transaction
+        already_in_tx = @lock conn.lock (conn.in_transaction || conn.server_in_transaction)
+        if !already_in_tx
+            start_transaction(conn)
+            owns_transaction = true
+            started_here = true
+        end
+    end
+    try
+        @lock conn.lock begin
+            checkstmt(stmt)
+            try
+                bind_params!(stmt.params, params, stmt.sql)
+                portal = string(UUIDs.uuid4())
+                types = Type[API.juliatype(x -> x, i, conn.type_registry) for i in stmt.typeIds]
+                lookup = Dict(x => i for (i, x) in enumerate(stmt.names))
+                owned_stmt = owns_statement ? stmt : nothing
+                cursor = Cursor{_style_type(conn)}(conn, portal, stmt.names,
+                    stmt.typeIds, types, lookup, max(1, Int(fetchsize)),
+                    ResultRow[], 1, false, 0, false, owned_stmt,
+                    owns_transaction)
+                API.writemessages(conn.socket, conn.debug, ('B', portal, stmt.name, Int16(0), Int16(length(stmt.params)), API.Params(stmt.params), Int16(0)), ('E', portal, Int32(cursor.fetchsize)), ('S',))
+                read_portal_batch!(cursor)
+                return cursor
+            finally
+                fill!(stmt.params, missing)
+            end
+        end
+    catch
+        if started_here
+            try
+                abort_cursor_transaction!(conn)
+            catch
+            end
+        end
+        rethrow()
     end
 end
 
@@ -532,6 +643,7 @@ started (and committed on close) if the connection isn't already in one.
 """
 function cursor(conn::Connection, sql::AbstractString, params=nothing; fetchsize::Integer=1000, debug::Bool=false)
     owns_transaction = false
+    stmt = nothing
     # a transaction opened with raw SQL counts as "already in one": the server
     # status sees it even though the client flag doesn't, and owning it here
     # would mean committing the caller's transaction on cursor close
@@ -539,10 +651,16 @@ function cursor(conn::Connection, sql::AbstractString, params=nothing; fetchsize
     already_in_tx || (start_transaction(conn); owns_transaction = true)
     try
         stmt = DBInterface.prepare(conn, sql; debug=debug)
-        return cursor(stmt, params; fetchsize=fetchsize, owns_transaction=owns_transaction)
+        return cursor(stmt, params; fetchsize=fetchsize, owns_transaction=owns_transaction,
+                      owns_statement=true)
     catch
-        # don't leave the transaction we started dangling on a failed cursor
-        # don't leave the transaction we started dangling on a failed cursor;
+        if stmt !== nothing && !stmt.closed
+            try
+                DBInterface.close!(stmt)
+            catch
+            end
+        end
+        # Don't leave the transaction we started dangling on a failed cursor;
         # if the connection died, clear the state directly (a ROLLBACK can't be
         # delivered, and leaving it set would block reconnect forever)
         if owns_transaction

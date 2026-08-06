@@ -70,6 +70,60 @@ jobs:
       - uses: julia-actions/julia-buildpkg@v1
       - uses: julia-actions/julia-runtest@v1
 
+  lower-bounds:
+    name: Lower dependency bounds - Julia 1.10 - ubuntu-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v6
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: '1.10'
+          arch: x64
+      - uses: julia-actions/cache@v3
+      - name: Test declared dependency floors
+        run: |
+          using Pkg
+          mktempdir() do env
+              Pkg.activate(env)
+              Pkg.develop(path=ENV["GITHUB_WORKSPACE"])
+              Pkg.add([
+                  Pkg.PackageSpec(name="ConcurrentUtilities", version="2.1.0"),
+                  Pkg.PackageSpec(name="DBInterface", version="2.5.0"),
+                  Pkg.PackageSpec(name="JSON", version="1.0.0"),
+                  Pkg.PackageSpec(name="MD5", version="0.2.0"),
+                  Pkg.PackageSpec(name="Parsers", version="2.5.4"),
+                  Pkg.PackageSpec(name="Reseau", version="1.1.1"),
+                  Pkg.PackageSpec(name="SASLAuth", version="1.0.0"),
+                  Pkg.PackageSpec(name="StructUtils", version="2.3.0"),
+                  Pkg.PackageSpec(name="Tables", version="1.0.0"),
+                  Pkg.PackageSpec(name="URIs", version="1.0.0"),
+              ])
+              Pkg.test("Postgres")
+          end
+        shell: julia --color=yes {0}
+
+  postgres-versions:
+    name: PostgreSQL ${{ matrix.postgres }} - Julia 1 - ubuntu-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # PostgreSQL 16 is covered by the main OS and Julia-version matrix.
+        postgres: ['14', '15', '17', '18']
+    env:
+      POSTGRES_IMAGE: postgres:${{ matrix.postgres }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: julia-actions/setup-julia@v3
+        with:
+          version: '1'
+          arch: x64
+      - uses: julia-actions/cache@v3
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-runtest@v1
+
   docs:
     name: Documentation
     runs-on: ubuntu-latest

@@ -120,6 +120,14 @@ struct PostgresRange{T}
     lower_inclusive::Bool
     upper_inclusive::Bool
     empty::Bool
+
+    function PostgresRange{T}(lower, upper, lower_inclusive::Bool,
+                              upper_inclusive::Bool, empty::Bool) where {T}
+        converted_lower = ismissing(lower) ? missing : convert(T, lower)
+        converted_upper = ismissing(upper) ? missing : convert(T, upper)
+        return new{T}(converted_lower, converted_upper, lower_inclusive,
+                      upper_inclusive, empty)
+    end
 end
 
 # ── CastFn: trim-safe type-erased value caster (the Reseau TaskFn pattern) ──
@@ -327,16 +335,24 @@ end
     return h, mi, se, ms
 end
 
-# `"char"` output: byte 0 renders as an empty string, bytes with the high bit
-# set render as a backslash-octal escape ("\\200".."\\377"), and anything else
-# is the raw byte. A backslash byte itself renders as a lone "\\", so only the
-# exact 4-byte escape shape is decoded.
+# `"char"` output: byte 0 renders as an empty string. High bytes render as
+# backslash-octal on current PostgreSQL releases, while PostgreSQL 14 can send
+# the raw byte. A backslash byte itself renders as a lone "\\", so only the
+# exact 4-byte escape shapes are decoded.
 function pg_parse_char(s::String)
     isempty(s) && return '\0'
     c = codeunits(s)
+    # Indexing a String that contains one raw high byte produces Julia's
+    # invalid-UTF8 Char sentinel. The PostgreSQL type is one byte, so decode
+    # that byte value directly.
+    length(c) == 1 && return Char(c[1])
     if length(c) == 4 && c[1] == UInt8('\\') &&
        UInt8('0') <= c[2] <= UInt8('3') && UInt8('0') <= c[3] <= UInt8('7') && UInt8('0') <= c[4] <= UInt8('7')
         return Char((_pg_digit(c[2]) << 6) | (_pg_digit(c[3]) << 3) | _pg_digit(c[4]))
+    end
+    if length(c) == 4 && c[1] == UInt8('\\') &&
+       (c[2] == UInt8('x') || c[2] == UInt8('X'))
+        return Char((hexnibble(c[3]) << 4) | hexnibble(c[4]))
     end
     return s[1]
 end

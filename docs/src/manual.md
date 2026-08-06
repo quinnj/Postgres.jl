@@ -147,7 +147,9 @@ rows = Tables.rowtable(DBInterface.execute(conn, raw"SELECT $1::int + $2::int AS
 @show only(rows).total
 ```
 
-Prepared statements can be created explicitly. Postgres.jl also caches prepared statements internally with LRU eviction; set `statement_cache_maxsize=0` to disable caching.
+Prepared statements can be created explicitly. Postgres.jl caches their named
+backend statements with LRU eviction while returning an independent handle to
+each caller. Set `statement_cache_maxsize=0` to disable this cache.
 
 ```julia
 stmt = DBInterface.prepare(conn, raw"SELECT $1::text AS value")
@@ -260,6 +262,10 @@ row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT 'happy'::mood AS mo
 
 Registering composite and range types follows the same pattern.
 
+Registration controls result decoding. Direct parameter binding for registered
+enum, composite, and range Julia values is not part of the 1.0 interface. Bind
+their PostgreSQL text representation and add an explicit SQL cast when needed.
+
 ### Session Formats
 
 Text decoding assumes the server renders dates and timestamps in the `ISO`
@@ -271,6 +277,9 @@ read. The alignment is re-applied on reconnect, but not if the session is
 changed afterwards: running `SET DateStyle = ...` or `SET IntervalStyle = ...`
 mid-session breaks decoding — intervals and unparseable dates raise errors
 rather than silently returning wrong values.
+
+Transaction-mode poolers cannot preserve session settings between logical
+connections. See the [1.0 Support Policy](@ref) before using this mode.
 
 ### Values Without A Julia Representation
 
