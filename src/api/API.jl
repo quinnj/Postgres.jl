@@ -12,7 +12,9 @@ const SKIP_BUFFER_SIZE = 8192
     Postgres.Error <: Exception
 
 A PostgreSQL server error (an `ErrorResponse` message). Carries the fields the
-server reported: `severity`, `code` (the SQLSTATE, e.g. `"23505"`), `message`,
+server reported: `severity` (non-localized when the server supplies it, so it
+can be compared against `"FATAL"`, `"ERROR"`, ... regardless of the server's
+`lc_messages`), `code` (the SQLSTATE, e.g. `"23505"`), `message`,
 and optional context such as `detail`, `hint`, `position`, `schema`, `table`,
 `column`, and `constraint`. A small number of protocol-level failures detected
 client-side (unsupported authentication methods, protocol desync) also use
@@ -90,6 +92,9 @@ function errorResponse(len, socket, debug)
     # parse error fields
     i = 1
     severity = ""
+    # 'V' is the non-localized severity (PostgreSQL 9.6+); 'S' is translated
+    # per the server's lc_messages, so it can't be compared against literals
+    severity_nonlocalized = ""
     code = ""
     message = ""
     detail = nothing
@@ -114,6 +119,8 @@ function errorResponse(len, socket, debug)
         val, i = cstring_at(buf, i)
         if ccode == 'S'
             severity = val
+        elseif ccode == 'V'
+            severity_nonlocalized = val
         elseif ccode == 'C'
             code = val
         elseif ccode == 'M'
@@ -148,6 +155,9 @@ function errorResponse(len, socket, debug)
             routine = val
         end
     end
+    # prefer the non-localized severity so callers can compare it to "FATAL"
+    # and friends regardless of the server's locale
+    isempty(severity_nonlocalized) || (severity = severity_nonlocalized)
     err = Error(severity, code, message, detail, hint, position, internal_position, internal_query, where, schema, table, column, datatype, constraint, file, line, routine)
     debug && @error err
     return err
