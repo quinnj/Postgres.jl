@@ -305,6 +305,7 @@ end
 
 function pg_parse_date(s::AbstractString)::Date
     c = codeunits(s)
+    _check_temporal_special(s, "date")
     length(c) >= 10 || throw(ArgumentError("invalid postgres date"))
     return _pg_date_at(c, 1)
 end
@@ -316,8 +317,17 @@ function pg_parse_time(s::AbstractString)::Time
     return Time(h, mi, se, ms)
 end
 
+@noinline _reject_temporal_special(s::AbstractString, what::String) =
+    throw(PostgresInterfaceError("postgres $what value \"$s\" cannot be represented as a Julia $(what == "date" ? "Date" : "DateTime")"))
+
+@inline function _check_temporal_special(s::AbstractString, what::String)
+    (s == "infinity" || s == "-infinity") && _reject_temporal_special(s, what)
+    return
+end
+
 function pg_parse_datetime(s::AbstractString)::DateTime
     c = codeunits(s)
+    _check_temporal_special(s, "timestamp")
     length(c) >= 19 || throw(ArgumentError("invalid postgres timestamp"))
     d = _pg_date_at(c, 1)
     h, mi, se, ms = _pg_hms_at(c, 12)
@@ -507,9 +517,34 @@ function split_range_values(val::String)
     return left, right
 end
 
+# A range bound is quoted whenever it contains whitespace, a comma, a quote, a
+# backslash or a bracket — which every timestamp bound does. The quotes and
+# their backslash escapes have to come off before the element parser sees it.
+function unquote_range_bound(token::String)
+    cu = codeunits(token)
+    (length(cu) >= 2 && cu[1] == UInt8('"') && cu[end] == UInt8('"')) || return token
+    out = IOBuffer()
+    i = 2
+    last = length(cu) - 1
+    while i <= last
+        c = cu[i]
+        if c == UInt8('\\') && i < last
+            i += 1
+            write(out, cu[i])
+        elseif c == UInt8('"') && i < last && cu[i + 1] == UInt8('"')
+            write(out, UInt8('"'))
+            i += 1
+        else
+            write(out, c)
+        end
+        i += 1
+    end
+    return String(take!(out))
+end
+
 function parse_range_value(token::String, typeId::Int, registry::Dict{Int, TypeInfo})
     token == "" && return missing
-    return parse_value(typeId, token, registry)
+    return parse_value(typeId, unquote_range_bound(token), registry)
 end
 
 # construct over the standard range element types explicitly: PostgresRange{T}
@@ -708,7 +743,8 @@ function parse_value(typeId::Int, val::String, registry::Dict{Int, TypeInfo})
         end
         return val == "t"
     elseif T == Char
-        return val[1]
+        # the "char" type renders its zero value as an empty string
+        return isempty(val) ? '\0' : val[1]
     elseif T == DateTime
         if typeId == 1184
             return parse_timestamptz(val)
@@ -780,7 +816,7 @@ end
 
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Int8}, s::String) = Parsers.parse(Int8, s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Bool}, s::String) = (s == "t" || s == "1"), nothing
-StructUtils.lift(::AbstractPostgresStyle, ::Type{Char}, s::String) = s[1], nothing
+StructUtils.lift(::AbstractPostgresStyle, ::Type{Char}, s::String) = (isempty(s) ? '\0' : s[1]), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Int16}, s::String) = Parsers.parse(Int16, s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Int32}, s::String) = Parsers.parse(Int32, s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Int64}, s::String) = Parsers.parse(Int64, s), nothing

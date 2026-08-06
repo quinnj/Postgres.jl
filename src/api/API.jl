@@ -178,6 +178,9 @@ function noticeResponse(len, socket)
 end
 
 function notificationResponse(len, socket)
+    # the body is at least the 4-byte pid; a shorter one would make the
+    # channel/payload read consume the next message
+    len < 4 && throw(Error("truncated NotificationResponse from server"))
     pid = ntoh(read(socket, Int32))
     buf = read(socket, len - 4)
     i = 1
@@ -278,7 +281,14 @@ function writestartupmessage(
     application_name::Union{Nothing, String},
     statement_timeout::Union{Nothing, Int},
 )::Nothing
-    timeout_options = statement_timeout === nothing ? nothing : string("-c statement_timeout=", statement_timeout)
+    # The text-format date/time parsers only understand ISO dates and
+    # postgres-style intervals, so pin them for the session: a server or role
+    # configured with a different DateStyle/IntervalStyle would otherwise send
+    # values that decode into silently wrong dates or fail with an error that
+    # points nowhere near the cause.
+    timeout_options = statement_timeout === nothing ?
+        "-c DateStyle=ISO,MDY -c IntervalStyle=postgres" :
+        string("-c DateStyle=ISO,MDY -c IntervalStyle=postgres -c statement_timeout=", statement_timeout)
     len = 8 + msgsizeof(("user", user)) + msgsizeof(("database", dbname)) + 1
     application_name !== nothing && (len += msgsizeof(("application_name", application_name)))
     timeout_options !== nothing && (len += msgsizeof(("options", timeout_options)))

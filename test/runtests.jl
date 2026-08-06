@@ -678,6 +678,25 @@ end
         @test_throws ArgumentError Postgres.API.decode_bytea(raw"\xabc")
         @test_throws ArgumentError Postgres.API.decode_bytea(raw"\xzz")
 
+        # timestamp range bounds are quoted on the wire; without unquoting them
+        # every tsrange/tstzrange value fails to decode
+        ts_range = Postgres.API.parse_range("[\"2020-01-01 00:00:00\",\"2020-01-02 00:00:00\")", 1114, registry)
+        @test ts_range.lower == DateTime(2020, 1, 1)
+        @test ts_range.upper == DateTime(2020, 1, 2)
+        @test ts_range.lower_inclusive
+        @test !ts_range.upper_inclusive
+        @test Postgres.API.unquote_range_bound("\"a\\\"b\"") == "a\"b"
+        @test Postgres.API.unquote_range_bound("plain") == "plain"
+
+        # the "char" type renders its zero value as an empty string
+        @test Postgres.API.parse_value(18, "", registry) == '\0'
+        @test Postgres.API.parse_value(18, "Z", registry) == 'Z'
+
+        # infinite timestamps/dates can't be represented and must say so
+        @test_throws Postgres.PostgresInterfaceError Postgres.API.pg_parse_datetime("infinity")
+        @test_throws Postgres.PostgresInterfaceError Postgres.API.pg_parse_datetime("-infinity")
+        @test_throws Postgres.PostgresInterfaceError Postgres.API.pg_parse_date("infinity")
+
         range = Postgres.API.parse_range("[1,5)", 23, registry)
         @test range == Postgres.PostgresRange{Int32}(1, 5, true, false, false)
         unbounded = Postgres.API.parse_range("(,5]", 23, registry)
@@ -1489,6 +1508,20 @@ end
                     @test_throws Postgres.PostgresInterfaceError Postgres.API.cancel_request(cfg.host, cfg.port, Int32(1), Int32(1), false, "verify-full")
                     # a cleartext-allowed cancel still delivers
                     @test Postgres.API.cancel_request(cfg.host, cfg.port, Int32(1), Int32(1), false, "disable")
+                end
+
+                @testset "Timestamp Ranges And char" begin
+                    ts_row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT '[2020-01-01 00:00:00,2020-01-02 00:00:00)'::tsrange AS r")))
+                    @test ts_row.r.lower == DateTime(2020, 1, 1)
+                    @test ts_row.r.upper == DateTime(2020, 1, 2)
+                    # "char" columns holding the zero value appear throughout
+                    # the system catalogs
+                    cat_rows = Tables.rowtable(DBInterface.execute(conn, "SELECT attidentity FROM pg_attribute LIMIT 5"))
+                    @test length(cat_rows) == 5
+                    # the session pins ISO dates and postgres intervals, so a
+                    # server default of something else can't break parsing
+                    @test Postgres.get_server_parameter(conn, "DateStyle") == "ISO, MDY"
+                    @test Postgres.get_server_parameter(conn, "IntervalStyle") == "postgres"
                 end
 
                 @testset "Interval Types" begin
