@@ -172,13 +172,20 @@ end
 # server-side transaction is already gone with the session.
 function finish_cursor_transaction!(conn::Connection)
     if !isopen(conn)
-        @lock conn.lock begin
-            conn.in_transaction = false
-            conn.transaction_depth = 0
-        end
+        clear_transaction_state!(conn)
         return
     end
     in_transaction(conn) && commit(conn)
+    return
+end
+
+# same, for the failure path: roll back rather than commit
+function abort_cursor_transaction!(conn::Connection)
+    if !isopen(conn)
+        clear_transaction_state!(conn)
+        return
+    end
+    in_transaction(conn) && rollback(conn)
     return
 end
 
@@ -519,7 +526,16 @@ function cursor(conn::Connection, sql::AbstractString, params=nothing; fetchsize
         return cursor(stmt, params; fetchsize=fetchsize, owns_transaction=owns_transaction)
     catch
         # don't leave the transaction we started dangling on a failed cursor
-        owns_transaction && isopen(conn) && in_transaction(conn) && rollback(conn)
+        # don't leave the transaction we started dangling on a failed cursor;
+        # if the connection died, clear the state directly (a ROLLBACK can't be
+        # delivered, and leaving it set would block reconnect forever)
+        if owns_transaction
+            try
+                abort_cursor_transaction!(conn)
+            catch
+                # already unwinding; don't mask the original error
+            end
+        end
         rethrow()
     end
 end

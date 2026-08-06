@@ -139,7 +139,9 @@ function params_from_values(values::Dict{String, String})
         dbname=dbname,
         application_name=get(merged, "application_name", nothing),
         connect_timeout=parse_optional_int(get(merged, "connect_timeout", nothing), "connect_timeout"),
-        sslmode=haskey(merged, "sslmode") ? lowercase(merged["sslmode"]) : nothing,
+        # an empty value means unset, as it does for the numeric and boolean
+        # parameters (an unexpanded ${PGSSLMODE} must not become an invalid mode)
+        sslmode=(haskey(merged, "sslmode") && !isempty(merged["sslmode"])) ? lowercase(merged["sslmode"]) : nothing,
         sslrootcert=get(merged, "sslrootcert", nothing),
         sslcert=get(merged, "sslcert", nothing),
         sslkey=get(merged, "sslkey", nothing),

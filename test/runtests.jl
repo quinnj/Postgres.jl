@@ -540,6 +540,14 @@ end
             @test Postgres.parse_dsn("host=h").port == 5432
             @test Postgres.parse_dsn(nothing).port == 5432
         end
+        # ... and the same for the boolean and TLS-mode parameters (quoted so
+        # the empty value can't swallow the next key: a bare "reconnect=" takes
+        # the following token as its value, as libpq does)
+        @test !Postgres.parse_dsn("host=h reconnect='' debug=''").reconnect
+        @test !Postgres.parse_dsn("host=h reconnect='' debug=''").debug
+        withenv("PGSSLMODE" => "") do
+            @test Postgres.parse_dsn("host=h").sslmode === nothing
+        end
 
         withenv(
             "PGHOST" => "envhost",
@@ -635,6 +643,28 @@ end
         @test Postgres.escape_literal("a'b") == "'a''b'"
         @test_throws Postgres.PostgresInterfaceError Postgres.escape_identifier("a\0b")
         @test_throws Postgres.PostgresInterfaceError Postgres.escape_literal("a\0b")
+
+        # severity must come from the non-localized 'V' field when the server
+        # sends it: 'S' is translated, so comparing it to "FATAL" would depend
+        # on the server's lc_messages
+        let socket = IOBuffer(Vector{UInt8}(vcat(
+                UInt8('S'), Vector{UInt8}("SCHWERWIEGEND"), 0x00,
+                UInt8('V'), Vector{UInt8}("FATAL"), 0x00,
+                UInt8('C'), Vector{UInt8}("57P01"), 0x00,
+                UInt8('M'), Vector{UInt8}("terminating connection"), 0x00,
+                0x00)))
+            err = Postgres.API.errorResponse(bytesavailable(socket), socket, false)
+            @test err.severity == "FATAL"
+            @test err.code == "57P01"
+        end
+        # without 'V' the localized 'S' is still reported
+        let socket = IOBuffer(Vector{UInt8}(vcat(
+                UInt8('S'), Vector{UInt8}("ERROR"), 0x00,
+                UInt8('C'), Vector{UInt8}("42601"), 0x00,
+                0x00)))
+            err = Postgres.API.errorResponse(bytesavailable(socket), socket, false)
+            @test err.severity == "ERROR"
+        end
 
         @test Postgres.API.parse_value(1184, "2024-02-13 05:28:17+02", registry) == DateTime(2024, 2, 13, 3, 28, 17)
         @test Postgres.API.parse_value(1184, "2024-02-13 05:28:17+02:30", registry) == DateTime(2024, 2, 13, 2, 58, 17)
@@ -821,7 +851,8 @@ end
                     DBInterface.execute(connp, "SELECT pg_terminate_backend($(conn_victim.pid))")
                     err = fetch(victim_task)
                     @test err isa Postgres.API.Error
-                    @test occursin("terminat", err.message)
+                    # 57P01: admin_shutdown — the code, not the localized message
+                    @test err.code == "57P01"
                     @test !isopen(conn_victim.socket)
 
                     DBInterface.close!(conn_victim)
@@ -967,6 +998,44 @@ end
 
                     @test_throws Postgres.PostgresInterfaceError Postgres.commit(conn)
                     @test_throws Postgres.PostgresInterfaceError Postgres.rollback(conn)
+
+                    # A COMMIT that fails server-side (deferred constraint) must
+                    # surface the server's error with its SQLSTATE — a retry
+                    # loop keys on that — and must not leave the transaction
+                    # open on the client after the server has ended it.
+                    DBInterface.execute(conn, "DROP TABLE IF EXISTS deferred_child")
+                    DBInterface.execute(conn, "DROP TABLE IF EXISTS deferred_parent")
+                    DBInterface.execute(conn, "CREATE TABLE deferred_parent (id int PRIMARY KEY)")
+                    DBInterface.execute(conn, """
+                        CREATE TABLE deferred_child (
+                            id int,
+                            parent_id int REFERENCES deferred_parent(id) DEFERRABLE INITIALLY DEFERRED
+                        )
+                    """)
+                    for wrapper in (:plain, :helper, :macro)
+                        err = try
+                            if wrapper === :plain
+                                Postgres.start_transaction(conn)
+                                DBInterface.execute(conn, "INSERT INTO deferred_child VALUES (1, 999)")
+                                Postgres.commit(conn)
+                            elseif wrapper === :helper
+                                Postgres.transaction(conn) do tx
+                                    DBInterface.execute(tx, "INSERT INTO deferred_child VALUES (1, 999)")
+                                end
+                            else
+                                Postgres.@transaction conn begin
+                                    DBInterface.execute(conn, "INSERT INTO deferred_child VALUES (1, 999)")
+                                end
+                            end
+                            nothing
+                        catch e
+                            e
+                        end
+                        @test err isa Postgres.API.Error
+                        @test err.code == "23503"
+                        @test !Postgres.in_transaction(conn)
+                        @test isempty(Tables.rowtable(DBInterface.execute(conn, "SELECT * FROM deferred_child")))
+                    end
 
                     # COMMIT/ROLLBACK end the transaction server-side even when
                     # they fail, so client state must not be left behind
@@ -1187,6 +1256,34 @@ end
                         return rows[1].a
                     end
                     @test pooled_result == 1
+
+                    # A connection returned to the pool mid-transaction must not
+                    # hand that transaction to the next borrower: their BEGIN
+                    # would become a SAVEPOINT and their commit would be lost.
+                    Postgres.with_connection(pool) do pooled_conn
+                        DBInterface.execute(pooled_conn, "DROP TABLE IF EXISTS pool_tx_test")
+                        DBInterface.execute(pooled_conn, "CREATE TABLE pool_tx_test (id int)")
+                    end
+                    try
+                        Postgres.with_connection(pool) do pooled_conn
+                            Postgres.start_transaction(pooled_conn)
+                            DBInterface.execute(pooled_conn, "INSERT INTO pool_tx_test VALUES (1)")
+                            error("abandon the block mid-transaction")
+                        end
+                    catch
+                        # the caller's error propagates; the pool must still be clean
+                    end
+                    Postgres.with_connection(pool) do pooled_conn
+                        @test !Postgres.in_transaction(pooled_conn)
+                        Postgres.transaction(pooled_conn) do tx
+                            DBInterface.execute(tx, "INSERT INTO pool_tx_test VALUES (2)")
+                        end
+                    end
+                    # the abandoned insert rolled back; the committed one landed
+                    Postgres.with_connection(pool) do pooled_conn
+                        ids = [row.id for row in Tables.rowtable(DBInterface.execute(pooled_conn, "SELECT id FROM pool_tx_test ORDER BY id"))]
+                        @test ids == [2]
+                    end
                     DBInterface.close!(pool)
                     @test !isopen(conn_a)
                 end

@@ -38,8 +38,8 @@ A single connection to a PostgreSQL server, created via
 `dsn` may be a libpq-style keyword string (`"host=127.0.0.1 user=postgres dbname=postgres"`)
 or a PostgreSQL URI (`"postgresql://user:pass@host:5432/dbname?sslmode=require"`).
 
-Supported keyword arguments (all but the last three also available as DSN/URI
-options):
+Supported keyword arguments. All are also available as DSN/URI options except
+`style`, which is Julia-only:
 
 - `dbname`, `port`, `application_name`
 - `connect_timeout` (seconds), `statement_timeout` (milliseconds)
@@ -47,9 +47,10 @@ options):
   `sslrootcert`, `sslcert`, `sslkey`, `sslcapath`, and `sslservername`.
   Only `verify-full` verifies the server's certificate; `require` encrypts
   without authenticating the server, and the default `prefer` falls back to an
-  unencrypted connection if the server declines TLS. `sslcapath` is loaded as
-  an additional CA *file*; libpq-style hashed CA directories are not
-  supported. `sslservername` overrides the TLS server
+  unencrypted connection if the server declines TLS. `sslcapath` is a
+  *fallback* CA file used only when `sslrootcert` is unset (it is ignored
+  otherwise); libpq-style hashed CA directories are not supported.
+  `sslservername` overrides the TLS server
   name when the host is a pre-resolved address — note that under
   `verify-full` this is also the name the certificate is verified against,
   so it must name the server you intend to authenticate.
@@ -463,10 +464,10 @@ function wait_for_notification(conn::Connection; timeout::Union{Real, Nothing}=n
                 API.notification_callback(conn.style, message)
                 return message
             elseif message isa API.Error
-                # a FATAL error means the server is terminating this session;
-                # close now so the next use reports the error rather than a
-                # bare EOF from a socket the server has already dropped
-                message.severity == "FATAL" && close(conn.socket)
+                # FATAL and PANIC both terminate the session; close now so the
+                # next use reports the error rather than a bare EOF from a
+                # socket the server has already dropped
+                (message.severity == "FATAL" || message.severity == "PANIC") && close(conn.socket)
                 throw(message)
             elseif message !== nothing
                 API.notice_callback(conn.style, message)
@@ -790,14 +791,44 @@ function acquire(pool::ConnectionPool; forcenew::Bool=false)
     return conn
 end
 
+# A connection going back into the pool must not carry a transaction with it:
+# the next borrower's `start_transaction` would issue a SAVEPOINT instead of
+# BEGIN, and their commit would only decrement the depth — their writes would
+# be silently discarded when the connection is later reset. Roll it back; if
+# that can't be done, drop the connection instead of handing it on.
+function reset_pooled_connection!(conn::Connection)
+    in_transaction(conn) || return true
+    try
+        @lock conn.lock begin
+            checkconn(conn)
+            try
+                execute_simple(conn, "ROLLBACK")
+            finally
+                conn.in_transaction = false
+                conn.transaction_depth = 0
+            end
+        end
+        return true
+    catch
+        try
+            DBInterface.close!(conn)
+        catch
+            # already unusable; nothing more to do
+        end
+        return false
+    end
+end
+
 """
     Postgres.release(pool, conn)
 
 Return a connection previously taken with [`acquire`](@ref Postgres.acquire)
-to the pool.
+to the pool. A connection still inside a transaction is rolled back first, so
+the next borrower starts from a clean session; if it can't be rolled back it
+is closed rather than reused.
 """
 function release(pool::ConnectionPool, conn::Connection)
-    if pool_isvalid(conn)
+    if pool_isvalid(conn) && reset_pooled_connection!(conn)
         Pools.release(pool.pool, conn)
     else
         Pools.release(pool.pool)
@@ -881,6 +912,16 @@ end
 Whether the connection currently has an open transaction.
 """
 in_transaction(conn::Connection) = @lock conn.lock conn.in_transaction
+
+# Forget a transaction whose session is already gone. Nothing can be sent to
+# end it, and leaving the flags set makes checkconn refuse to reconnect.
+function clear_transaction_state!(conn::Connection)
+    @lock conn.lock begin
+        conn.in_transaction = false
+        conn.transaction_depth = 0
+    end
+    return
+end
 
 """
     Postgres.commit(conn)
@@ -971,7 +1012,10 @@ function transaction(f::F, conn::Connection) where {F}
         commit(conn)
         return result
     catch
-        rollback(conn)
+        # only roll back if the transaction is still open: a failed COMMIT has
+        # already ended it, and rolling back then would throw "no transaction
+        # in progress" from this catch and destroy the server's error
+        in_transaction(conn) && rollback(conn)
         rethrow()
     end
 end
@@ -983,7 +1027,7 @@ function DBInterface.transaction(f::F, conn::Connection) where {F}
         commit(conn)
         return result
     catch
-        rollback(conn)
+        in_transaction(conn) && rollback(conn)
         rethrow()
     end
 end
@@ -1004,7 +1048,7 @@ macro transaction(conn, expr)
             success = true
             result
         catch
-            !success && rollback($(esc(conn)))
+            !success && in_transaction($(esc(conn))) && rollback($(esc(conn)))
             rethrow()
         end
     end
