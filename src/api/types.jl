@@ -355,7 +355,9 @@ function parse_numeric(val::String)
         # scaling below (tryparse so an oversized exponent reports the same
         # error as an out-of-range one, rather than an OverflowError)
         parsed_exp = tryparse(Int, stripped[exp_index + 1:end])
-        (parsed_exp === nothing || abs(parsed_exp) > 100_000) &&
+        # compared without abs: abs(typemin(Int)) wraps back to itself and
+        # would slip past the bound
+        (parsed_exp === nothing || parsed_exp < -100_000 || parsed_exp > 100_000) &&
             throw(PostgresInterfaceError("postgres numeric exponent out of range: $stripped"))
         exp_val = parsed_exp
         stripped = stripped[1:exp_index - 1]

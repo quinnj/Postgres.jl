@@ -549,6 +549,8 @@ end
         # an absurd exponent must be rejected, not turned into a huge BigInt
         @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric("1e999999999999")
         @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric("1e99999999999999999999999999")
+        # abs(typemin(Int)) wraps to itself, so the bound must not use abs
+        @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric("1e-9223372036854775808")
         # ordinary scientific notation still round-trips
         @test string(Postgres.API.parse_numeric("1.5e2")) == "150"
         @test string(Postgres.API.parse_numeric("1.5e-2")) == "0.015"
@@ -568,8 +570,10 @@ end
             consume = row -> StructUtils.applyeach(Postgres.API.PostgresStyle(), (k, v) -> nothing, row)
             # ncols is signed on the wire: -1 must not pass an upper-bound check
             @test_throws Postgres.API.Error consume(mk(UInt8[0xff, 0xff]))
-            # more columns than the row description declared
+            # the count must equal the described column count exactly: too few
+            # would leave the caller's row partly unfilled
             @test_throws Postgres.API.Error consume(mk(UInt8[0x00, 0x09]))
+            @test_throws Postgres.API.Error consume(mk(UInt8[0x00, 0x01, 0x00, 0x00, 0x00, 0x01, UInt8('7')]))
             # truncated header, and a column length running past the body
             @test_throws Postgres.API.Error consume(mk(UInt8[0x00]))
             @test_throws Postgres.API.Error consume(mk(UInt8[0x00, 0x01, 0x00, 0x00, 0x00, 0x7f]))
@@ -1146,12 +1150,17 @@ end
                     # queries must not desync the stream: the async message
                     # arrives interleaved with the query's own messages, and
                     # its body has to be consumed rather than read as the next
-                    # message header.
-                    Postgres.notify!(notifier, "notify_test", "interleaved")
-                    sleep(0.2)
-                    @test Tables.rowtable(DBInterface.execute(listener, "SELECT 2 AS a"))[1].a == 2
-                    @test Tables.rowtable(DBInterface.execute(listener, "SELECT 3 AS a"))[1].a == 3
-                    @test isopen(listener)
+                    # message header. Repeated so the notification is unlikely
+                    # to land after every query and pass vacuously.
+                    interleaved_ok = true
+                    for i in 1:5
+                        Postgres.notify!(notifier, "notify_test", "interleaved $i")
+                        sleep(0.1)
+                        interleaved_ok &= Tables.rowtable(DBInterface.execute(listener, "SELECT $i AS a"))[1].a == i
+                        interleaved_ok &= isopen(listener)
+                        interleaved_ok || break
+                    end
+                    @test interleaved_ok
 
                     DBInterface.close!(notifier)
                     DBInterface.close!(listener)
@@ -1324,6 +1333,28 @@ end
                     # TLS — which has to happen while the query being cancelled
                     # holds the connection lock.
                     @test Postgres.API.cancel_request(ssl_cfg.host, ssl_cfg.port, Int32(1), Int32(1), false, "require")
+                    # LISTEN/NOTIFY over TLS: the read deadline surfaces as a
+                    # wrapped TLSError rather than a bare DeadlineExceededError,
+                    # so the poll loop must recognize it — and must not leave an
+                    # expired deadline set, which would kill the connection.
+                    ssl_listener = wait_for_connection(ssl_cfg; sslmode="require")
+                    ssl_notifier = wait_for_connection(ssl_cfg; sslmode="require")
+                    try
+                        Postgres.listen!(ssl_listener, "tls_notify_test")
+                        @test Postgres.wait_for_notification(ssl_listener; timeout=0.3) === nothing
+                        # the connection survives an elapsed poll deadline
+                        @test Tables.rowtable(DBInterface.execute(ssl_listener, "SELECT 1 AS a"))[1].a == 1
+                        Postgres.notify!(ssl_notifier, "tls_notify_test", "over-tls")
+                        tls_notification = Postgres.wait_for_notification(ssl_listener; timeout=5.0)
+                        @test tls_notification !== nothing
+                        @test tls_notification.channel == "tls_notify_test"
+                        @test tls_notification.payload == "over-tls"
+                        @test Tables.rowtable(DBInterface.execute(ssl_listener, "SELECT 2 AS a"))[1].a == 2
+                    finally
+                        isopen(ssl_notifier) && DBInterface.close!(ssl_notifier)
+                        isopen(ssl_listener) && DBInterface.close!(ssl_listener)
+                    end
+
                     ssl_cancel_conn = DBInterface.connect(Postgres.Connection, ssl_cfg.host, ssl_cfg.user, ssl_cfg.password; dbname=ssl_cfg.dbname, port=ssl_cfg.port)
                     @test ssl_cancel_conn.socket isa Postgres.Reseau.TLS.Conn
                     try

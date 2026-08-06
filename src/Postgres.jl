@@ -354,14 +354,25 @@ end
 
 const NOTIFICATION_POLL_INTERVAL_NS = Int64(100_000_000)
 
+# A read deadline surfaces directly as DeadlineExceededError on a plain TCP
+# connection, but the TLS layer wraps transport failures, so over TLS the same
+# expiry arrives as a TLSError carrying it as the cause.
+function _is_read_deadline_error(err)
+    err isa Reseau.IOPoll.DeadlineExceededError && return true
+    err isa Reseau.TLS.TLSError && return err.cause isa Reseau.IOPoll.DeadlineExceededError
+    return false
+end
+
 """
     Postgres.wait_for_notification(conn; timeout=nothing) -> Union{Notification, Nothing}
 
 Block until a `NOTIFY` message arrives on the connection (see
 [`listen!`](@ref Postgres.listen!)) and return it as a
 [`Notification`](@ref Postgres.API.Notification). With a `timeout` (seconds),
-return `nothing` if no notification arrives in time. The connection lock is
-held while waiting, so use a dedicated connection for listening.
+return `nothing` if no message begins arriving in that window; once a message
+starts, it is always read to completion so the connection is never left parked
+mid-message. The connection lock is held while waiting, so use a dedicated
+connection for listening.
 """
 function wait_for_notification(conn::Connection; timeout::Union{Real, Nothing}=nothing)
     start_time = time()
@@ -384,11 +395,17 @@ function wait_for_notification(conn::Connection; timeout::Union{Real, Nothing}=n
             mt = try
                 read(conn.socket, UInt8)
             catch err
-                err isa Reseau.IOPoll.DeadlineExceededError || rethrow()
+                _is_read_deadline_error(err) || rethrow()
+                nothing
+            finally
+                # the deadline must be cleared on every path, including a
+                # rethrow: an expired deadline left set on the socket makes
+                # every later read on this connection fail
                 isopen(conn.socket) && _clear_read_deadline!(conn.socket)
-                continue
             end
-            isopen(conn.socket) && _clear_read_deadline!(conn.socket)
+            # nothing arrived within this poll interval; nothing of a message
+            # has been consumed, so it is safe to loop and re-check the timeout
+            mt === nothing && continue
             # no deadline is in effect from here on, so the rest of the message
             # is read to completion and any failure is a real one
             len = ntoh(read(conn.socket, Int32)) - 4
