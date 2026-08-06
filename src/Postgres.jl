@@ -463,6 +463,10 @@ function wait_for_notification(conn::Connection; timeout::Union{Real, Nothing}=n
                 API.notification_callback(conn.style, message)
                 return message
             elseif message isa API.Error
+                # a FATAL error means the server is terminating this session;
+                # close now so the next use reports the error rather than a
+                # bare EOF from a socket the server has already dropped
+                message.severity == "FATAL" && close(conn.socket)
                 throw(message)
             elseif message !== nothing
                 API.notice_callback(conn.style, message)
@@ -885,12 +889,27 @@ Commit the current transaction (or release one level of transaction nesting).
 """
 function commit(conn::Connection)
     @lock conn.lock begin
-        checkconn(conn)
         !conn.in_transaction && throw(PostgresInterfaceError("no transaction in progress"))
-        if conn.transaction_depth == 1
-            execute_simple(conn, "COMMIT")
+        # a dead socket took the transaction with it: clear the bookkeeping
+        # before reporting, or checkconn will refuse to reconnect forever
+        # ("reconnect disabled during transaction")
+        if !isopen(conn.socket)
             conn.in_transaction = false
             conn.transaction_depth = 0
+            disconnected()
+        end
+        checkconn(conn)
+        if conn.transaction_depth == 1
+            # COMMIT ends the transaction server-side whether it succeeds or
+            # fails (and a dead connection ends it too), so the client's
+            # transaction state must be cleared either way — leaving it set
+            # would block reconnects and make the next cursor skip its BEGIN
+            try
+                execute_simple(conn, "COMMIT")
+            finally
+                conn.in_transaction = false
+                conn.transaction_depth = 0
+            end
         else
             # Release SAVEPOINT for nested transaction
             conn.transaction_depth -= 1
@@ -908,12 +927,23 @@ the enclosing savepoint).
 """
 function rollback(conn::Connection)
     @lock conn.lock begin
-        checkconn(conn)
         !conn.in_transaction && throw(PostgresInterfaceError("no transaction in progress"))
-        if conn.transaction_depth == 1
-            execute_simple(conn, "ROLLBACK")
+        # as in commit: a dead session already ended the transaction
+        if !isopen(conn.socket)
             conn.in_transaction = false
             conn.transaction_depth = 0
+            disconnected()
+        end
+        checkconn(conn)
+        if conn.transaction_depth == 1
+            # as in commit: the transaction is over server-side regardless of
+            # how ROLLBACK fares, so don't leave client state describing it
+            try
+                execute_simple(conn, "ROLLBACK")
+            finally
+                conn.in_transaction = false
+                conn.transaction_depth = 0
+            end
         else
             # Rollback to SAVEPOINT for nested transaction
             conn.transaction_depth -= 1

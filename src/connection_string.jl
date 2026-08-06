@@ -101,6 +101,8 @@ const IGNORED_PARAMS = Set([
 
 function parse_bool_param(value::Union{String, Nothing}, default::Bool, key::String)
     value === nothing && return default
+    # an empty value means "unset", as it does for the integer parameters
+    isempty(value) && return default
     lowered = lowercase(value)
     lowered in ("1", "on", "true", "yes") && return true
     lowered in ("0", "off", "false", "no") && return false

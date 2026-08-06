@@ -196,6 +196,9 @@ function DBInterface.close!(cursor::Cursor)
         end
         closed_cleanly = true
     finally
+        # take responsibility exactly once: closing an already-closed cursor
+        # must not commit whatever transaction the caller has open now
+        cursor.owns_transaction = false
         if owns_transaction
             if closed_cleanly
                 # a COMMIT failure here means the caller's writes did not land,

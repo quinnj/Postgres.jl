@@ -968,6 +968,20 @@ end
                     @test_throws Postgres.PostgresInterfaceError Postgres.commit(conn)
                     @test_throws Postgres.PostgresInterfaceError Postgres.rollback(conn)
 
+                    # COMMIT/ROLLBACK end the transaction server-side even when
+                    # they fail, so client state must not be left behind
+                    fail_conn = DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, cfg.password; dbname=cfg.dbname, port=cfg.port, reconnect=true)
+                    Postgres.start_transaction(fail_conn)
+                    close(fail_conn.socket)
+                    try
+                        Postgres.commit(fail_conn)
+                    catch
+                        # the connection is gone; the COMMIT cannot be delivered
+                    end
+                    @test !Postgres.in_transaction(fail_conn)
+                    @test Tables.rowtable(DBInterface.execute(fail_conn, "SELECT 1 AS a"))[1].a == 1
+                    DBInterface.close!(fail_conn)
+
                     Postgres.start_transaction(conn)
                     @test_throws Postgres.API.Error DBInterface.execute(conn, "INVALID SQL")
                     Postgres.rollback(conn)
@@ -1317,6 +1331,32 @@ end
                     values = [row.n for row in cur]
                     @test values == [1, 2, 3, 4, 5]
                     DBInterface.close!(cur)
+                    @test !Postgres.in_transaction(conn)
+
+                    # closing an already-closed cursor must not reach into a
+                    # transaction the caller opened afterwards and commit it
+                    DBInterface.execute(conn, "DROP TABLE IF EXISTS cursor_reclose")
+                    DBInterface.execute(conn, "CREATE TABLE cursor_reclose (id int)")
+                    Postgres.start_transaction(conn)
+                    DBInterface.execute(conn, "INSERT INTO cursor_reclose VALUES (1)")
+                    DBInterface.close!(cur)
+                    @test Postgres.in_transaction(conn)
+                    Postgres.rollback(conn)
+                    @test isempty(Tables.rowtable(DBInterface.execute(conn, "SELECT * FROM cursor_reclose")))
+
+                    # a cursor over a dead connection must not leave transaction
+                    # state behind, which would block reconnect forever
+                    dead_conn = DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, cfg.password; dbname=cfg.dbname, port=cfg.port, reconnect=true)
+                    dead_cur = Postgres.cursor(dead_conn, "SELECT generate_series(1, 100) AS n"; fetchsize=2)
+                    close(dead_conn.socket)
+                    try
+                        DBInterface.close!(dead_cur)
+                    catch
+                        # closing the portal on a dead socket may throw
+                    end
+                    @test !Postgres.in_transaction(dead_conn)
+                    @test Tables.rowtable(DBInterface.execute(dead_conn, "SELECT 1 AS a"))[1].a == 1
+                    DBInterface.close!(dead_conn)
                 end
 
                 @testset "Notice Callback (style)" begin
