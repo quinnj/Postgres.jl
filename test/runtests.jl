@@ -545,8 +545,11 @@ end
         # the following token as its value, as libpq does)
         @test !Postgres.parse_dsn("host=h reconnect='' debug=''").reconnect
         @test !Postgres.parse_dsn("host=h reconnect='' debug=''").debug
+        # sslmode is deliberately NOT empty-tolerant (libpq rejects it too):
+        # an unexpanded ${PGSSLMODE} meant to be verify-full must fail loudly
+        # rather than fall back to the unauthenticated default
         withenv("PGSSLMODE" => "") do
-            @test Postgres.parse_dsn("host=h").sslmode === nothing
+            @test Postgres.parse_dsn("host=h").sslmode == ""
         end
 
         withenv(
@@ -1090,6 +1093,14 @@ end
                     DBInterface.execute(conn, "CREATE TABLE macro_test (id SERIAL PRIMARY KEY, value INTEGER)")
                     DBInterface.execute(conn, "INSERT INTO macro_test (value) VALUES (1)")
 
+                    # the macro must evaluate its connection expression once
+                    conn_evals = Ref(0)
+                    eval_conn = () -> (conn_evals[] += 1; conn)
+                    Postgres.@transaction eval_conn() begin
+                        DBInterface.execute(conn, "SELECT 1")
+                    end
+                    @test conn_evals[] == 1
+
                     result = Postgres.@transaction conn begin
                         DBInterface.execute(conn, "INSERT INTO macro_test (value) VALUES (2)")
                         length(Tables.rowtable(DBInterface.execute(conn, "SELECT * FROM macro_test")))
@@ -1297,6 +1308,21 @@ end
                         Postgres.transaction(pooled_conn) do tx
                             DBInterface.execute(tx, "INSERT INTO pool_tx_test VALUES (2)")
                         end
+                    end
+
+                    # ... including a transaction opened by raw SQL, which the
+                    # client-side flag never sees
+                    try
+                        Postgres.with_connection(pool) do pooled_conn
+                            DBInterface.execute(pooled_conn, "BEGIN")
+                            DBInterface.execute(pooled_conn, "INSERT INTO pool_tx_test VALUES (99)")
+                            error("abandon a raw-SQL transaction")
+                        end
+                    catch
+                    end
+                    Postgres.with_connection(pool) do pooled_conn
+                        rows = Tables.rowtable(DBInterface.execute(pooled_conn, "SELECT id FROM pool_tx_test ORDER BY id"))
+                        @test [row.id for row in rows] == [2]
                     end
                     # the abandoned insert rolled back; the committed one landed
                     Postgres.with_connection(pool) do pooled_conn

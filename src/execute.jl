@@ -456,6 +456,7 @@ function DBInterface.execute(stmt::Statement, params=nothing, ::Type{T}=Any; deb
                 API.exec(style, socket::Reseau.TLS.Conn, stmt.name, stmt.params, stmt.names, stmt.typeIds, stmt.conn.type_registry, debug, 0)
             end
             result = T === Any ? makeresult(e) : StructUtils.arraylike(T) ? StructUtils.make(T, e, style) : only(StructUtils.make(Vector{T}, e, style))
+            stmt.conn.server_in_transaction = API.in_transaction_status(e.tx_status[])
         end
         log_enabled && API.query_logger(style, :execute, (sql=stmt.sql, params=params, duration_ns=time_ns() - start_ns, success=true))
         return result
@@ -485,6 +486,7 @@ function DBInterface.execute(conn::Connection, sql::AbstractString, params=nothi
                 API.exec(style, socket::Reseau.TLS.Conn, stmtname, params_vec, names, types, conn.type_registry, debug, 0)
             end
             result = T === Any ? makeresult(e) : StructUtils.arraylike(T) ? StructUtils.make(T, e, style) : only(StructUtils.make(Vector{T}, e, style))
+            conn.server_in_transaction = API.in_transaction_status(e.tx_status[])
         end
         log_enabled && API.query_logger(style, :execute, (sql=sql_str, params=params, duration_ns=time_ns() - start_ns, success=true))
         return result

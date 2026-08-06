@@ -103,6 +103,9 @@ mutable struct Connection{T, S <: API.AbstractPostgresStyle} <: DBInterface.Conn
     in_transaction::Bool # track transaction state
     transaction_depth::Int # track nested transactions (SAVEPOINTs)
     generation::Int # increment on reconnect to invalidate statements
+    # the server's own ReadyForQuery transaction status: unlike in_transaction
+    # it also sees a transaction opened by raw SQL (`execute(conn, "BEGIN")`)
+    server_in_transaction::Bool
 
     function Connection(; host::AbstractString="", user::AbstractString="", password::Union{AbstractString, Nothing}=nothing, dbname::AbstractString="", port::Integer=5432, debug::Bool=false, reconnect::Bool=false, application_name::Union{AbstractString, Nothing}=nothing, connect_timeout::Union{Integer, Nothing}=nothing, sslmode::Union{AbstractString, Nothing}=nothing, sslrootcert::Union{AbstractString, Nothing}=nothing, sslcert::Union{AbstractString, Nothing}=nothing, sslkey::Union{AbstractString, Nothing}=nothing, sslcapath::Union{AbstractString, Nothing}=nothing, sslservername::Union{AbstractString, Nothing}=nothing, statement_timeout::Union{Integer, Nothing}=nothing, statement_cache_maxsize::Integer=100, style::API.AbstractPostgresStyle=PostgresStyle())
         host = String(host)
@@ -122,7 +125,7 @@ mutable struct Connection{T, S <: API.AbstractPostgresStyle} <: DBInterface.Conn
         maxsize = max(0, Int(statement_cache_maxsize))
         socket, pid, skey, server_params = API.connect(host, port, dbname, user, password, debug, app_name, timeout, sslmode_val, sslrootcert_val, sslcert_val, sslkey_val, sslcapath_val, sslservername_val, statement_timeout_val)
         registry = Dict(API.DEFAULT_TYPE_REGISTRY)
-        return new{Statement{typeof(style)}, typeof(style)}(ReentrantLock(), socket, host, user, password, dbname, port, app_name, timeout, sslmode_val, sslrootcert_val, sslcert_val, sslkey_val, sslcapath_val, sslservername_val, statement_timeout_val, pid, skey, Dict{String, Statement{typeof(style)}}(), maxsize, 0, server_params, registry, false, reconnect, debug, style, false, 0, 1)
+        return new{Statement{typeof(style)}, typeof(style)}(ReentrantLock(), socket, host, user, password, dbname, port, app_name, timeout, sslmode_val, sslrootcert_val, sslcert_val, sslkey_val, sslcapath_val, sslservername_val, statement_timeout_val, pid, skey, Dict{String, Statement{typeof(style)}}(), maxsize, 0, server_params, registry, false, reconnect, debug, style, false, 0, 1, false)
     end
 end
 
@@ -797,7 +800,9 @@ end
 # be silently discarded when the connection is later reset. Roll it back; if
 # that can't be done, drop the connection instead of handing it on.
 function reset_pooled_connection!(conn::Connection)
-    in_transaction(conn) || return true
+    # the client flag misses a transaction opened by raw SQL, so trust the
+    # server's ReadyForQuery status too
+    (in_transaction(conn) || (@lock conn.lock conn.server_in_transaction)) || return true
     try
         @lock conn.lock begin
             checkconn(conn)
@@ -876,7 +881,8 @@ include("execute.jl")
 # does not exist"). Also one network round trip instead of three. Callers
 # must hold conn.lock.
 function execute_simple(conn::Connection, sql::String)
-    API.exec(conn.style, conn.socket, sql, conn.debug)
+    status = API.exec(conn.style, conn.socket, sql, conn.debug)
+    conn.server_in_transaction = API.in_transaction_status(status)
     return conn
 end
 
@@ -995,6 +1001,19 @@ function rollback(conn::Connection)
     return conn
 end
 
+# Roll back after the body (or the COMMIT) failed. Only acts if a transaction
+# is still open — a failed COMMIT has already ended it — and never lets its own
+# failure replace the original error, which is what the caller needs to see.
+function rollback_for_failed_transaction!(conn::Connection)
+    in_transaction(conn) || return
+    try
+        rollback(conn)
+    catch
+        # the connection is already failing; the original error is the useful one
+    end
+    return
+end
+
 """
     Postgres.transaction(f, conn)
 
@@ -1012,10 +1031,7 @@ function transaction(f::F, conn::Connection) where {F}
         commit(conn)
         return result
     catch
-        # only roll back if the transaction is still open: a failed COMMIT has
-        # already ended it, and rolling back then would throw "no transaction
-        # in progress" from this catch and destroy the server's error
-        in_transaction(conn) && rollback(conn)
+        rollback_for_failed_transaction!(conn)
         rethrow()
     end
 end
@@ -1027,7 +1043,7 @@ function DBInterface.transaction(f::F, conn::Connection) where {F}
         commit(conn)
         return result
     catch
-        in_transaction(conn) && rollback(conn)
+        rollback_for_failed_transaction!(conn)
         rethrow()
     end
 end
@@ -1040,15 +1056,19 @@ throws. Evaluates to `expr`'s value.
 """
 macro transaction(conn, expr)
     quote
+        # bind once: the connection expression may have side effects
+        # (`@transaction acquire(pool) ...` would otherwise take a different
+        # connection for the BEGIN, the COMMIT and the ROLLBACK)
+        local c = $(esc(conn))
         local success = false
-        start_transaction($(esc(conn)))
+        start_transaction(c)
         try
             result = $(esc(expr))
-            commit($(esc(conn)))
+            commit(c)
             success = true
             result
         catch
-            !success && in_transaction($(esc(conn))) && rollback($(esc(conn)))
+            !success && rollback_for_failed_transaction!(c)
             rethrow()
         end
     end

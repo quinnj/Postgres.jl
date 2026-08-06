@@ -764,11 +764,17 @@ end
 # differ: a default server pays nothing, and no extra startup parameters are
 # sent (poolers such as pgbouncer reject `options` unless it is allowlisted).
 function align_session_formats!(socket, server_params::Dict{String, String}, debug::Bool)
-    datestyle = get(server_params, "DateStyle", "")
-    startswith(datestyle, "ISO") || exec(PostgresStyle(), socket, "SET DateStyle = 'ISO, MDY'", debug)
-    intervalstyle = get(server_params, "IntervalStyle", "")
-    (isempty(intervalstyle) || intervalstyle == "postgres") ||
+    # A parameter the server didn't report (a pooler may not forward it) must
+    # be treated as unknown, i.e. corrected — assuming it is already right is
+    # how intervals silently decode to zero.
+    if !startswith(get(server_params, "DateStyle", ""), "ISO")
+        exec(PostgresStyle(), socket, "SET DateStyle = 'ISO, MDY'", debug)
+        server_params["DateStyle"] = "ISO, MDY"
+    end
+    if get(server_params, "IntervalStyle", "") != "postgres"
         exec(PostgresStyle(), socket, "SET IntervalStyle = 'postgres'", debug)
+        server_params["IntervalStyle"] = "postgres"
+    end
     return
 end
 
@@ -881,7 +887,22 @@ struct Exec{S <: AbstractPostgresStyle}
     debug::Bool
     command_tag::Base.RefValue{Union{Nothing, String}}
     rows_affected::Base.RefValue{Union{Nothing, Int}}
+    # ReadyForQuery's transaction status: 'I' idle, 'T' in a transaction,
+    # 'E' in a failed transaction. The server's own view, which is the only
+    # thing that knows about a transaction opened by raw SQL.
+    tx_status::Base.RefValue{UInt8}
 end
+
+# read ReadyForQuery's one-byte transaction status (older/odd servers may send
+# an empty body; treat that as unknown-but-idle)
+function read_ready_status(socket, len)
+    len < 1 && (skipbytes!(socket, len); return UInt8('I'))
+    status = read(socket, UInt8)
+    skipbytes!(socket, len - 1)
+    return status
+end
+
+in_transaction_status(status::UInt8) = status == UInt8('T') || status == UInt8('E')
 
 function commandComplete(len, socket)
     buf = read(socket, len)
@@ -913,7 +934,7 @@ function StructUtils.applyeach(::AbstractPostgresStyle, f, e::Exec)
                 # error; keep reading until ready-for-query, thrown below
                 server_error = errorResponse(len, e.socket, e.debug)
             elseif mt == UInt8('Z')
-                skipbytes!(e.socket, len)
+                e.tx_status[] = read_ready_status(e.socket, len)
                 break
             elseif mt == UInt8('D')
                 nrows += 1
@@ -1000,12 +1021,13 @@ function exec(style::S, socket::ReseauConn, stmtname::String, params::Vector{Uni
     # bind, then execute, then sync
     writemessages(socket, debug, ('B', "", stmtname, npformats, nparams, Params(params), Int16(0)), ('E', "", Int32(rowlimit)), ('S',))
     waitfor(socket, debug, '2')
-    return Exec{S}(style, socket, names, typeIds, type_registry, debug, Ref{Union{Nothing, String}}(nothing), Ref{Union{Nothing, Int}}(nothing))
+    return Exec{S}(style, socket, names, typeIds, type_registry, debug, Ref{Union{Nothing, String}}(nothing), Ref{Union{Nothing, Int}}(nothing), Ref{UInt8}(UInt8('I')))
 end
 
 function exec(style::S, socket::ReseauConn, query::String, debug::Bool) where {S <: AbstractPostgresStyle}
     writemessages(socket, debug, ('Q', query))
     server_error = nothing
+    tx_status = UInt8('I')
     try
         while true
             mt, len = readheader(socket, debug)
@@ -1014,7 +1036,7 @@ function exec(style::S, socket::ReseauConn, query::String, debug::Bool) where {S
                 # server error so the connection remains reusable.
                 server_error = errorResponse(len, socket, debug)
             elseif mt == UInt8('Z')
-                skipbytes!(socket, len)
+                tx_status = read_ready_status(socket, len)
                 break
             elseif mt == UInt8('N')
                 notice_callback(style, noticeResponse(len, socket))
@@ -1034,7 +1056,7 @@ function exec(style::S, socket::ReseauConn, query::String, debug::Bool) where {S
         rethrow()
     end
     server_error === nothing || throw(server_error)
-    return
+    return tx_status
 end
 
 exec(socket::ReseauConn, query::String, debug::Bool) = exec(PostgresStyle(), socket, query, debug)
