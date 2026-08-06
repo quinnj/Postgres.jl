@@ -510,6 +510,26 @@ end
         @test Postgres.API.hostport_address("db.example.com", 6432) == "db.example.com:6432"
         @test_throws Postgres.PostgresInterfaceError Postgres.API.hostport_address("/var/run/postgresql", 5432)
 
+        # debug/reconnect are accepted from a DSN and actually applied
+        flag_params = Postgres.parse_dsn("host=h debug=true reconnect=on")
+        @test flag_params.debug
+        @test flag_params.reconnect
+        @test !Postgres.parse_dsn("host=h").debug
+        @test !Postgres.parse_dsn("host=h").reconnect
+
+        # an unrecognized parameter is a typo, not something to silently drop:
+        # "ssl_mode=verify-full" would otherwise leave sslmode unset and
+        # quietly fall back to an unverified connection
+        @test_throws ArgumentError Postgres.parse_dsn("host=h ssl_mode=verify-full")
+        @test_throws ArgumentError Postgres.parse_dsn("postgresql://u@h/db?ssl_mode=require")
+
+        # an empty value (an unset PGPORT expanded by a process manager) falls
+        # back to the default instead of failing to parse
+        withenv("PGPORT" => "") do
+            @test Postgres.parse_dsn("host=h").port == 5432
+            @test Postgres.parse_dsn(nothing).port == 5432
+        end
+
         withenv(
             "PGHOST" => "envhost",
             "PGPORT" => "5544",
@@ -631,6 +651,18 @@ end
 
         fields = Postgres.API.parse_composite_fields("(\"a,b\",,\"a\\\"b\",\"c\\\\d\",plain)")
         @test isequal(fields, Union{String, Missing}["a,b", missing, "a\"b", "c\\d", "plain"])
+
+        # postgres prefixes the literal with explicit dimensions whenever a
+        # lower bound isn't 1; without handling it the elements are silently
+        # dropped (text) or the parse throws (numeric)
+        @test Postgres.API.parse_array_by_oid("[0:2]={x,y,z}", 25, registry) == ["x", "y", "z"]
+        @test Postgres.API.parse_array_by_oid("[0:2]={1,2,3}", 23, registry) == [1, 2, 3]
+        @test Postgres.API.parse_value(1009, "[0:1]={a,b}", registry) == ["a", "b"]
+        @test Postgres.API.ArrayParsing.parse_array("[1:2][1:2]={{1,2},{3,4}}", Int64) == [[1, 2], [3, 4]]
+        # a bare '[' that isn't a dimension prefix is still treated as an array
+        @test Postgres.API.ArrayParsing.parse_array("[1,2]", Int64) == [1, 2]
+
+        @test Postgres.API.ArrayParsing.parse_array("{1,2}", Int64) isa Vector{Int64}
 
         rng = MersenneTwister(0x5097)
         for _ in 1:200
@@ -834,6 +866,12 @@ end
                 @test isequal(array_row.arr, Union{Missing, Int32}[1, missing, 3])
                 nested_row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT '{{1,2},{3,4}}'::int[] AS arr")))
                 @test nested_row.arr == [Int32[1, 2], Int32[3, 4]]
+                # arrays whose lower bound isn't 1 come back with an explicit
+                # dimension prefix; the elements must survive it
+                lb_row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT array_fill(7, ARRAY[3], ARRAY[0]) AS arr")))
+                @test lb_row.arr == [7, 7, 7]
+                lb_text_row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT array_fill('x'::text, ARRAY[3], ARRAY[0]) AS arr")))
+                @test lb_text_row.arr == ["x", "x", "x"]
                     typed = DBInterface.execute(conn, raw"SELECT * FROM types_test WHERE id = $1", (id,), TypeRow)
                     @test typed isa TypeRow
                     @test typed.uuid_col == expected[12]

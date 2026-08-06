@@ -101,6 +101,9 @@ function coerce_array(values::Vector{Any}, inner_type::Type{T}) where {T}
         value isa AbstractVector && (has_nested = true; break)
         value === missing && (has_missing = true)
     end
+    # nested arrays stay Vector{Any}: narrowing to the runtime element type
+    # would need a runtime-typed Vector construction, which `juliac --trim`
+    # cannot resolve. The values themselves are fully parsed either way.
     has_nested && return values
     if has_missing
         dest = Union{inner_type, Missing}[]
@@ -159,9 +162,42 @@ function parse_array_inner(code::Base.CodeUnits{UInt8, String}, pos::Ref{Int}, i
     return coerce_array(values, inner_type)
 end
 
+const EQUALS = UInt8('=')
+
+# PostgreSQL prefixes an array literal with explicit dimensions whenever a
+# lower bound isn't 1: "[0:2]={a,b,c}", "[1:2][1:2]={{1,2},{3,4}}". Skip the
+# prefix so the rest parses as an ordinary array literal — otherwise the '['
+# is taken for an array-open bracket and the real elements are lost.
+function skip_dimension_prefix!(code::Base.CodeUnits{UInt8, String}, pos::Ref{Int})
+    start = pos[]
+    n = length(code)
+    while pos[] <= n && code[pos[]] == BRACKET_OPEN
+        close_idx = pos[]
+        while close_idx <= n && code[close_idx] != BRACKET_CLOSE
+            close_idx += 1
+        end
+        if close_idx > n
+            pos[] = start
+            return
+        end
+        pos[] = close_idx + 1
+    end
+    if pos[] > start && pos[] <= n && code[pos[]] == EQUALS
+        pos[] += 1
+        return
+    end
+    pos[] = start
+    return
+end
+
 function parse_array(str::String, inner_type::Type{T}) where {T}
     code = codeunits(str)
     pos = Ref{Int}(1)
+    skip_ws(code, pos)
+    if pos[] > length(code)
+        return inner_type[]
+    end
+    skip_dimension_prefix!(code, pos)
     skip_ws(code, pos)
     if pos[] > length(code)
         return inner_type[]

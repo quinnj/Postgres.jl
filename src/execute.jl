@@ -168,15 +168,26 @@ end
 
 function DBInterface.close!(cursor::Cursor)
     owns_transaction = cursor.owns_transaction
-    @lock cursor.conn.lock begin
-        if !cursor.done
-            API.writemessages(cursor.conn.socket, cursor.conn.debug, ('C', UInt8('P'), cursor.portal), ('S',))
-            API.waitfor(cursor.conn.socket, cursor.conn.debug, '3', 'Z')
+    try
+        @lock cursor.conn.lock begin
+            if !cursor.done
+                API.writemessages(cursor.conn.socket, cursor.conn.debug, ('C', UInt8('P'), cursor.portal), ('S',))
+                API.waitfor(cursor.conn.socket, cursor.conn.debug, '3', 'Z')
+            end
+            cursor.done = true
+            empty!(cursor.buffer)
         end
-        cursor.done = true
-        empty!(cursor.buffer)
+    finally
+        # close the transaction this cursor opened even if closing the portal
+        # failed: leaving in_transaction set would block reconnects forever
+        if owns_transaction && isopen(cursor.conn) && in_transaction(cursor.conn)
+            try
+                commit(cursor.conn)
+            catch
+                # the connection is already failing; don't mask the original error
+            end
+        end
     end
-    owns_transaction && in_transaction(cursor.conn) && commit(cursor.conn)
     return
 end
 Base.close(cursor::Cursor) = DBInterface.close!(cursor)
@@ -258,7 +269,10 @@ end
         @inbounds f.types[f.i] = Union{f.types[f.i], Missing}
         @inbounds f.data[f.i] = missing
     else
-        if v isa AbstractVector{>:Missing}
+        # the OID-derived column type is a default; widen the schema whenever
+        # the parsed value doesn't fit it (nullable or nested array elements,
+        # values from a custom parser), so Tables.schema stays truthful
+        @inbounds if !(v isa f.types[f.i])
             @inbounds f.types[f.i] = typeof(v)
         end
         @inbounds f.data[f.i] = v

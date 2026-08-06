@@ -46,7 +46,10 @@ options):
 - `sslmode` (`"disable"`, `"prefer"` (default), `"require"`, `"verify-full"`),
   `sslrootcert`, `sslcert`, `sslkey`, `sslcapath`, and `sslservername`.
   Only `verify-full` verifies the server's certificate; `require` encrypts
-  without authenticating the server. `sslservername` overrides the TLS server
+  without authenticating the server, and the default `prefer` falls back to an
+  unencrypted connection if the server declines TLS. `sslcapath` is loaded as
+  an additional CA *file*; libpq-style hashed CA directories are not
+  supported. `sslservername` overrides the TLS server
   name when the host is a pre-resolved address — note that under
   `verify-full` this is also the name the certificate is verified against,
   so it must name the server you intend to authenticate.
@@ -372,7 +375,17 @@ Block until a `NOTIFY` message arrives on the connection (see
 return `nothing` if no message begins arriving in that window; once a message
 starts, it is always read to completion so the connection is never left parked
 mid-message. The connection lock is held while waiting, so use a dedicated
-connection for listening.
+connection for listening — that is also the only way to receive every
+notification, since notifications that arrive while the connection is busy
+with a query are delivered to
+[`notification_callback`](@ref Postgres.API.notification_callback) only during
+the phases of a query that read result data.
+
+Over TLS the poll interval bounds a read on the underlying transport rather
+than on the TLS record layer, so a record that arrives split across a poll
+boundary cannot be resumed. That is detected on the following poll and closes
+the connection with an error rather than returning corrupt data; a blocking
+wait (no `timeout`) is not affected.
 """
 function wait_for_notification(conn::Connection; timeout::Union{Real, Nothing}=nothing)
     start_time = time()
@@ -384,7 +397,10 @@ function wait_for_notification(conn::Connection; timeout::Union{Real, Nothing}=n
             else
                 remaining_s = timeout - (time() - start_time)
                 remaining_s <= 0 && return nothing
-                Int64(time_ns()) + min(NOTIFICATION_POLL_INTERVAL_NS, round(Int64, remaining_s * 1_000_000_000))
+                # clamp before converting: an Inf or very large timeout would
+                # overflow the nanosecond conversion
+                remaining_ns = remaining_s >= 10.0 ? NOTIFICATION_POLL_INTERVAL_NS : round(Int64, remaining_s * 1_000_000_000)
+                Int64(time_ns()) + min(NOTIFICATION_POLL_INTERVAL_NS, remaining_ns)
             end
             # The deadline covers only the first byte: if it expires there,
             # nothing of a message has been consumed and polling again is safe.
@@ -395,7 +411,14 @@ function wait_for_notification(conn::Connection; timeout::Union{Real, Nothing}=n
             mt = try
                 read(conn.socket, UInt8)
             catch err
-                _is_read_deadline_error(err) || rethrow()
+                if !_is_read_deadline_error(err)
+                    # the stream position is unknowable, so the connection
+                    # must never be reused (see the TLS caveat in the
+                    # docstring: a deadline that expires partway through a TLS
+                    # record surfaces here on the following poll)
+                    close(conn.socket)
+                    rethrow()
+                end
                 nothing
             finally
                 # the deadline must be cleared on every path, including a
@@ -406,28 +429,36 @@ function wait_for_notification(conn::Connection; timeout::Union{Real, Nothing}=n
             # nothing arrived within this poll interval; nothing of a message
             # has been consumed, so it is safe to loop and re-check the timeout
             mt === nothing && continue
-            # no deadline is in effect from here on, so the rest of the message
-            # is read to completion and any failure is a real one
-            len = ntoh(read(conn.socket, Int32)) - 4
-            if len < 0 || len > API.MAX_MESSAGE_LEN
+            # A byte of a message has been consumed, so from here any failure
+            # leaves the stream at an unknowable position: close the connection
+            # rather than hand back one that still looks healthy. No deadline is
+            # in effect, so the message is read to completion.
+            notification = try
+                len = ntoh(read(conn.socket, Int32)) - 4
+                (len < 0 || len > API.MAX_MESSAGE_LEN) &&
+                    throw(API.Error("invalid message length $len from server; connection protocol state is corrupted"))
+                conn.debug && @info "readheader: $(Char(mt)), $len"
+                if mt == UInt8('A')
+                    API.notificationResponse(len, conn.socket)
+                elseif mt == UInt8('N')
+                    API.notice_callback(conn.style, API.noticeResponse(len, conn.socket))
+                    nothing
+                elseif mt == UInt8('S')
+                    update_server_parameters!(conn, read(conn.socket, len))
+                    nothing
+                elseif mt == UInt8('E')
+                    throw(API.errorResponse(len, conn.socket, conn.debug))
+                else
+                    API.skipbytes!(conn.socket, len)
+                    nothing
+                end
+            catch
                 close(conn.socket)
-                throw(API.Error("invalid message length $len from server; connection protocol state is corrupted"))
+                rethrow()
             end
-            conn.debug && @info "readheader: $(Char(mt)), $len"
-            if mt == UInt8('A')
-                notification = API.notificationResponse(len, conn.socket)
+            if notification !== nothing
                 API.notification_callback(conn.style, notification)
                 return notification
-            elseif mt == UInt8('N')
-                notice = API.noticeResponse(len, conn.socket)
-                API.notice_callback(conn.style, notice)
-            elseif mt == UInt8('S')
-                buf = read(conn.socket, len)
-                update_server_parameters!(conn, buf)
-            elseif mt == UInt8('E')
-                throw(API.errorResponse(len, conn.socket, conn.debug))
-            else
-                API.skipbytes!(conn.socket, len)
             end
         end
     end

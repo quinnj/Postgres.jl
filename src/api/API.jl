@@ -683,6 +683,11 @@ function connect(host::String, port::Integer, dbname::String, user::String, @nos
     sslservername_v = sslservername::Union{String, Nothing}
     statement_timeout_v = statement_timeout::Union{Int, Nothing}
     socket = connectsocket(host, port, connect_timeout_v)
+    # Any failure from here on must close the socket: nothing else holds a
+    # reference to it, and the transport has no finalizer, so an escaping
+    # exception would leak the descriptor for the life of the process —
+    # a pool or reconnect loop against a flapping server would hit EMFILE.
+    try
     sslmode_str = sslmode_v === nothing ? "prefer" : lowercase(String(sslmode_v))
     sslmode_str == "disable" || sslmode_str == "prefer" || sslmode_str == "require" || sslmode_str == "verify-full" || throw(Error("invalid sslmode: $sslmode_str"))
     if sslmode_str != "disable"
@@ -727,6 +732,10 @@ function connect(host::String, port::Integer, dbname::String, user::String, @nos
     end
     pid, skey, server_params = waitfor(socket, debug, 'K', 'Z')
     return socket, pid, skey, server_params
+    catch
+        close(socket)
+        rethrow()
+    end
 end
 
 function prepare(socket, sql::String, debug::Bool; name::Union{Nothing, String}=nothing)

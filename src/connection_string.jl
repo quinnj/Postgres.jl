@@ -77,7 +77,28 @@ function apply_env_defaults!(values::Dict{String, String})
     return values
 end
 
+const KNOWN_PARAMS = Set([
+    "host", "port", "user", "password", "dbname", "application_name",
+    "connect_timeout", "sslmode", "sslrootcert", "sslcert", "sslkey",
+    "sslcapath", "sslservername", "statement_timeout",
+    "statement_cache_maxsize", "debug", "reconnect",
+])
+
+parse_bool_param(value::Union{String, Nothing}, default::Bool) = value === nothing ? default : lowercase(value) in ("1", "on", "true", "yes")
+
+# An unrecognized key is almost always a typo, and silently dropping it is
+# dangerous: "ssl_mode=verify-full" would leave sslmode unset and fall back to
+# an unverified connection while the caller believes otherwise. libpq errors
+# on unknown keywords for the same reason.
+function check_known_params(values::Dict{String, String})
+    for key in keys(values)
+        key in KNOWN_PARAMS || throw(ArgumentError("unrecognized connection parameter \"$key\"; recognized parameters are $(join(sort!(collect(KNOWN_PARAMS)), ", "))"))
+    end
+    return values
+end
+
 function params_from_values(values::Dict{String, String})
+    check_known_params(values)
     merged = connection_defaults()
     merge!(merged, values)
     apply_env_defaults!(merged)
@@ -86,7 +107,9 @@ function params_from_values(values::Dict{String, String})
     return ConnectionParams(
         ;
         host=get(merged, "host", "localhost"),
-        port=parse(Int, get(merged, "port", "5432")),
+        # empty values (an unset PGPORT expanded into the environment) fall
+        # back to the default rather than failing to parse
+        port=something(parse_optional_int(get(merged, "port", nothing)), 5432),
         user=user,
         password=get(merged, "password", nothing),
         dbname=dbname,
@@ -99,7 +122,9 @@ function params_from_values(values::Dict{String, String})
         sslcapath=get(merged, "sslcapath", nothing),
         sslservername=get(merged, "sslservername", nothing),
         statement_timeout=parse_optional_int(get(merged, "statement_timeout", nothing)),
-        statement_cache_maxsize=parse(Int, get(merged, "statement_cache_maxsize", "100")),
+        statement_cache_maxsize=something(parse_optional_int(get(merged, "statement_cache_maxsize", nothing)), 100),
+        debug=parse_bool_param(get(merged, "debug", nothing), false),
+        reconnect=parse_bool_param(get(merged, "reconnect", nothing), false),
     )
 end
 
@@ -204,8 +229,9 @@ function parse_uri(uri::String)
     query = String(parsed.query)
     if !isempty(query)
         params = URIs.queryparams(query)
-        for key in ("host", "port", "user", "password", "dbname", "application_name", "connect_timeout", "sslmode", "sslrootcert", "sslcert", "sslkey", "sslcapath", "sslservername", "statement_timeout", "statement_cache_maxsize")
-            haskey(params, key) && (values[key] = params[key])
+        for (key, value) in params
+            key in KNOWN_PARAMS || throw(ArgumentError("unrecognized connection parameter \"$key\" in URI"))
+            values[key] = value
         end
     end
     return params_from_values(values)
