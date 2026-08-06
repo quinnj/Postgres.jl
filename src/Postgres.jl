@@ -582,16 +582,21 @@ function cancel_query!(conn::Connection)
     skey = conn.skey
     debug = conn.debug
     sslmode = conn.sslmode
+    # If the connection actually negotiated TLS, require it for the cancel
+    # connection too, even under the permissive default — otherwise a server
+    # answering 'N' downgrades the cancel key to cleartext. Checked outside
+    # the lock deliberately: cancel_query! is called precisely when another
+    # task holds it running the query being cancelled, so a trylock-guarded
+    # check would be skipped in the case that matters. Reading the socket
+    # field unlocked matches how host/pid/skey are read below.
+    if conn.socket isa Reseau.TLS.Conn && (sslmode === nothing || lowercase(sslmode) == "prefer")
+        sslmode = "require"
+    end
     if trylock(conn.lock)
         try
             !isopen(conn.socket) && throw(PostgresInterfaceError("cannot cancel query: connection not open"))
             pid = conn.pid
             skey = conn.skey
-            # the connection actually negotiated TLS, so require it for the
-            # cancel connection too even under the permissive default
-            if conn.socket isa Reseau.TLS.Conn && (sslmode === nothing || lowercase(sslmode) == "prefer")
-                sslmode = "require"
-            end
         finally
             unlock(conn.lock)
         end

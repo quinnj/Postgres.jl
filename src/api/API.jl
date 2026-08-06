@@ -324,14 +324,20 @@ end
 # depend on a trusted peer.
 const MAX_MESSAGE_LEN = Int32(1) << 30
 
-@noinline _bad_message_length(len) =
+# A bogus length means the stream is desynchronized, so the socket must be
+# closed before throwing — callers such as describeprepared treat a surviving
+# `Error` as "the stream is clean, at ReadyForQuery" and would otherwise keep
+# using a connection whose position is unknowable.
+@noinline function _bad_message_length(socket, len)
+    close(socket)
     throw(Error("invalid message length $len from server; connection protocol state is corrupted"))
+end
 
 function readheader(socket, debug=false)
     mt = read(socket, UInt8)
     len = ntoh(read(socket, Int32)) - 4
     debug && @info "readheader: $(Char(mt)), $len"
-    (len < 0 || len > MAX_MESSAGE_LEN) && _bad_message_length(len)
+    (len < 0 || len > MAX_MESSAGE_LEN) && _bad_message_length(socket, len)
     return mt, len
 end
 
@@ -414,7 +420,7 @@ function waitfor(socket, debug::Bool, codes::Vararg{Char, N}) where {N}
                 # parameter status
                 buf = read(socket, len)
                 i = 1
-                GC.@preserve buf while i < len
+                GC.@preserve buf while i <= length(buf)
                     j = findnext(isequal(UInt8(0)), buf, i)
                     j === nothing && break
                     key = unsafe_string(pointer(buf, i), j - i)
@@ -791,7 +797,10 @@ function StructUtils.applyeach(::AbstractPostgresStyle, f, dr::DataRow)
     GC.@preserve buf begin
         nbuf >= 2 || throw(Error("truncated DataRow message from server"))
         ncols = Int(ntoh(unsafe_load(Ptr{Int16}(pointer(buf)))))
-        ncols <= length(dr.names) || throw(Error("DataRow column count exceeds the row description"))
+        # the count is signed on the wire: a negative would pass an upper-bound
+        # check and silently yield an unfilled row (UndefRefError downstream)
+        (0 <= ncols <= length(dr.names) && ncols <= length(dr.typeIds)) ||
+            throw(Error("DataRow column count does not match the row description"))
         pos = 3
         for i = 1:ncols
             # column lengths come off the wire: validate each against the
@@ -1011,6 +1020,9 @@ function copy_in(style::S, socket, query::String, source::IO, debug::Bool) where
     catch
         # bailed mid-stream: the position is unknowable, never reuse the socket
         close(socket)
+        # if the server reported an error before the connection died, surface
+        # it over the raw IO error — it explains what actually went wrong
+        error_msg === nothing || throw(error_msg)
         rethrow()
     end
     error_msg === nothing || throw(error_msg)
@@ -1066,6 +1078,7 @@ function copy_in(style::S, socket, query::String, source::IO, debug::Bool) where
     catch
         # bailed mid-stream: the position is unknowable, never reuse the socket
         close(socket)
+        error_msg === nothing || throw(error_msg)
         rethrow()
     end
     second_copy && throw(PostgresInterfaceError("copy_from supports a single COPY ... FROM STDIN statement per call"))
@@ -1116,6 +1129,7 @@ function copy_out(style::S, socket, query::String, dest::IO, debug::Bool) where 
         # bailed mid-stream (socket failure, or the user's dest IO threw):
         # the position is unknowable, never reuse the socket
         close(socket)
+        error_msg === nothing || throw(error_msg)
         rethrow()
     end
     wrong_direction && throw(PostgresInterfaceError("statement initiated COPY ... FROM STDIN; use Postgres.copy_from"))

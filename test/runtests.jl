@@ -561,6 +561,27 @@ end
         @test Postgres.API.cstring_at(UInt8['a', 0x00, 'c', 0x00], 3) == ("c", 5)
         @test Postgres.API.cstring_at(UInt8['a', 0x00], 5) == ("", 3)
 
+        # a malformed DataRow must fail with a clear protocol error rather
+        # than reading past the buffer or leaving the row partly unfilled
+        let nms = Symbol[:a, :b], tids = Int[23, 23],
+            mk = b -> Postgres.API.DataRow(b, nms, tids, registry),
+            consume = row -> StructUtils.applyeach(Postgres.API.PostgresStyle(), (k, v) -> nothing, row)
+            # ncols is signed on the wire: -1 must not pass an upper-bound check
+            @test_throws Postgres.API.Error consume(mk(UInt8[0xff, 0xff]))
+            # more columns than the row description declared
+            @test_throws Postgres.API.Error consume(mk(UInt8[0x00, 0x09]))
+            # truncated header, and a column length running past the body
+            @test_throws Postgres.API.Error consume(mk(UInt8[0x00]))
+            @test_throws Postgres.API.Error consume(mk(UInt8[0x00, 0x01, 0x00, 0x00, 0x00, 0x7f]))
+            # a well-formed row still parses, including a NULL column
+            vals = Any[]
+            consume_ok = Postgres.API.DataRow(
+                UInt8[0x00, 0x02, 0x00, 0x00, 0x00, 0x01, UInt8('5'), 0xff, 0xff, 0xff, 0xff],
+                nms, tids, registry)
+            StructUtils.applyeach(Postgres.API.PostgresStyle(), (k, v) -> push!(vals, v), consume_ok)
+            @test vals == Any[Int32(5), nothing]
+        end
+
         # escaping helpers reject embedded NULs rather than emitting SQL the
         # server would truncate mid-statement
         @test Postgres.escape_identifier("a\"b") == "\"a\"\"b\""
@@ -1274,9 +1295,14 @@ end
                     @test connection_error(ssl_cfg.host, ssl_cfg; sslmode="verify-full", sslrootcert=tls.wrongrootcert) !== nothing
 
                     # against a TLS-capable server the cancel key goes over TLS
-                    # and the request is delivered
+                    # and the request is delivered. The connection uses the
+                    # default sslmode ("prefer") but negotiates TLS, so this
+                    # also covers the cancel path upgrading itself to require
+                    # TLS — which has to happen while the query being cancelled
+                    # holds the connection lock.
                     @test Postgres.API.cancel_request(ssl_cfg.host, ssl_cfg.port, Int32(1), Int32(1), false, "require")
-                    ssl_cancel_conn = DBInterface.connect(Postgres.Connection, ssl_cfg.host, ssl_cfg.user, ssl_cfg.password; dbname=ssl_cfg.dbname, port=ssl_cfg.port, sslmode="require")
+                    ssl_cancel_conn = DBInterface.connect(Postgres.Connection, ssl_cfg.host, ssl_cfg.user, ssl_cfg.password; dbname=ssl_cfg.dbname, port=ssl_cfg.port)
+                    @test ssl_cancel_conn.socket isa Postgres.Reseau.TLS.Conn
                     try
                         ssl_task = errormonitor(Threads.@spawn begin
                             try
