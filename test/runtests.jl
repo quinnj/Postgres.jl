@@ -523,6 +523,17 @@ end
         @test_throws ArgumentError Postgres.parse_dsn("host=h ssl_mode=verify-full")
         @test_throws ArgumentError Postgres.parse_dsn("postgresql://u@h/db?ssl_mode=require")
 
+        # real libpq keywords this driver doesn't implement are accepted and
+        # ignored: providers routinely put them in the URI they hand users
+        @test Postgres.parse_dsn("postgresql://u:p@h/db?sslmode=require&channel_binding=require").sslmode == "require"
+        @test Postgres.parse_dsn("postgresql://u@h/db?target_session_attrs=read-write").dbname == "db"
+        @test Postgres.parse_dsn("host=h options=-csearch_path=x").host == "h"
+
+        # invalid values for a recognized parameter are reported against that
+        # parameter rather than silently defaulting
+        @test_throws ArgumentError Postgres.parse_dsn("host=h reconnect=ture")
+        @test_throws ArgumentError Postgres.parse_dsn("host=h port=abc")
+
         # an empty value (an unset PGPORT expanded by a process manager) falls
         # back to the default instead of failing to parse
         withenv("PGPORT" => "") do
@@ -659,8 +670,12 @@ end
         @test Postgres.API.parse_array_by_oid("[0:2]={1,2,3}", 23, registry) == [1, 2, 3]
         @test Postgres.API.parse_value(1009, "[0:1]={a,b}", registry) == ["a", "b"]
         @test Postgres.API.ArrayParsing.parse_array("[1:2][1:2]={{1,2},{3,4}}", Int64) == [[1, 2], [3, 4]]
-        # a bare '[' that isn't a dimension prefix is still treated as an array
-        @test Postgres.API.ArrayParsing.parse_array("[1,2]", Int64) == [1, 2]
+        # ']' is ordinary element data: postgres doesn't quote it, so treating
+        # it as a terminator silently truncated the element and dropped every
+        # element after it
+        @test Postgres.API.parse_array_by_oid("{a]b,x[1],plain}", 25, registry) == ["a]b", "x[1]", "plain"]
+        @test Postgres.API.parse_array_by_oid("{]}", 25, registry) == ["]"]
+        @test Postgres.API.parse_array_by_oid("{/var/log/x[1].txt,b}", 25, registry) == ["/var/log/x[1].txt", "b"]
 
         @test Postgres.API.ArrayParsing.parse_array("{1,2}", Int64) isa Vector{Int64}
 
@@ -862,6 +877,19 @@ end
                     @test ismissing(row.nullable_text)
                 @test row.int_array == expected[23]
                 @test eltype(row.int_array) == Int32
+                # a column mixing null-free and null-bearing arrays must report
+                # a schema type every row satisfies, whatever the row order
+                for order in ("'{1,2}'::int[]), ('{1,NULL}'::int[]), ('{3,4}'::int[]",
+                              "'{1,NULL}'::int[]), ('{1,2}'::int[]), ('{3,4}'::int[]")
+                    mixed = DBInterface.execute(conn, "SELECT a FROM (VALUES ($order)) t(a)")
+                    schema_type = Tables.schema(mixed).types[1]
+                    @test all(row -> Tables.getcolumn(row, 1) isa schema_type, mixed)
+                    @test length(Tables.columntable(mixed).a) == 3
+                end
+                # a text array element containing ']' must survive the round trip
+                bracket_param = ["a]b", "x[1]", "]", "plain"]
+                bracket_row = only(Tables.rowtable(DBInterface.execute(conn, raw"SELECT $1::text[] AS arr", (bracket_param,))))
+                @test bracket_row.arr == bracket_param
                 array_row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT '{1,NULL,3}'::int[] AS arr")))
                 @test isequal(array_row.arr, Union{Missing, Int32}[1, missing, 3])
                 nested_row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT '{{1,2},{3,4}}'::int[] AS arr")))

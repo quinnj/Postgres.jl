@@ -433,7 +433,11 @@ function wait_for_notification(conn::Connection; timeout::Union{Real, Nothing}=n
             # leaves the stream at an unknowable position: close the connection
             # rather than hand back one that still looks healthy. No deadline is
             # in effect, so the message is read to completion.
-            notification = try
+            # Read the message off the socket. Only the reading is guarded:
+            # once a message is fully consumed the stream is back at a clean
+            # boundary, so user callbacks and server errors are surfaced
+            # without destroying the connection.
+            message = try
                 len = ntoh(read(conn.socket, Int32)) - 4
                 (len < 0 || len > API.MAX_MESSAGE_LEN) &&
                     throw(API.Error("invalid message length $len from server; connection protocol state is corrupted"))
@@ -441,13 +445,12 @@ function wait_for_notification(conn::Connection; timeout::Union{Real, Nothing}=n
                 if mt == UInt8('A')
                     API.notificationResponse(len, conn.socket)
                 elseif mt == UInt8('N')
-                    API.notice_callback(conn.style, API.noticeResponse(len, conn.socket))
-                    nothing
+                    API.noticeResponse(len, conn.socket)
                 elseif mt == UInt8('S')
                     update_server_parameters!(conn, read(conn.socket, len))
                     nothing
                 elseif mt == UInt8('E')
-                    throw(API.errorResponse(len, conn.socket, conn.debug))
+                    API.errorResponse(len, conn.socket, conn.debug)
                 else
                     API.skipbytes!(conn.socket, len)
                     nothing
@@ -456,9 +459,13 @@ function wait_for_notification(conn::Connection; timeout::Union{Real, Nothing}=n
                 close(conn.socket)
                 rethrow()
             end
-            if notification !== nothing
-                API.notification_callback(conn.style, notification)
-                return notification
+            if message isa API.Notification
+                API.notification_callback(conn.style, message)
+                return message
+            elseif message isa API.Error
+                throw(message)
+            elseif message !== nothing
+                API.notice_callback(conn.style, message)
             end
         end
     end

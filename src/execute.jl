@@ -166,8 +166,25 @@ function DBInterface.close!(stmt::Statement)
     return
 end
 
+# Finish the transaction a cursor opened for itself. If the connection died,
+# clear the bookkeeping directly rather than trying to COMMIT: leaving
+# in_transaction set would make checkconn refuse to reconnect forever, and the
+# server-side transaction is already gone with the session.
+function finish_cursor_transaction!(conn::Connection)
+    if !isopen(conn)
+        @lock conn.lock begin
+            conn.in_transaction = false
+            conn.transaction_depth = 0
+        end
+        return
+    end
+    in_transaction(conn) && commit(conn)
+    return
+end
+
 function DBInterface.close!(cursor::Cursor)
     owns_transaction = cursor.owns_transaction
+    closed_cleanly = false
     try
         @lock cursor.conn.lock begin
             if !cursor.done
@@ -177,14 +194,19 @@ function DBInterface.close!(cursor::Cursor)
             cursor.done = true
             empty!(cursor.buffer)
         end
+        closed_cleanly = true
     finally
-        # close the transaction this cursor opened even if closing the portal
-        # failed: leaving in_transaction set would block reconnects forever
-        if owns_transaction && isopen(cursor.conn) && in_transaction(cursor.conn)
-            try
-                commit(cursor.conn)
-            catch
-                # the connection is already failing; don't mask the original error
+        if owns_transaction
+            if closed_cleanly
+                # a COMMIT failure here means the caller's writes did not land,
+                # so it must propagate rather than be swallowed
+                finish_cursor_transaction!(cursor.conn)
+            else
+                try
+                    finish_cursor_transaction!(cursor.conn)
+                catch
+                    # already unwinding; don't mask the original error
+                end
             end
         end
     end
@@ -271,9 +293,11 @@ end
     else
         # the OID-derived column type is a default; widen the schema whenever
         # the parsed value doesn't fit it (nullable or nested array elements,
-        # values from a custom parser), so Tables.schema stays truthful
+        # values from a custom parser), so Tables.schema stays truthful.
+        # Widening must be monotone — replacing would let a later row narrow
+        # the schema back to a type earlier rows don't satisfy.
         @inbounds if !(v isa f.types[f.i])
-            @inbounds f.types[f.i] = typeof(v)
+            @inbounds f.types[f.i] = Union{f.types[f.i], typeof(v)}
         end
         @inbounds f.data[f.i] = v
     end

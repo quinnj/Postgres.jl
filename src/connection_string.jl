@@ -43,10 +43,12 @@ end
 
 default_user() = get(ENV, "PGUSER", get(ENV, "USER", get(ENV, "USERNAME", "")))
 
-function parse_optional_int(value::Union{String, Nothing})
+function parse_optional_int(value::Union{String, Nothing}, key::String="")
     value === nothing && return nothing
     isempty(value) && return nothing
-    return parse(Int, value)
+    parsed = tryparse(Int, value)
+    parsed === nothing && throw(ArgumentError("invalid value \"$value\" for connection parameter \"$key\"; expected an integer"))
+    return parsed
 end
 
 function connection_defaults()
@@ -84,7 +86,26 @@ const KNOWN_PARAMS = Set([
     "statement_cache_maxsize", "debug", "reconnect",
 ])
 
-parse_bool_param(value::Union{String, Nothing}, default::Bool) = value === nothing ? default : lowercase(value) in ("1", "on", "true", "yes")
+# libpq keywords this driver doesn't implement. They are accepted and ignored
+# rather than rejected: managed-PostgreSQL providers routinely include them in
+# the connection URI they hand users, and failing on a DSN that names a real
+# libpq option would be worse than not honoring it.
+const IGNORED_PARAMS = Set([
+    "channel_binding", "target_session_attrs", "options", "gssencmode",
+    "gsslib", "krbsrvname", "sslnegotiation", "sslcompression", "sslcrl",
+    "sslcrldir", "sslpassword", "requiressl", "requirepeer", "hostaddr",
+    "client_encoding", "passfile", "service", "fallback_application_name",
+    "keepalives", "keepalives_idle", "keepalives_interval", "keepalives_count",
+    "tcp_user_timeout", "load_balance_hosts", "replication",
+])
+
+function parse_bool_param(value::Union{String, Nothing}, default::Bool, key::String)
+    value === nothing && return default
+    lowered = lowercase(value)
+    lowered in ("1", "on", "true", "yes") && return true
+    lowered in ("0", "off", "false", "no") && return false
+    throw(ArgumentError("invalid value \"$value\" for connection parameter \"$key\"; expected a boolean (on/off, true/false, yes/no, 1/0)"))
+end
 
 # An unrecognized key is almost always a typo, and silently dropping it is
 # dangerous: "ssl_mode=verify-full" would leave sslmode unset and fall back to
@@ -92,7 +113,8 @@ parse_bool_param(value::Union{String, Nothing}, default::Bool) = value === nothi
 # on unknown keywords for the same reason.
 function check_known_params(values::Dict{String, String})
     for key in keys(values)
-        key in KNOWN_PARAMS || throw(ArgumentError("unrecognized connection parameter \"$key\"; recognized parameters are $(join(sort!(collect(KNOWN_PARAMS)), ", "))"))
+        (key in KNOWN_PARAMS || key in IGNORED_PARAMS) ||
+            throw(ArgumentError("unrecognized connection parameter \"$key\"; recognized parameters are $(join(sort!(collect(KNOWN_PARAMS)), ", "))"))
     end
     return values
 end
@@ -109,22 +131,22 @@ function params_from_values(values::Dict{String, String})
         host=get(merged, "host", "localhost"),
         # empty values (an unset PGPORT expanded into the environment) fall
         # back to the default rather than failing to parse
-        port=something(parse_optional_int(get(merged, "port", nothing)), 5432),
+        port=something(parse_optional_int(get(merged, "port", nothing), "port"), 5432),
         user=user,
         password=get(merged, "password", nothing),
         dbname=dbname,
         application_name=get(merged, "application_name", nothing),
-        connect_timeout=parse_optional_int(get(merged, "connect_timeout", nothing)),
+        connect_timeout=parse_optional_int(get(merged, "connect_timeout", nothing), "connect_timeout"),
         sslmode=haskey(merged, "sslmode") ? lowercase(merged["sslmode"]) : nothing,
         sslrootcert=get(merged, "sslrootcert", nothing),
         sslcert=get(merged, "sslcert", nothing),
         sslkey=get(merged, "sslkey", nothing),
         sslcapath=get(merged, "sslcapath", nothing),
         sslservername=get(merged, "sslservername", nothing),
-        statement_timeout=parse_optional_int(get(merged, "statement_timeout", nothing)),
-        statement_cache_maxsize=something(parse_optional_int(get(merged, "statement_cache_maxsize", nothing)), 100),
-        debug=parse_bool_param(get(merged, "debug", nothing), false),
-        reconnect=parse_bool_param(get(merged, "reconnect", nothing), false),
+        statement_timeout=parse_optional_int(get(merged, "statement_timeout", nothing), "statement_timeout"),
+        statement_cache_maxsize=something(parse_optional_int(get(merged, "statement_cache_maxsize", nothing), "statement_cache_maxsize"), 100),
+        debug=parse_bool_param(get(merged, "debug", nothing), false, "debug"),
+        reconnect=parse_bool_param(get(merged, "reconnect", nothing), false, "reconnect"),
     )
 end
 
@@ -230,8 +252,10 @@ function parse_uri(uri::String)
     if !isempty(query)
         params = URIs.queryparams(query)
         for (key, value) in params
-            key in KNOWN_PARAMS || throw(ArgumentError("unrecognized connection parameter \"$key\" in URI"))
-            values[key] = value
+            (key in KNOWN_PARAMS || key in IGNORED_PARAMS) ||
+                throw(ArgumentError("unrecognized connection parameter \"$key\" in URI; recognized parameters are $(join(sort!(collect(KNOWN_PARAMS)), ", "))"))
+            # keys we accept but don't implement must not reach params_from_values
+            key in KNOWN_PARAMS && (values[key] = value)
         end
     end
     return params_from_values(values)

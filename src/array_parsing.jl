@@ -50,7 +50,12 @@ function parse_unquoted(code::Base.CodeUnits{UInt8, String}, pos::Ref{Int})
     buf = UInt8[]
     while pos[] <= length(code)
         c = code[pos[]]
-        if c == COMMA || c == BRACE_CLOSE || c == BRACKET_CLOSE
+        # ']' is NOT a terminator: postgres only quotes elements containing
+        # '"', '\\', '{', '}', ',' or whitespace, so an unquoted ']' (file
+        # paths, "x[1]", embedded JSON) is ordinary element data. Treating it
+        # as a terminator silently truncated the element and dropped every
+        # element after it.
+        if c == COMMA || c == BRACE_CLOSE
             break
         elseif c == BACKSLASH
             pos[] += 1
@@ -130,7 +135,7 @@ end
 
 function parse_array_value(code::Base.CodeUnits{UInt8, String}, pos::Ref{Int}, inner_type::Type{T}) where {T}
     c = code[pos[]]
-    if c == BRACE_OPEN || c == BRACKET_OPEN
+    if c == BRACE_OPEN
         return parse_array_inner(code, pos, inner_type)
     elseif c == QUOTE
         token = parse_quoted(code, pos)
@@ -148,7 +153,7 @@ function parse_array_inner(code::Base.CodeUnits{UInt8, String}, pos::Ref{Int}, i
         skip_ws(code, pos)
         pos[] > length(code) && break
         c = code[pos[]]
-        if c == BRACE_CLOSE || c == BRACKET_CLOSE
+        if c == BRACE_CLOSE
             pos[] += 1
             break
         end
@@ -203,7 +208,7 @@ function parse_array(str::String, inner_type::Type{T}) where {T}
         return inner_type[]
     end
     c = code[pos[]]
-    if c == BRACE_OPEN || c == BRACKET_OPEN
+    if c == BRACE_OPEN
         return parse_array_inner(code, pos, inner_type)
     end
     value = parse_scalar(str, inner_type, true)
