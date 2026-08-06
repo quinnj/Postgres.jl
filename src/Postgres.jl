@@ -44,8 +44,12 @@ options):
 - `dbname`, `port`, `application_name`
 - `connect_timeout` (seconds), `statement_timeout` (milliseconds)
 - `sslmode` (`"disable"`, `"prefer"` (default), `"require"`, `"verify-full"`),
-  `sslrootcert`, `sslcert`, `sslkey`, `sslcapath`, and `sslservername`
-  (TLS SNI override for pre-resolved hosts)
+  `sslrootcert`, `sslcert`, `sslkey`, `sslcapath`, and `sslservername`.
+  Only `verify-full` verifies the server's certificate; `require` encrypts
+  without authenticating the server. `sslservername` overrides the TLS server
+  name when the host is a pre-resolved address — note that under
+  `verify-full` this is also the name the certificate is verified against,
+  so it must name the server you intend to authenticate.
 - `statement_cache_maxsize`: LRU prepared-statement cache size (default 100; `0` disables)
 - `reconnect`: automatically reconnect and re-prepare statements if the
   connection is found dead (default `false`; never reconnects mid-transaction)
@@ -249,12 +253,16 @@ function set_statement_timeout!(conn::Connection, timeout::Union{Integer, Nothin
     return conn
 end
 
+@noinline _reject_nul(what::String) = throw(PostgresInterfaceError("$what cannot contain a NUL byte"))
+
 """
     Postgres.escape_identifier(name) -> String
 
-Quote a string for use as a SQL identifier (double-quoted, embedded quotes doubled).
+Quote a string for use as a SQL identifier (double-quoted, embedded quotes
+doubled). Throws if `name` contains a NUL byte.
 """
 function escape_identifier(name::AbstractString)
+    occursin('\0', name) && _reject_nul("identifier")
     return string("\"", replace(name, "\"" => "\"\""), "\"")
 end
 
@@ -262,10 +270,17 @@ end
     Postgres.escape_literal(val) -> String
 
 Quote a string for use as a SQL literal (single-quoted, embedded quotes
-doubled). Prefer query parameters (`\$1`, `\$2`, ...) over literal interpolation
-whenever possible.
+doubled). Throws if `val` contains a NUL byte.
+
+Prefer query parameters (`\$1`, `\$2`, ...) over literal interpolation
+whenever possible — parameters are never parsed as SQL. This helper assumes
+the server's `standard_conforming_strings` is `on` (the default since
+PostgreSQL 9.1); with it turned off, backslashes in the literal are escape
+characters and doubling quotes alone is not sufficient to make interpolation
+safe.
 """
 function escape_literal(val::AbstractString)
+    occursin('\0', val) && _reject_nul("literal")
     return string("'", replace(val, "'" => "''"), "'")
 end
 
@@ -551,6 +566,9 @@ Send a PostgreSQL CancelRequest for the query currently running on `conn`
 (over a separate, short-lived connection, so it works while `conn` is busy).
 The cancelled query fails with a [`Postgres.Error`](@ref Postgres.API.Error)
 with SQLSTATE `57014`.
+
+The cancel connection uses the same TLS settings as `conn`, since the cancel
+key it carries is a credential.
 """
 function cancel_query!(conn::Connection)
     host = conn.host
@@ -567,7 +585,7 @@ function cancel_query!(conn::Connection)
             unlock(conn.lock)
         end
     end
-    API.cancel_request(host, port, pid, skey, debug)
+    API.cancel_request(host, port, pid, skey, debug, conn.sslmode, conn.sslrootcert, conn.sslcert, conn.sslkey, conn.sslcapath, conn.sslservername, conn.connect_timeout)
     return conn
 end
 

@@ -546,6 +546,23 @@ end
         @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric("NaN")
         @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric("Infinity")
         @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric("-Infinity")
+        # an absurd exponent must be rejected, not turned into a huge BigInt
+        @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric("1e999999999999")
+
+        # message-field parsing is bounded by the buffer actually received: a
+        # truncated or unterminated field must not read past the allocation
+        @test Postgres.API.cstring_at(UInt8[], 1) == ("", 1)
+        @test Postgres.API.cstring_at(UInt8['a', 'b', 0x00], 1) == ("ab", 4)
+        @test Postgres.API.cstring_at(UInt8['a', 'b'], 1) == ("ab", 3)
+        @test Postgres.API.cstring_at(UInt8['a', 0x00, 'c', 0x00], 3) == ("c", 5)
+        @test Postgres.API.cstring_at(UInt8['a', 0x00], 5) == ("", 3)
+
+        # escaping helpers reject embedded NULs rather than emitting SQL the
+        # server would truncate mid-statement
+        @test Postgres.escape_identifier("a\"b") == "\"a\"\"b\""
+        @test Postgres.escape_literal("a'b") == "'a''b'"
+        @test_throws Postgres.PostgresInterfaceError Postgres.escape_identifier("a\0b")
+        @test_throws Postgres.PostgresInterfaceError Postgres.escape_literal("a\0b")
 
         @test Postgres.API.parse_value(1184, "2024-02-13 05:28:17+02", registry) == DateTime(2024, 2, 13, 3, 28, 17)
         @test Postgres.API.parse_value(1184, "2024-02-13 05:28:17+02:30", registry) == DateTime(2024, 2, 13, 2, 58, 17)
@@ -1203,6 +1220,11 @@ end
                     @test result isa Postgres.API.Error
                     @test result.code == "57014"
                     DBInterface.close!(cancel_conn)
+
+                    # the cancel key must never go out in the clear when the
+                    # connection it cancels required TLS
+                    @test !Postgres.API.cancel_request(cfg.host, cfg.port, Int32(1), Int32(1), false, "require")
+                    @test !Postgres.API.cancel_request(cfg.host, cfg.port, Int32(1), Int32(1), false, "verify-full")
                 end
 
                 @testset "Interval Types" begin

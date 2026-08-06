@@ -17,8 +17,8 @@ Postgres.jl accepts DSN strings or PostgreSQL URIs and supports:
 
 - libpq-style keyword strings such as `host=127.0.0.1 port=5432 user=postgres dbname=postgres`.
 - Environment defaults from `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGAPPNAME`, `PGCONNECT_TIMEOUT`, and TLS-related `PGSSL*` variables.
-- `sslmode` values: `disable`, `prefer`, `require`, `verify-full` (only `verify-full` verifies certificates).
-- TLS files: `sslrootcert`, `sslcert`, `sslkey`, `sslcapath`; `sslservername` overrides the TLS SNI hostname when connecting to a pre-resolved address.
+- `sslmode` values: `disable`, `prefer`, `require`, `verify-full`. Only `verify-full` verifies the server's certificate; `require` encrypts without authenticating the server.
+- TLS files: `sslrootcert`, `sslcert`, `sslkey`, `sslcapath`. `sslservername` overrides the TLS server name when connecting to a pre-resolved address; under `verify-full` it is also the name the certificate is verified against, so it must name the server you intend to authenticate.
 - `connect_timeout` (seconds), `statement_timeout` (milliseconds).
 - `application_name` and `statement_cache_maxsize`.
 

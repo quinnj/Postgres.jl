@@ -12,6 +12,11 @@ behavior interface on it:
     Postgres.notice_callback(::MyStyle, notice) = ...
     Postgres.notification_callback(::MyStyle, notification) = ...
 
+`query_logger`'s `info` carries the SQL and the bound parameter values, so a
+logger that writes them out will record whatever sensitive data those queries
+carry — redact or omit `info.params` if the log is not as trusted as the
+database.
+
 Custom styles inherit the default row-materialization traits (lift/structlike/...),
 which dispatch on `AbstractPostgresStyle`, and are used as the StructUtils style when
 materializing query results — so `StructUtils.lift` overloads on a custom style apply
@@ -346,6 +351,10 @@ function parse_numeric(val::String)
     exp_val = 0
     if exp_index !== nothing
         exp_val = parse(Int, stripped[exp_index + 1:end])
+        # postgres numeric tops out at 16383 digits either side of the point;
+        # bound the exponent so a bogus value can't drive an enormous BigInt
+        # scaling below
+        abs(exp_val) <= 100_000 || throw(PostgresInterfaceError("postgres numeric exponent out of range: $stripped"))
         stripped = stripped[1:exp_index - 1]
     end
     parts = split(stripped, '.'; limit=2)

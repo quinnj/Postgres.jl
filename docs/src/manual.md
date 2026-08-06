@@ -127,6 +127,8 @@ Postgres.notification_callback(::LoggingStyle, notification) = @info "notificati
 conn = DBInterface.connect(Postgres.Connection, "host=127.0.0.1 user=postgres dbname=postgres"; style=LoggingStyle())
 ```
 
+`query_logger`'s `info` includes the SQL and the bound parameter values, so a logger that writes them out records whatever sensitive data those queries carry. Redact or omit `info.params` when the log destination is less trusted than the database itself.
+
 ```@docs
 Postgres.AbstractPostgresStyle
 Postgres.PostgresStyle

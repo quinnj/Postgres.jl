@@ -70,6 +70,21 @@ function Base.showerror(io::IO, e::Error)
     return
 end
 
+# Read a NUL-terminated string from `buf` starting at `pos`, bounded by the
+# buffer's actual length: `read` returns a short buffer at EOF, and a hostile
+# or failing server can send an unterminated or truncated field, so an
+# unbounded scan (plain `unsafe_string(pointer(buf, pos))`) would read past
+# the allocation. Returns (string, next_pos).
+function cstring_at(buf::Vector{UInt8}, pos::Int)
+    n = length(buf)
+    pos > n && return "", n + 1
+    stop = findnext(isequal(UInt8(0)), buf, pos)
+    if stop === nothing
+        return GC.@preserve(buf, unsafe_string(pointer(buf, pos), n - pos + 1)), n + 1
+    end
+    return GC.@preserve(buf, unsafe_string(pointer(buf, pos), stop - pos)), stop + 1
+end
+
 function errorResponse(len, socket, debug)
     buf = read(socket, len)
     # parse error fields
@@ -91,11 +106,12 @@ function errorResponse(len, socket, debug)
     file = nothing
     line = nothing
     routine = nothing
-    GC.@preserve buf while i < len
+    while i <= length(buf)
         ccode = Char(buf[i])
+        # the field list is terminated by a zero byte
+        ccode == '\0' && break
         i += 1
-        val = unsafe_string(pointer(buf, i))
-        i += sizeof(val) + 1
+        val, i = cstring_at(buf, i)
         if ccode == 'S'
             severity = val
         elseif ccode == 'C'
@@ -141,11 +157,11 @@ function noticeResponse(len, socket)
     buf = read(socket, len)
     i = 1
     notice = Dict{String, String}()
-    GC.@preserve buf while i < length(buf)
+    while i <= length(buf)
         ccode = Char(buf[i])
+        ccode == '\0' && break
         i += 1
-        val = unsafe_string(pointer(buf, i))
-        i += sizeof(val) + 1
+        val, i = cstring_at(buf, i)
         notice[string(ccode)] = val
     end
     return notice
@@ -158,11 +174,8 @@ function notificationResponse(len, socket)
     channel = ""
     payload = ""
     if !isempty(buf)
-        GC.@preserve buf begin
-            channel = unsafe_string(pointer(buf, i))
-            i += sizeof(channel) + 1
-            i <= length(buf) && (payload = unsafe_string(pointer(buf, i)))
-        end
+        channel, i = cstring_at(buf, i)
+        i <= length(buf) && ((payload, i) = cstring_at(buf, i))
     end
     return Notification(pid, channel, payload)
 end
@@ -510,7 +523,11 @@ function authRequest(debug, len, socket, user, password, client::Union{Nothing, 
         client = SASLAuth.SCRAMSHA256Client(user, password)
         msg, _ = SASLAuth.step!(client, nothing)
         bytes = Vector{UInt8}(msg)
-        writemessage(socket, debug, 'p', "SCRAM-SHA-256", Int32(length(bytes)), bytes)
+        # SASL messages carry the client nonce and (in the client-final message)
+        # the client proof, from which the password is brute-forcible offline:
+        # write them with debug=false and log a redacted line instead
+        debug && @info "sending message: p, (SASL initial response redacted)"
+        writemessage(socket, false, 'p', "SCRAM-SHA-256", Int32(length(bytes)), bytes)
         mt, len = readheader(socket, debug)
         expect_auth_message(socket, debug, mt, len)
         return authRequest(debug, len, socket, user, password, client)
@@ -518,7 +535,8 @@ function authRequest(debug, len, socket, user, password, client::Union{Nothing, 
         # SASL Challenge
         challenge = String(read(socket, len - 4))
         msg, _ = SASLAuth.step!(client, challenge)
-        writemessage(socket, debug, 'p', Vector{UInt8}(msg))
+        debug && @info "sending message: p, (SASL response redacted)"
+        writemessage(socket, false, 'p', Vector{UInt8}(msg))
         mt, len = readheader(socket, debug)
         expect_auth_message(socket, debug, mt, len)
         return authRequest(debug, len, socket, user, password, client)
@@ -712,20 +730,19 @@ function describeprepared(socket, name::String, debug::Bool)
         ncols = Int(ntoh(read(socket, Int16)))
         buf = read(socket, len - 2)
         i = 1
-        GC.@preserve buf while i < len - 2
-            ptr = pointer(buf, i)
-            plen = Int(@ccall strlen(ptr::Ptr{Cvoid})::Csize_t)
-            name = _symbol(ptr, plen)
-            i += plen + 1
-            i += 4 # skip table oid
-            i += 2 # skip column number
-            typeId = Int(ntoh(unsafe_load(Ptr{Int32}(pointer(buf, i)))))
+        # each field: name (cstring), table oid (4), column number (2),
+        # type oid (4), type length (2), type modifier (4), format code (2).
+        # All offsets are bounds-checked against the buffer actually received:
+        # a short read or a malformed RowDescription must not read past it.
+        GC.@preserve buf while i <= length(buf)
+            stop = findnext(isequal(UInt8(0)), buf, i)
+            stop === nothing && break
+            name = _symbol(pointer(buf, i), stop - i)
+            i = stop + 1
+            i + 17 <= length(buf) || break
+            typeId = Int(ntoh(unsafe_load(Ptr{Int32}(pointer(buf, i + 6)))))
+            i += 18
             push!(types, typeId)
-            i += 4
-            i += 2 # skip type length
-            # typeModifier = Int(ntoh(unsafe_load(Ptr{Int32}(pointer(buf, i)))))
-            i += 4
-            i += 2 # skip format code
             push!(cols, name)
         end
         waitfor(socket, debug, 'Z')
@@ -755,16 +772,23 @@ end
 
 function StructUtils.applyeach(::AbstractPostgresStyle, f, dr::DataRow)
     buf = dr.buf
+    nbuf = length(buf)
     GC.@preserve buf begin
+        nbuf >= 2 || throw(Error("truncated DataRow message from server"))
         ncols = Int(ntoh(unsafe_load(Ptr{Int16}(pointer(buf)))))
+        ncols <= length(dr.names) || throw(Error("DataRow column count exceeds the row description"))
         pos = 3
         for i = 1:ncols
+            # column lengths come off the wire: validate each against the
+            # message actually received before reading the value
+            pos + 3 <= nbuf || throw(Error("truncated DataRow message from server"))
             len = Int(ntoh(unsafe_load(Ptr{Int32}(pointer(buf, pos)))))
             pos += 4
             if len == -1
                 # null
                 f(dr.names[i], nothing)
             else
+                (len >= 0 && pos + len - 1 <= nbuf) || throw(Error("truncated DataRow message from server"))
                 str = unsafe_string(pointer(buf, pos), len)
                 pos += len
                 @inbounds applycast(f, dr.names[i], dr.typeIds[i], str, dr.type_registry)
@@ -788,7 +812,8 @@ end
 function commandComplete(len, socket)
     buf = read(socket, len)
     isempty(buf) && return ""
-    return GC.@preserve buf unsafe_string(pointer(buf))
+    tag, _ = cstring_at(buf, 1)
+    return tag
 end
 
 function rows_affected_from_command_tag(tag::String)
@@ -1090,9 +1115,36 @@ function close_statement(socket, name::String, debug::Bool)
     return
 end
 
-function cancel_request(host::String, port::Int, pid::Int32, skey::Int32, debug::Bool=false)
-    socket = connectsocket(host, port)
+# The cancel key is a credential: anyone holding it can cancel that backend's
+# queries for the life of the connection, so the CancelRequest goes over TLS
+# whenever the connection it cancels uses TLS.
+function cancel_request(host::String, port::Int, pid::Int32, skey::Int32, debug::Bool=false,
+                        @nospecialize(sslmode::Union{String, Nothing}=nothing),
+                        @nospecialize(sslrootcert::Union{String, Nothing}=nothing),
+                        @nospecialize(sslcert::Union{String, Nothing}=nothing),
+                        @nospecialize(sslkey::Union{String, Nothing}=nothing),
+                        @nospecialize(sslcapath::Union{String, Nothing}=nothing),
+                        @nospecialize(sslservername::Union{String, Nothing}=nothing),
+                        @nospecialize(connect_timeout::Union{Int, Nothing}=nothing))
+    sslmode_v = sslmode::Union{String, Nothing}
+    connect_timeout_v = connect_timeout::Union{Int, Nothing}
+    socket = connectsocket(host, port, connect_timeout_v)
     try
+        sslmode_str = sslmode_v === nothing ? "prefer" : lowercase(String(sslmode_v))
+        if sslmode_str != "disable"
+            writemessage(socket, debug, '\0', Int32(80877103))
+            mt = read(socket, UInt8)
+            if mt == UInt8('S')
+                socket = tlsupgrade(socket, connect_timeout_v,
+                                    sslservername isa String ? sslservername::String : host,
+                                    sslmode_str == "verify-full",
+                                    sslcert::Union{String, Nothing}, sslkey::Union{String, Nothing},
+                                    sslrootcert::Union{String, Nothing}, sslcapath::Union{String, Nothing})
+            elseif sslmode_str == "require" || sslmode_str == "verify-full"
+                # never send the cancel key in the clear when TLS was required
+                return false
+            end
+        end
         buf = IOBuffer(Vector{UInt8}(undef, 16); write=true)
         write(buf, hton(Int32(16)))
         write(buf, hton(Int32(80877102)))  # CancelRequest code
