@@ -1518,10 +1518,29 @@ end
                     # the system catalogs
                     cat_rows = Tables.rowtable(DBInterface.execute(conn, "SELECT attidentity FROM pg_attribute LIMIT 5"))
                     @test length(cat_rows) == 5
-                    # the session pins ISO dates and postgres intervals, so a
-                    # server default of something else can't break parsing
-                    @test Postgres.get_server_parameter(conn, "DateStyle") == "ISO, MDY"
-                    @test Postgres.get_server_parameter(conn, "IntervalStyle") == "postgres"
+                    # the session uses ISO dates and postgres intervals, which
+                    # the text parsers require
+                    style_row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT current_setting('DateStyle') AS ds, current_setting('IntervalStyle') AS is")))
+                    @test startswith(style_row.ds, "ISO")
+                    @test style_row.is == "postgres"
+
+                    # a server whose default is not ISO is corrected at connect
+                    # rather than silently producing unparseable dates
+                    DBInterface.execute(conn, "ALTER DATABASE $(cfg.dbname) SET DateStyle = 'German, DMY'")
+                    DBInterface.execute(conn, "ALTER DATABASE $(cfg.dbname) SET IntervalStyle = 'sql_standard'")
+                    try
+                        german_conn = DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, cfg.password; dbname=cfg.dbname, port=cfg.port)
+                        try
+                            row = only(Tables.rowtable(DBInterface.execute(german_conn, "SELECT '2020-03-04 05:06:07'::timestamp AS t, '1 day'::interval AS i")))
+                            @test row.t == DateTime(2020, 3, 4, 5, 6, 7)
+                            @test row.i == Dates.Day(1)
+                        finally
+                            DBInterface.close!(german_conn)
+                        end
+                    finally
+                        DBInterface.execute(conn, "ALTER DATABASE $(cfg.dbname) RESET DateStyle")
+                        DBInterface.execute(conn, "ALTER DATABASE $(cfg.dbname) RESET IntervalStyle")
+                    end
                 end
 
                 @testset "Interval Types" begin

@@ -281,14 +281,7 @@ function writestartupmessage(
     application_name::Union{Nothing, String},
     statement_timeout::Union{Nothing, Int},
 )::Nothing
-    # The text-format date/time parsers only understand ISO dates and
-    # postgres-style intervals, so pin them for the session: a server or role
-    # configured with a different DateStyle/IntervalStyle would otherwise send
-    # values that decode into silently wrong dates or fail with an error that
-    # points nowhere near the cause.
-    timeout_options = statement_timeout === nothing ?
-        "-c DateStyle=ISO,MDY -c IntervalStyle=postgres" :
-        string("-c DateStyle=ISO,MDY -c IntervalStyle=postgres -c statement_timeout=", statement_timeout)
+    timeout_options = statement_timeout === nothing ? nothing : string("-c statement_timeout=", statement_timeout)
     len = 8 + msgsizeof(("user", user)) + msgsizeof(("database", dbname)) + 1
     application_name !== nothing && (len += msgsizeof(("application_name", application_name)))
     timeout_options !== nothing && (len += msgsizeof(("options", timeout_options)))
@@ -751,11 +744,32 @@ function connect(host::String, port::Integer, dbname::String, user::String, @nos
         close_and_throw(socket, Error("server version too old"))
     end
     pid, skey, server_params = waitfor(socket, debug, 'K', 'Z')
+    # socket-union isa split so the call resolves under --trim, as above
+    if socket isa Reseau.TCP.Conn
+        align_session_formats!(socket::Reseau.TCP.Conn, server_params, debug)
+    else
+        align_session_formats!(socket::Reseau.TLS.Conn, server_params, debug)
+    end
     return socket, pid, skey, server_params
     catch
         close(socket)
         rethrow()
     end
+end
+
+# The text-format parsers only understand ISO dates and postgres-style
+# intervals; against any other setting values decode into silently wrong dates
+# or fail with an error that points nowhere near the cause. The server reports
+# both in its startup ParameterStatus, so correct them only when they actually
+# differ: a default server pays nothing, and no extra startup parameters are
+# sent (poolers such as pgbouncer reject `options` unless it is allowlisted).
+function align_session_formats!(socket, server_params::Dict{String, String}, debug::Bool)
+    datestyle = get(server_params, "DateStyle", "")
+    startswith(datestyle, "ISO") || exec(PostgresStyle(), socket, "SET DateStyle = 'ISO, MDY'", debug)
+    intervalstyle = get(server_params, "IntervalStyle", "")
+    (isempty(intervalstyle) || intervalstyle == "postgres") ||
+        exec(PostgresStyle(), socket, "SET IntervalStyle = 'postgres'", debug)
+    return
 end
 
 function prepare(socket, sql::String, debug::Bool; name::Union{Nothing, String}=nothing)
