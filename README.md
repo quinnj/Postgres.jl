@@ -226,3 +226,10 @@ DBInterface.close!(pool)
 ## Errors and cancellation
 
 `Postgres.Error` represents server errors and includes SQLSTATE codes; `Postgres.PostgresInterfaceError` covers client-side failures. Use `Postgres.cancel_query!(conn)` to send a CancelRequest to the server.
+
+## Development disclosure
+
+The 1.0 release preparation used Claude Code and OpenAI Codex for implementation
+assistance and adversarial review. Maintainer decisions, source history, review
+discussion, and validation results are recorded in
+[pull request #5](https://github.com/JuliaDatabases/Postgres.jl/pull/5).
