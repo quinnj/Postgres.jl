@@ -61,6 +61,14 @@ struct Int8Row
     s::String
 end
 
+# user-IO failure injection for the COPY hardening tests
+struct ThrowingSource <: IO end
+Base.eof(::ThrowingSource) = false
+Base.readbytes!(::ThrowingSource, ::Vector{UInt8}, n) = error("source failed")
+
+struct FailingDest <: IO end
+Base.write(::FailingDest, ::Vector{UInt8}) = error("dest failed")
+
 struct PgConfig
     host::String
     port::Int
@@ -1120,6 +1128,20 @@ end
                     # a genuine mid-stream server error during copy-out wins
                     # over the misuse error and the connection stays usable
                     @test_throws Postgres.API.Error Postgres.copy_to(conn, "COPY (SELECT 1/0) TO STDOUT")
+
+                    # a failing user data source aborts the copy with CopyFail
+                    # and the connection stays usable
+                    @test_throws ErrorException Postgres.copy_from(conn, "COPY copy_test (id, name) FROM STDIN", ThrowingSource())
+                    @test Tables.rowtable(DBInterface.execute(conn, "SELECT 5 AS a"))[1].a == 5
+
+                    # a failing dest IO mid copy-out closes the connection
+                    # instead of leaving a desynced socket that looks usable
+                    conn_copyfail = DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, cfg.password; dbname=cfg.dbname, port=cfg.port)
+                    DBInterface.execute(conn_copyfail, "CREATE TEMP TABLE copy_out_fail (id int)")
+                    DBInterface.execute(conn_copyfail, "INSERT INTO copy_out_fail VALUES (1), (2)")
+                    @test_throws ErrorException Postgres.copy_to(conn_copyfail, "COPY copy_out_fail TO STDOUT", FailingDest())
+                    @test !isopen(conn_copyfail.socket)
+                    DBInterface.close!(conn_copyfail)
 
                     # COPY via execute throws a clear client error pointing at
                     # copy_from/copy_to and keeps the connection usable

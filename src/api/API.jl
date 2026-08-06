@@ -944,65 +944,89 @@ function copy_in(style::S, socket, query::String, source::IO, debug::Bool) where
     writemessage(socket, debug, 'Q', query)
     error_msg = nothing
     copy_started = false
-    while true
-        mt, len = readheader(socket, debug)
-        if mt == UInt8('G')
-            skipbytes!(socket, len)
-            copy_started = true
-            break
-        elseif mt == UInt8('E')
-            error_msg = errorResponse(len, socket, debug)
-        elseif mt == UInt8('Z')
-            # ReadyForQuery without CopyInResponse: the statement errored or
-            # wasn't a COPY ... FROM STDIN; the stream is back at ready
-            skipbytes!(socket, len)
-            break
-        elseif mt == UInt8('N')
-            notice = noticeResponse(len, socket)
-            notice_callback(style, notice)
-        elseif mt == UInt8('A')
-            notification = notificationResponse(len, socket)
-            notification_callback(style, notification)
-        else
-            skipbytes!(socket, len)
+    try
+        while true
+            mt, len = readheader(socket, debug)
+            if mt == UInt8('G')
+                skipbytes!(socket, len)
+                copy_started = true
+                break
+            elseif mt == UInt8('E')
+                error_msg = errorResponse(len, socket, debug)
+            elseif mt == UInt8('Z')
+                # ReadyForQuery without CopyInResponse: the statement errored or
+                # wasn't a COPY ... FROM STDIN; the stream is back at ready
+                skipbytes!(socket, len)
+                break
+            elseif mt == UInt8('N')
+                notice = noticeResponse(len, socket)
+                notice_callback(style, notice)
+            elseif mt == UInt8('A')
+                notification = notificationResponse(len, socket)
+                notification_callback(style, notification)
+            else
+                skipbytes!(socket, len)
+            end
         end
+    catch
+        # bailed mid-stream: the position is unknowable, never reuse the socket
+        close(socket)
+        rethrow()
     end
     error_msg === nothing || throw(error_msg)
     copy_started || throw(PostgresInterfaceError("statement did not initiate COPY ... FROM STDIN"))
-    buf = Vector{UInt8}(undef, 16384)
-    while !eof(source)
-        n = readbytes!(source, buf, length(buf))
-        n == 0 && break
-        writemessage(socket, debug, 'd', view(buf, 1:n))
+    try
+        buf = Vector{UInt8}(undef, 16384)
+        while !eof(source)
+            n = readbytes!(source, buf, length(buf))
+            n == 0 && break
+            writemessage(socket, debug, 'd', view(buf, 1:n))
+        end
+        writemessage(socket, debug, 'c')
+    catch
+        # the user's data source failed mid-copy: abort the copy so the
+        # connection returns to ready, then rethrow the source error
+        try
+            writemessage(socket, debug, 'f', "client-side data source failed")
+            drain_to_ready!(socket, debug)
+        catch
+            close(socket)
+        end
+        rethrow()
     end
-    writemessage(socket, debug, 'c')
     error_msg = nothing
     second_copy = false
-    while true
-        mt, len = readheader(socket, debug)
-        if mt == UInt8('E')
-            error_msg = errorResponse(len, socket, debug)
-        elseif mt == UInt8('C')
-            skipbytes!(socket, len)
-        elseif mt == UInt8('G')
-            # a second CopyInResponse (multi-statement query string): the
-            # server is waiting for more copy data, so abort with CopyFail
-            # instead of deadlocking; a clear error is thrown below
-            skipbytes!(socket, len)
-            second_copy = true
-            writemessage(socket, debug, 'f', "copy_from supports a single COPY FROM STDIN statement")
-        elseif mt == UInt8('N')
-            notice = noticeResponse(len, socket)
-            notice_callback(style, notice)
-        elseif mt == UInt8('A')
-            notification = notificationResponse(len, socket)
-            notification_callback(style, notification)
-        elseif mt == UInt8('Z')
-            skipbytes!(socket, len)
-            break
-        else
-            skipbytes!(socket, len)
+    try
+        while true
+            mt, len = readheader(socket, debug)
+            if mt == UInt8('E')
+                error_msg = errorResponse(len, socket, debug)
+            elseif mt == UInt8('C')
+                skipbytes!(socket, len)
+            elseif mt == UInt8('G')
+                # a second CopyInResponse (multi-statement query string): the
+                # server is waiting for more copy data, so abort with CopyFail
+                # instead of deadlocking; a clear error is thrown below
+                skipbytes!(socket, len)
+                second_copy = true
+                writemessage(socket, debug, 'f', "copy_from supports a single COPY FROM STDIN statement")
+            elseif mt == UInt8('N')
+                notice = noticeResponse(len, socket)
+                notice_callback(style, notice)
+            elseif mt == UInt8('A')
+                notification = notificationResponse(len, socket)
+                notification_callback(style, notification)
+            elseif mt == UInt8('Z')
+                skipbytes!(socket, len)
+                break
+            else
+                skipbytes!(socket, len)
+            end
         end
+    catch
+        # bailed mid-stream: the position is unknowable, never reuse the socket
+        close(socket)
+        rethrow()
     end
     second_copy && throw(PostgresInterfaceError("copy_from supports a single COPY ... FROM STDIN statement per call"))
     error_msg === nothing || throw(error_msg)
@@ -1014,38 +1038,45 @@ function copy_out(style::S, socket, query::String, dest::IO, debug::Bool) where 
     error_msg = nothing
     copy_started = false
     wrong_direction = false
-    while true
-        mt, len = readheader(socket, debug)
-        if mt == UInt8('H')
-            skipbytes!(socket, len)
-            copy_started = true
-        elseif mt == UInt8('d')
-            write(dest, read(socket, len))
-        elseif mt == UInt8('c')
-            skipbytes!(socket, len)
-        elseif mt == UInt8('C')
-            skipbytes!(socket, len)
-        elseif mt == UInt8('G')
-            # CopyInResponse: the statement was COPY ... FROM STDIN. The server
-            # is now waiting on us for data, so abort the copy with CopyFail to
-            # return the stream to ready instead of deadlocking.
-            skipbytes!(socket, len)
-            wrong_direction = true
-            writemessage(socket, debug, 'f', "COPY FROM STDIN is not supported via copy_to")
-        elseif mt == UInt8('E')
-            error_msg = errorResponse(len, socket, debug)
-        elseif mt == UInt8('N')
-            notice = noticeResponse(len, socket)
-            notice_callback(style, notice)
-        elseif mt == UInt8('A')
-            notification = notificationResponse(len, socket)
-            notification_callback(style, notification)
-        elseif mt == UInt8('Z')
-            skipbytes!(socket, len)
-            break
-        else
-            skipbytes!(socket, len)
+    try
+        while true
+            mt, len = readheader(socket, debug)
+            if mt == UInt8('H')
+                skipbytes!(socket, len)
+                copy_started = true
+            elseif mt == UInt8('d')
+                write(dest, read(socket, len))
+            elseif mt == UInt8('c')
+                skipbytes!(socket, len)
+            elseif mt == UInt8('C')
+                skipbytes!(socket, len)
+            elseif mt == UInt8('G')
+                # CopyInResponse: the statement was COPY ... FROM STDIN. The server
+                # is now waiting on us for data, so abort the copy with CopyFail to
+                # return the stream to ready instead of deadlocking.
+                skipbytes!(socket, len)
+                wrong_direction = true
+                writemessage(socket, debug, 'f', "COPY FROM STDIN is not supported via copy_to")
+            elseif mt == UInt8('E')
+                error_msg = errorResponse(len, socket, debug)
+            elseif mt == UInt8('N')
+                notice = noticeResponse(len, socket)
+                notice_callback(style, notice)
+            elseif mt == UInt8('A')
+                notification = notificationResponse(len, socket)
+                notification_callback(style, notification)
+            elseif mt == UInt8('Z')
+                skipbytes!(socket, len)
+                break
+            else
+                skipbytes!(socket, len)
+            end
         end
+    catch
+        # bailed mid-stream (socket failure, or the user's dest IO threw):
+        # the position is unknowable, never reuse the socket
+        close(socket)
+        rethrow()
     end
     wrong_direction && throw(PostgresInterfaceError("statement initiated COPY ... FROM STDIN; use Postgres.copy_from"))
     error_msg === nothing || throw(error_msg)
