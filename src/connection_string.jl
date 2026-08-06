@@ -109,14 +109,36 @@ function parse_bool_param(value::Union{String, Nothing}, default::Bool, key::Str
     throw(ArgumentError("invalid value \"$value\" for connection parameter \"$key\"; expected a boolean (on/off, true/false, yes/no, 1/0)"))
 end
 
+# Ignored keywords that change security or connection-selection behavior when
+# set: silently dropping "channel_binding=require" or a CRL file would leave
+# the caller believing a protection is in place. The values listed are the
+# no-op defaults for each keyword; any other value draws a warning.
+const SECURITY_SENSITIVE_IGNORED = Dict(
+    "channel_binding" => ("", "prefer", "disable"),
+    "target_session_attrs" => ("", "any"),
+    "options" => ("",),
+    "sslcrl" => ("",),
+    "sslcrldir" => ("",),
+    "requiressl" => ("", "0"),
+)
+
+function warn_ignored_param(key::String, value::String)
+    inert = get(SECURITY_SENSITIVE_IGNORED, key, nothing)
+    inert === nothing && return
+    value in inert && return
+    @warn "connection parameter \"$key=$value\" is not supported by Postgres.jl and is ignored"
+    return
+end
+
 # An unrecognized key is almost always a typo, and silently dropping it is
 # dangerous: "ssl_mode=verify-full" would leave sslmode unset and fall back to
 # an unverified connection while the caller believes otherwise. libpq errors
 # on unknown keywords for the same reason.
 function check_known_params(values::Dict{String, String})
-    for key in keys(values)
+    for (key, value) in values
         (key in KNOWN_PARAMS || key in IGNORED_PARAMS) ||
             throw(ArgumentError("unrecognized connection parameter \"$key\"; recognized parameters are $(join(sort!(collect(KNOWN_PARAMS)), ", "))"))
+        key in IGNORED_PARAMS && warn_ignored_param(key, value)
     end
     return values
 end
@@ -259,6 +281,7 @@ function parse_uri(uri::String)
         for (key, value) in params
             (key in KNOWN_PARAMS || key in IGNORED_PARAMS) ||
                 throw(ArgumentError("unrecognized connection parameter \"$key\" in URI; recognized parameters are $(join(sort!(collect(KNOWN_PARAMS)), ", "))"))
+            key in IGNORED_PARAMS && warn_ignored_param(key, value)
             # keys we accept but don't implement must not reach params_from_values
             key in KNOWN_PARAMS && (values[key] = value)
         end

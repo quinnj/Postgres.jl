@@ -259,3 +259,26 @@ row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT 'happy'::mood AS mo
 ```
 
 Registering composite and range types follows the same pattern.
+
+### Session Formats
+
+Text decoding assumes the server renders dates and timestamps in the `ISO`
+`DateStyle` output format and intervals in the `postgres` `IntervalStyle`. The
+driver checks the server-reported settings at connect time and issues a `SET`
+for any that differ, preserving the configured date field order (`MDY`/`DMY`/
+`YMD`) since it decides how ambiguous input literals like `'01/02/2020'` are
+read. The alignment is re-applied on reconnect, but not if the session is
+changed afterwards: running `SET DateStyle = ...` or `SET IntervalStyle = ...`
+mid-session breaks decoding — intervals and unparseable dates raise errors
+rather than silently returning wrong values.
+
+### Values Without A Julia Representation
+
+A few PostgreSQL values have no faithful Julia equivalent and raise
+`Postgres.PostgresInterfaceError` when decoded rather than silently returning
+a wrong value: `infinity`/`-infinity` dates and timestamps, dates in the BC
+era, and `numeric` `NaN`/`infinity`. `"char"` columns (the 1-byte internal
+catalog type) decode to `Char`, including the zero byte (`'\0'`) and high-bit
+bytes; note that a `'\0'` read from such a column cannot be bound back as a
+text parameter, because PostgreSQL rejects NUL bytes in text — write it with
+an explicit cast such as `0::"char"` instead.

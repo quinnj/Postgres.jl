@@ -632,7 +632,10 @@ function register_range!(conn::Connection, name::AbstractString; schema::Abstrac
     oid = Int(rows[1].oid)
     subtype_oid = Int(rows[1].rngsubtype)
     subtype_type = API.type_info(conn.type_registry, subtype_oid).julia_type
-    parser = (val, registry) -> API.parse_range(val, subtype_oid, registry)
+    # bind the element type here rather than rediscovering it per value: the
+    # builtin parse_range only knows a fixed set of element types, so a range
+    # over anything else would register successfully and then fail on every value
+    parser = (val, registry) -> API.parse_range_of(subtype_type, val, subtype_oid, registry)
     register_type!(conn, oid, PostgresRange{subtype_type}; parser=parser)
     return conn
 end
@@ -698,6 +701,9 @@ function checkconn(conn::Connection)
         empty!(conn.statements)
         conn.in_transaction = false
         conn.transaction_depth = 0
+        # the server-side transaction died with the old socket; a stale flag
+        # would trigger a spurious ROLLBACK on the fresh session
+        conn.server_in_transaction = false
         conn.generation += 1
         conn.server_parameters = server_params
         @warn "postgres connection was closed; reconnected"
@@ -925,6 +931,7 @@ function clear_transaction_state!(conn::Connection)
     @lock conn.lock begin
         conn.in_transaction = false
         conn.transaction_depth = 0
+        conn.server_in_transaction = false
     end
     return
 end

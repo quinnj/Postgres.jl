@@ -524,10 +524,19 @@ end
         @test_throws ArgumentError Postgres.parse_dsn("postgresql://u@h/db?ssl_mode=require")
 
         # real libpq keywords this driver doesn't implement are accepted and
-        # ignored: providers routinely put them in the URI they hand users
-        @test Postgres.parse_dsn("postgresql://u:p@h/db?sslmode=require&channel_binding=require").sslmode == "require"
-        @test Postgres.parse_dsn("postgresql://u@h/db?target_session_attrs=read-write").dbname == "db"
-        @test Postgres.parse_dsn("host=h options=-csearch_path=x").host == "h"
+        # ignored: providers routinely put them in the URI they hand users.
+        # The ones that request a security or connection-selection behavior
+        # warn, so the caller isn't left believing a protection is in place
+        @test (@test_logs (:warn, r"channel_binding=require.*ignored") Postgres.parse_dsn("postgresql://u:p@h/db?sslmode=require&channel_binding=require")).sslmode == "require"
+        @test (@test_logs (:warn, r"target_session_attrs=read-write.*ignored") Postgres.parse_dsn("postgresql://u@h/db?target_session_attrs=read-write")).dbname == "db"
+        @test (@test_logs (:warn, r"options=.*ignored") Postgres.parse_dsn("host=h options=-csearch_path=x")).host == "h"
+        @test_logs (:warn, r"sslcrl=.*ignored") Postgres.parse_dsn("host=h sslcrl=/tmp/crl.pem")
+        @test_logs (:warn, r"requiressl=1.*ignored") Postgres.parse_dsn("host=h requiressl=1")
+        # the no-op defaults for those keywords stay silent, as do keywords
+        # with no security consequence
+        @test_logs Postgres.parse_dsn("host=h channel_binding=prefer target_session_attrs=any requiressl=0")
+        @test_logs Postgres.parse_dsn("host=h keepalives=1 client_encoding=UTF8")
+        @test_logs Postgres.parse_dsn("postgresql://u@h/db?channel_binding=disable")
 
         # invalid values for a recognized parameter are reported against that
         # parameter rather than silently defaulting
@@ -675,6 +684,23 @@ end
 
         @test Postgres.API.parse_interval("1 year 2 mons 3 days 04:05:06.789") == Dates.CompoundPeriod(Dates.Year(1), Dates.Month(2), Dates.Day(3), Dates.Hour(4), Dates.Minute(5), Dates.Second(6), Dates.Millisecond(789))
         @test Postgres.API.parse_interval("-04:05:06.789") == Dates.CompoundPeriod(Dates.Hour(-4), Dates.Minute(-5), Dates.Second(-6), Dates.Millisecond(-789))
+        # a genuine zero interval renders as "00:00:00" in the postgres style
+        @test Postgres.API.parse_interval("00:00:00") == Dates.Millisecond(0)
+        # text in an IntervalStyle this parser can't read (a mid-session SET
+        # to sql_standard or iso_8601) must fail loudly, not silently decode
+        # to a zero interval
+        for foreign in ("+1 +2:00:00", "1 2:00:00", "P1DT2H", "PT0S", "@ 1 day 2 hours", "1-2")
+            @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_interval(foreign)
+        end
+
+        # the field-order half of DateStyle survives the correction to ISO
+        @test Postgres.API.date_order("German, DMY") == "DMY"
+        @test Postgres.API.date_order("SQL, MDY") == "MDY"
+        @test Postgres.API.date_order("Postgres, YMD") == "YMD"
+        @test Postgres.API.date_order("ISO, DMY") == "DMY"
+        # unreported or unrecognized styles fall back to the postgres default
+        @test Postgres.API.date_order("") == "MDY"
+        @test Postgres.API.date_order("German") == "MDY"
 
         @test Postgres.API.parse_value(17, raw"\xDEADBEEF", registry) == UInt8[0xde, 0xad, 0xbe, 0xef]
         @test Postgres.API.decode_bytea(raw"\141\\") == UInt8['a', '\\']
@@ -694,11 +720,32 @@ end
         # the "char" type renders its zero value as an empty string
         @test Postgres.API.parse_value(18, "", registry) == '\0'
         @test Postgres.API.parse_value(18, "Z", registry) == 'Z'
+        # ... and high-bit bytes as backslash-octal escapes
+        @test Postgres.API.parse_value(18, "\\200", registry) == Char(0x80)
+        @test Postgres.API.parse_value(18, "\\377", registry) == Char(0xff)
+        # a backslash byte renders as a lone backslash, not an escape
+        @test Postgres.API.parse_value(18, "\\", registry) == '\\'
+        @test Postgres.API.pg_parse_char("\\310") == Char(0xc8)
+        # "char"[] (oid 1002) decodes elements, escapes included; on the wire
+        # the escape's backslash is itself array-quoted as "\\200"
+        @test isequal(Postgres.API.parse_value(1002, "{a,\"\\\\200\",NULL}", registry), Any['a', Char(0x80), missing])
+        @test Postgres.API.ArrayParsing.parse_array("{a,b}", Char) == ['a', 'b']
 
         # infinite timestamps/dates can't be represented and must say so
         @test_throws Postgres.PostgresInterfaceError Postgres.API.pg_parse_datetime("infinity")
         @test_throws Postgres.PostgresInterfaceError Postgres.API.pg_parse_datetime("-infinity")
         @test_throws Postgres.PostgresInterfaceError Postgres.API.pg_parse_date("infinity")
+        # BC dates are a different year numbering than Julia's (no year zero);
+        # decoding them as AD would be silent corruption
+        @test_throws Postgres.PostgresInterfaceError Postgres.API.pg_parse_date("0044-03-15 BC")
+        @test_throws Postgres.PostgresInterfaceError Postgres.API.pg_parse_datetime("0044-03-15 12:00:00 BC")
+        # timestamptz puts " BC" after the zone offset, past where the
+        # offset-stripped datetime parse can see it
+        @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_timestamptz("0044-03-15 12:00:00+00 BC")
+        # years beyond 9999 widen the year field rather than misparsing
+        @test Postgres.API.pg_parse_date("10000-01-01") == Date(10000, 1, 1)
+        @test Postgres.API.pg_parse_datetime("294276-12-31 23:59:59") == DateTime(294276, 12, 31, 23, 59, 59)
+        @test Postgres.API.parse_value(1184, "10000-01-02 03:04:05+02", registry) == DateTime(10000, 1, 2, 1, 4, 5)
 
         range = Postgres.API.parse_range("[1,5)", 23, registry)
         @test range == Postgres.PostgresRange{Int32}(1, 5, true, false, false)
@@ -1000,6 +1047,22 @@ end
                     @test row.span.upper == 5
                     @test row.span.lower_inclusive
                     @test !row.span.upper_inclusive
+
+                    # a range over an element type outside the builtin set must
+                    # decode after registration, not throw on every value
+                    DBInterface.execute(conn, "DROP TYPE IF EXISTS textrange CASCADE")
+                    DBInterface.execute(conn, "CREATE TYPE textrange AS RANGE (subtype = text)")
+                    Postgres.register_range!(conn, "textrange"; schema="public")
+                    trow = only(Tables.rowtable(DBInterface.execute(conn, "SELECT textrange('a','z') AS r, textrange('x','y','[]') AS s, 'empty'::textrange AS e")))
+                    @test trow.r isa Postgres.PostgresRange{String}
+                    @test trow.r.lower == "a"
+                    @test trow.r.upper == "z"
+                    @test trow.r.lower_inclusive
+                    @test !trow.r.upper_inclusive
+                    @test trow.s.lower == "x"
+                    @test trow.s.upper_inclusive
+                    @test trow.e.empty
+                    DBInterface.execute(conn, "DROP TYPE textrange CASCADE")
                 end
                 @testset "Transactions" begin
                     DBInterface.execute(conn, "DROP TABLE IF EXISTS trans_test")
@@ -1347,10 +1410,25 @@ end
                     rows = Tables.rowtable(DBInterface.execute(app_conn, "SELECT current_setting('application_name') AS app_name"))
                     @test rows[1].app_name == "reconnect_test"
                     DBInterface.close!(app_conn)
+
+                    # a raw-SQL transaction open at disconnect died with the
+                    # session; the tracked server status must not survive the
+                    # reconnect, or the next pool release issues a spurious
+                    # ROLLBACK on the fresh session
+                    tx_conn = DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, cfg.password; dbname=cfg.dbname, port=cfg.port, reconnect=true)
+                    DBInterface.execute(tx_conn, "BEGIN")
+                    @test @lock tx_conn.lock tx_conn.server_in_transaction
+                    close(tx_conn.socket)
+                    @test only(Tables.rowtable(DBInterface.execute(tx_conn, "SELECT 1 AS a"))).a == 1
+                    @test !(@lock tx_conn.lock tx_conn.server_in_transaction)
+                    DBInterface.close!(tx_conn)
                 end
 
                 @testset "Statement Timeout" begin
                     timeout_conn = DBInterface.connect(Postgres.Connection, cfg.host, cfg.user, cfg.password; dbname=cfg.dbname, port=cfg.port, statement_timeout=200)
+                    # applied with a post-connect SET (poolers reject it as a
+                    # startup option), so confirm it actually took effect
+                    @test only(Tables.rowtable(DBInterface.execute(timeout_conn, "SELECT current_setting('statement_timeout') AS t"))).t == "200ms"
                     @test_throws Postgres.API.Error DBInterface.execute(timeout_conn, "SELECT pg_sleep(1)")
                     Postgres.set_statement_timeout!(timeout_conn, 0)
                     rows = Tables.rowtable(DBInterface.execute(timeout_conn, "SELECT 1 AS a"))
@@ -1544,6 +1622,32 @@ end
                     # the system catalogs
                     cat_rows = Tables.rowtable(DBInterface.execute(conn, "SELECT attidentity FROM pg_attribute LIMIT 5"))
                     @test length(cat_rows) == 5
+                    # high-bit "char" values arrive as backslash-octal escapes
+                    oct_row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT (-1)::\"char\" AS c1, (-128)::\"char\" AS c2, 'a'::\"char\" AS c3, 0::\"char\" AS c4")))
+                    @test oct_row.c1 == Char(0xff)
+                    @test oct_row.c2 == Char(0x80)
+                    @test oct_row.c3 == 'a'
+                    @test oct_row.c4 == '\0'
+                    # "char"[] round-trips too, escapes and zero included
+                    chararr_row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT ARRAY['a'::\"char\", 0::\"char\", (-1)::\"char\"] AS a")))
+                    @test isequal(collect(chararr_row.a), Any['a', '\0', Char(0xff)])
+
+                    # years beyond 9999 and BC dates: wide years decode, BC
+                    # fails loudly, and neither poisons the connection
+                    big_row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT '10000-01-01'::date AS d, '10000-01-02 03:04:05'::timestamp AS t")))
+                    @test big_row.d == Date(10000, 1, 1)
+                    @test big_row.t == DateTime(10000, 1, 2, 3, 4, 5)
+                    @test_throws Postgres.PostgresInterfaceError Tables.rowtable(DBInterface.execute(conn, "SELECT '0044-03-15 BC'::date AS d"))
+                    @test only(Tables.rowtable(DBInterface.execute(conn, "SELECT 1 AS ok"))).ok == 1
+                    # an interval in a foreign IntervalStyle fails loudly too,
+                    # at a message boundary the connection can recover from
+                    DBInterface.execute(conn, "SET IntervalStyle = 'sql_standard'")
+                    try
+                        @test_throws Postgres.PostgresInterfaceError Tables.rowtable(DBInterface.execute(conn, "SELECT '1 day 2 hours'::interval AS i"))
+                    finally
+                        DBInterface.execute(conn, "SET IntervalStyle = 'postgres'")
+                    end
+                    @test only(Tables.rowtable(DBInterface.execute(conn, "SELECT '1 day'::interval AS i"))).i == Dates.Day(1)
                     # the session uses ISO dates and postgres intervals, which
                     # the text parsers require
                     style_row = only(Tables.rowtable(DBInterface.execute(conn, "SELECT current_setting('DateStyle') AS ds, current_setting('IntervalStyle') AS is")))
@@ -1560,6 +1664,12 @@ end
                             row = only(Tables.rowtable(DBInterface.execute(german_conn, "SELECT '2020-03-04 05:06:07'::timestamp AS t, '1 day'::interval AS i")))
                             @test row.t == DateTime(2020, 3, 4, 5, 6, 7)
                             @test row.i == Dates.Day(1)
+                            # the correction must keep the configured DMY field
+                            # order: reading '01/02/2020' as MDY would silently
+                            # turn the user's 1 February into January 2
+                            order_row = only(Tables.rowtable(DBInterface.execute(german_conn, "SELECT current_setting('DateStyle') AS ds, '01/02/2020'::date AS d")))
+                            @test order_row.ds == "ISO, DMY"
+                            @test order_row.d == Date(2020, 2, 1)
                         finally
                             DBInterface.close!(german_conn)
                         end

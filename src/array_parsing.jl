@@ -1,7 +1,7 @@
 module ArrayParsing
 
 using Parsers, Dates, UUIDs
-import ..pg_parse_date, ..pg_parse_time, ..pg_parse_datetime_any, ..parse_numeric, ..Numeric
+import ..pg_parse_date, ..pg_parse_time, ..pg_parse_datetime_any, ..parse_numeric, ..Numeric, ..pg_parse_char
 
 const BRACKET_OPEN = UInt8('[')
 const BRACKET_CLOSE = UInt8(']')
@@ -95,6 +95,7 @@ function parse_scalar(token::String, inner_type::Type{T}, quoted::Bool) where {T
     inner_type === DateTime && return pg_parse_datetime_any(token)
     inner_type === UUID && return UUID(token)
     inner_type === Numeric && return parse_numeric(token)
+    inner_type === Char && return pg_parse_char(token)
     return token
 end
 

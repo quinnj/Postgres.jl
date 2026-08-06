@@ -281,10 +281,11 @@ function writestartupmessage(
     application_name::Union{Nothing, String},
     statement_timeout::Union{Nothing, Int},
 )::Nothing
-    timeout_options = statement_timeout === nothing ? nothing : string("-c statement_timeout=", statement_timeout)
+    # statement_timeout is applied with a SET after connect rather than through
+    # the startup `options` parameter: poolers (pgbouncer) reject unknown
+    # startup options outright, so sending it here fails the whole connection.
     len = 8 + msgsizeof(("user", user)) + msgsizeof(("database", dbname)) + 1
     application_name !== nothing && (len += msgsizeof(("application_name", application_name)))
-    timeout_options !== nothing && (len += msgsizeof(("options", timeout_options)))
     debug && @info "sending startup message"
     buf = IOBuffer(Vector{UInt8}(undef, len); write=true)
     write(buf, hton(Int32(len)))
@@ -292,7 +293,6 @@ function writestartupmessage(
     _write_startup_param(buf, "user", user)
     _write_startup_param(buf, "database", dbname)
     application_name !== nothing && _write_startup_param(buf, "application_name", application_name)
-    timeout_options !== nothing && _write_startup_param(buf, "options", timeout_options)
     write(buf, UInt8(0))
     write(socket, take!(buf))
     flush(socket)
@@ -746,9 +746,9 @@ function connect(host::String, port::Integer, dbname::String, user::String, @nos
     pid, skey, server_params = waitfor(socket, debug, 'K', 'Z')
     # socket-union isa split so the call resolves under --trim, as above
     if socket isa Reseau.TCP.Conn
-        align_session_formats!(socket::Reseau.TCP.Conn, server_params, debug)
+        align_session_formats!(socket::Reseau.TCP.Conn, server_params, debug, statement_timeout_v)
     else
-        align_session_formats!(socket::Reseau.TLS.Conn, server_params, debug)
+        align_session_formats!(socket::Reseau.TLS.Conn, server_params, debug, statement_timeout_v)
     end
     return socket, pid, skey, server_params
     catch
@@ -763,13 +763,30 @@ end
 # both in its startup ParameterStatus, so correct them only when they actually
 # differ: a default server pays nothing, and no extra startup parameters are
 # sent (poolers such as pgbouncer reject `options` unless it is allowlisted).
-function align_session_formats!(socket, server_params::Dict{String, String}, debug::Bool)
+# The field-order half of DateStyle ("MDY"/"DMY"/"YMD") decides how ambiguous
+# *input* like '01/02/2020' is read; only the output half has to be ISO. Keep
+# whatever order the server was configured with so correcting the output format
+# doesn't silently change what the user's literals mean.
+function date_order(datestyle::AbstractString)
+    for part in split(datestyle, ',')
+        order = uppercase(strip(part))
+        (order == "MDY" || order == "DMY" || order == "YMD") && return order
+    end
+    return "MDY"
+end
+
+function align_session_formats!(socket, server_params::Dict{String, String}, debug::Bool, @nospecialize(statement_timeout::Union{Int, Nothing})=nothing)
+    if statement_timeout !== nothing
+        exec(PostgresStyle(), socket, string("SET statement_timeout = ", statement_timeout::Int), debug)
+    end
     # A parameter the server didn't report (a pooler may not forward it) must
     # be treated as unknown, i.e. corrected — assuming it is already right is
     # how intervals silently decode to zero.
-    if !startswith(get(server_params, "DateStyle", ""), "ISO")
-        exec(PostgresStyle(), socket, "SET DateStyle = 'ISO, MDY'", debug)
-        server_params["DateStyle"] = "ISO, MDY"
+    datestyle = get(server_params, "DateStyle", "")
+    if !startswith(datestyle, "ISO")
+        wanted = string("ISO, ", date_order(datestyle))
+        exec(PostgresStyle(), socket, string("SET DateStyle = '", wanted, "'"), debug)
+        server_params["DateStyle"] = wanted
     end
     if get(server_params, "IntervalStyle", "") != "postgres"
         exec(PostgresStyle(), socket, "SET IntervalStyle = 'postgres'", debug)

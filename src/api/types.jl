@@ -215,6 +215,7 @@ function _populate_default_type_registry!()
     1560 => TypeInfo(Bool, nothing),
     1000 => TypeInfo(Vector{Bool}, nothing),
     1001 => TypeInfo(Vector{Vector{UInt8}}, (val, registry) -> parse_array_by_oid(val, 17, registry)),
+    1002 => TypeInfo(Vector{Char}, (val, registry) -> parse_array_by_oid(val, 18, registry)),
     1005 => TypeInfo(Vector{Int16}, nothing),
     1007 => TypeInfo(Vector{Int32}, nothing),
     1016 => TypeInfo(Vector{Int64}, nothing),
@@ -276,12 +277,26 @@ end
 @inline _pg_digit(b::UInt8)::Int = Int(b - UInt8('0'))
 @inline _pg_isdigit(b::UInt8)::Bool = UInt8('0') <= b <= UInt8('9')
 
-@inline function _pg_date_at(c, o::Int)::Date
-    y = _pg_digit(c[o]) * 1000 + _pg_digit(c[o+1]) * 100 + _pg_digit(c[o+2]) * 10 + _pg_digit(c[o+3])
-    m = _pg_digit(c[o+5]) * 10 + _pg_digit(c[o+6])
-    d = _pg_digit(c[o+8]) * 10 + _pg_digit(c[o+9])
-    return Date(y, m, d)
+# The year is normally 4 digits but PostgreSQL emits more beyond year 9999, so
+# scan it rather than assuming a fixed width. Returns the date and the offset
+# just past it.
+@inline function _pg_date_at_end(c, o::Int)
+    y = 0
+    i = o
+    n = length(c)
+    while i <= n && _pg_isdigit(c[i])
+        y = y * 10 + _pg_digit(c[i])
+        i += 1
+    end
+    (i > n || c[i] != UInt8('-')) && throw(ArgumentError("invalid postgres date"))
+    i += 1
+    m = _pg_digit(c[i]) * 10 + _pg_digit(c[i+1])
+    i += 3
+    d = _pg_digit(c[i]) * 10 + _pg_digit(c[i+1])
+    return Date(y, m, d), i + 2
 end
+
+@inline _pg_date_at(c, o::Int)::Date = first(_pg_date_at_end(c, o))
 
 @inline function _pg_hms_at(c, o::Int)
     h = _pg_digit(c[o]) * 10 + _pg_digit(c[o+1])
@@ -303,6 +318,20 @@ end
     return h, mi, se, ms
 end
 
+# `"char"` output: byte 0 renders as an empty string, bytes with the high bit
+# set render as a backslash-octal escape ("\\200".."\\377"), and anything else
+# is the raw byte. A backslash byte itself renders as a lone "\\", so only the
+# exact 4-byte escape shape is decoded.
+function pg_parse_char(s::String)
+    isempty(s) && return '\0'
+    c = codeunits(s)
+    if length(c) == 4 && c[1] == UInt8('\\') &&
+       UInt8('0') <= c[2] <= UInt8('3') && UInt8('0') <= c[3] <= UInt8('7') && UInt8('0') <= c[4] <= UInt8('7')
+        return Char((_pg_digit(c[2]) << 6) | (_pg_digit(c[3]) << 3) | _pg_digit(c[4]))
+    end
+    return s[1]
+end
+
 function pg_parse_date(s::AbstractString)::Date
     c = codeunits(s)
     _check_temporal_special(s, "date")
@@ -322,6 +351,9 @@ end
 
 @inline function _check_temporal_special(s::AbstractString, what::String)
     (s == "infinity" || s == "-infinity") && _reject_temporal_special(s, what)
+    # BC years are a different numbering than Julia's (proleptic, no year 0),
+    # so decoding them as AD would silently produce the wrong date
+    endswith(s, " BC") && throw(PostgresInterfaceError("postgres BC $what value \"$s\" is not supported"))
     return
 end
 
@@ -329,8 +361,9 @@ function pg_parse_datetime(s::AbstractString)::DateTime
     c = codeunits(s)
     _check_temporal_special(s, "timestamp")
     length(c) >= 19 || throw(ArgumentError("invalid postgres timestamp"))
-    d = _pg_date_at(c, 1)
-    h, mi, se, ms = _pg_hms_at(c, 12)
+    # the time starts one space past the date, whose year may be wider than 4
+    d, after_date = _pg_date_at_end(c, 1)
+    h, mi, se, ms = _pg_hms_at(c, after_date + 1)
     return DateTime(Dates.year(d), Dates.month(d), Dates.day(d), h, mi, se, ms)
 end
 
@@ -346,6 +379,10 @@ end
 
 @inline function parse_timestamptz(val::String)
     lastindex(val) == 0 && throw(ArgumentError("invalid postgres timestamptz"))
+    # timestamptz output puts " BC" after the zone offset, so the check inside
+    # pg_parse_datetime (which sees only the offset-stripped prefix) can't
+    # catch it; check the full value here
+    _check_temporal_special(val, "timestamp")
     if val[end] == 'Z'
         ts = SubString(val, 1, prevind(val, lastindex(val)))
         return pg_parse_datetime(ts)
@@ -454,20 +491,34 @@ function parse_interval_time(token::AbstractString)
     return periods
 end
 
+@noinline _reject_interval(val::String) =
+    throw(PostgresInterfaceError("unrecognized postgres interval \"$val\"; this driver requires IntervalStyle=postgres"))
+
 function parse_interval(val::String)
     tokens = split(strip(val))
     periods = Dates.Period[]
+    # whether any token was understood; distinguishes a real zero interval
+    # ("00:00:00") from text in a style this parser can't read
+    recognized = false
     i = 1
     while i <= length(tokens)
         token = tokens[i]
         if occursin(':', token)
+            # a postgres time component is exactly h:m:s; anything else with a
+            # colon comes from a different IntervalStyle
+            count(isequal(':'), token) == 2 && (recognized = true)
             append!(periods, parse_interval_time(token))
             i += 1
             continue
         end
         i == length(tokens) && break
-        amount = parse(Int, token)
+        amount = tryparse(Int, token)
+        # a non-numeric token ("@", sql_standard year-month like "1-2") means a
+        # different IntervalStyle; fail with the actionable error, not a raw
+        # integer-parse failure
+        amount === nothing && _reject_interval(val)
         unit = lowercase(tokens[i + 1])
+        nbefore = length(periods)
         if startswith(unit, "year")
             push!(periods, Dates.Year(amount))
         elseif startswith(unit, "mon")
@@ -481,9 +532,19 @@ function parse_interval(val::String)
         elseif startswith(unit, "sec")
             push!(periods, Dates.Second(amount))
         end
+        # every understood unit pushes a period, so growth means this token
+        # pair was genuinely matched
+        length(periods) > nbefore && (recognized = true)
         i += 2
     end
-    isempty(periods) && return Dates.Millisecond(0)
+    if isempty(periods)
+        # a genuine zero interval renders as "00:00:00"; anything else that
+        # yielded no periods is a format this parser doesn't understand (a
+        # mid-session `SET IntervalStyle` to sql_standard or iso_8601), and
+        # silently returning zero would be wrong data
+        recognized || _reject_interval(val)
+        return Dates.Millisecond(0)
+    end
     length(periods) == 1 && return only(periods)
     # n=0 construction skips CompoundPeriod's canonicalize loop (whose Period +
     # merge is dynamic dispatch under --trim); pg interval text is already
@@ -576,6 +637,22 @@ function parse_range(val::String, typeId::Int, registry::Dict{Int, TypeInfo})
     lower = parse_range_value(left, typeId, registry)
     upper = parse_range_value(right, typeId, registry)
     return _range_typed(T, lower, upper, lower_inclusive, upper_inclusive, false)
+end
+
+# Range parsing for an element type discovered at registration time
+# (`register_range!`). The builtin registry keeps using `parse_range`'s fixed
+# dispatch, which is what stays resolvable under `--trim`; this path is only
+# reachable once a user registers a range type at runtime.
+function parse_range_of(::Type{T}, val::String, typeId::Int, registry::Dict{Int, TypeInfo}) where {T}
+    lowercase(val) == "empty" && return PostgresRange{T}(missing, missing, false, false, true)
+    lower_inclusive = val[1] == '['
+    upper_inclusive = val[end] == ']'
+    left, right = split_range_values(val[2:end - 1])
+    lower = parse_range_value(left, typeId, registry)
+    upper = parse_range_value(right, typeId, registry)
+    l = lower === missing ? missing : convert(T, lower)
+    u = upper === missing ? missing : convert(T, upper)
+    return PostgresRange{T}(l, u, lower_inclusive, upper_inclusive, false)
 end
 
 parse_array_scalar(typeId::Int, registry::Dict{Int, TypeInfo}, value::Missing) = missing
@@ -743,8 +820,7 @@ function parse_value(typeId::Int, val::String, registry::Dict{Int, TypeInfo})
         end
         return val == "t"
     elseif T == Char
-        # the "char" type renders its zero value as an empty string
-        return isempty(val) ? '\0' : val[1]
+        return pg_parse_char(val)
     elseif T == DateTime
         if typeId == 1184
             return parse_timestamptz(val)
@@ -816,7 +892,7 @@ end
 
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Int8}, s::String) = Parsers.parse(Int8, s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Bool}, s::String) = (s == "t" || s == "1"), nothing
-StructUtils.lift(::AbstractPostgresStyle, ::Type{Char}, s::String) = (isempty(s) ? '\0' : s[1]), nothing
+StructUtils.lift(::AbstractPostgresStyle, ::Type{Char}, s::String) = pg_parse_char(s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Int16}, s::String) = Parsers.parse(Int16, s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Int32}, s::String) = Parsers.parse(Int32, s), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Int64}, s::String) = Parsers.parse(Int64, s), nothing
@@ -843,6 +919,7 @@ StructUtils.lift(::AbstractPostgresStyle, ::Type{Vector{Time}}, s::String) = par
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Vector{DateTime}}, s::String) = parse_array(s, DateTime), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Vector{UUID}}, s::String) = parse_array(s, UUID), nothing
 StructUtils.lift(::AbstractPostgresStyle, ::Type{Vector{Numeric}}, s::String) = parse_array(s, Numeric), nothing
+StructUtils.lift(::AbstractPostgresStyle, ::Type{Vector{Char}}, s::String) = parse_array(s, Char), nothing
 
 # For array-typed fields the generic `make` takes its arraylike branch (applyeach
 # over the source) before consulting lifts — but our source is the wire STRING,
