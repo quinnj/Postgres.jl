@@ -548,6 +548,10 @@ end
         @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric("-Infinity")
         # an absurd exponent must be rejected, not turned into a huge BigInt
         @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric("1e999999999999")
+        @test_throws Postgres.PostgresInterfaceError Postgres.API.parse_numeric("1e99999999999999999999999999")
+        # ordinary scientific notation still round-trips
+        @test string(Postgres.API.parse_numeric("1.5e2")) == "150"
+        @test string(Postgres.API.parse_numeric("1.5e-2")) == "0.015"
 
         # message-field parsing is bounded by the buffer actually received: a
         # truncated or unterminated field must not read past the allocation
@@ -1222,9 +1226,13 @@ end
                     DBInterface.close!(cancel_conn)
 
                     # the cancel key must never go out in the clear when the
-                    # connection it cancels required TLS
-                    @test !Postgres.API.cancel_request(cfg.host, cfg.port, Int32(1), Int32(1), false, "require")
-                    @test !Postgres.API.cancel_request(cfg.host, cfg.port, Int32(1), Int32(1), false, "verify-full")
+                    # connection it cancels required TLS; the refusal is a
+                    # thrown error, not a silent no-op (this server has no SSL,
+                    # so it answers the SSLRequest with 'N')
+                    @test_throws Postgres.PostgresInterfaceError Postgres.API.cancel_request(cfg.host, cfg.port, Int32(1), Int32(1), false, "require")
+                    @test_throws Postgres.PostgresInterfaceError Postgres.API.cancel_request(cfg.host, cfg.port, Int32(1), Int32(1), false, "verify-full")
+                    # a cleartext-allowed cancel still delivers
+                    @test Postgres.API.cancel_request(cfg.host, cfg.port, Int32(1), Int32(1), false, "disable")
                 end
 
                 @testset "Interval Types" begin
@@ -1264,6 +1272,28 @@ end
 
                     @test connection_error(ssl_cfg.host, ssl_cfg; sslmode="verify-full") !== nothing
                     @test connection_error(ssl_cfg.host, ssl_cfg; sslmode="verify-full", sslrootcert=tls.wrongrootcert) !== nothing
+
+                    # against a TLS-capable server the cancel key goes over TLS
+                    # and the request is delivered
+                    @test Postgres.API.cancel_request(ssl_cfg.host, ssl_cfg.port, Int32(1), Int32(1), false, "require")
+                    ssl_cancel_conn = DBInterface.connect(Postgres.Connection, ssl_cfg.host, ssl_cfg.user, ssl_cfg.password; dbname=ssl_cfg.dbname, port=ssl_cfg.port, sslmode="require")
+                    try
+                        ssl_task = errormonitor(Threads.@spawn begin
+                            try
+                                DBInterface.execute(ssl_cancel_conn, "SELECT pg_sleep(5)")
+                                return :completed
+                            catch err
+                                return err
+                            end
+                        end)
+                        sleep(0.5)
+                        Postgres.cancel_query!(ssl_cancel_conn)
+                        ssl_result = fetch(ssl_task)
+                        @test ssl_result isa Postgres.API.Error
+                        @test ssl_result.code == "57014"
+                    finally
+                        isopen(ssl_cancel_conn) && DBInterface.close!(ssl_cancel_conn)
+                    end
 
                     localhost_require_err = connection_error("localhost", ssl_cfg; sslmode="require")
                     if localhost_require_err === nothing

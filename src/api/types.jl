@@ -350,11 +350,14 @@ function parse_numeric(val::String)
     exp_index = findfirst(c -> c == 'e' || c == 'E', stripped)
     exp_val = 0
     if exp_index !== nothing
-        exp_val = parse(Int, stripped[exp_index + 1:end])
         # postgres numeric tops out at 16383 digits either side of the point;
         # bound the exponent so a bogus value can't drive an enormous BigInt
-        # scaling below
-        abs(exp_val) <= 100_000 || throw(PostgresInterfaceError("postgres numeric exponent out of range: $stripped"))
+        # scaling below (tryparse so an oversized exponent reports the same
+        # error as an out-of-range one, rather than an OverflowError)
+        parsed_exp = tryparse(Int, stripped[exp_index + 1:end])
+        (parsed_exp === nothing || abs(parsed_exp) > 100_000) &&
+            throw(PostgresInterfaceError("postgres numeric exponent out of range: $stripped"))
+        exp_val = parsed_exp
         stripped = stripped[1:exp_index - 1]
     end
     parts = split(stripped, '.'; limit=2)

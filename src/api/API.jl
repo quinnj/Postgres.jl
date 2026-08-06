@@ -316,10 +316,22 @@ function skipbytes!(io::IO, n::Integer)
     return nothing
 end
 
+# PostgreSQL's own protocol maximum (PQ_LARGE_MESSAGE_LIMIT): no valid message
+# body exceeds 1 GiB. The length is server-supplied and the transport allocates
+# it up front, so bound it here — the single point every message passes through
+# — rather than letting a bogus header commit gigabytes. This is reachable
+# before authentication (an ErrorResponse to the SSLRequest), so it must not
+# depend on a trusted peer.
+const MAX_MESSAGE_LEN = Int32(1) << 30
+
+@noinline _bad_message_length(len) =
+    throw(Error("invalid message length $len from server; connection protocol state is corrupted"))
+
 function readheader(socket, debug=false)
     mt = read(socket, UInt8)
     len = ntoh(read(socket, Int32)) - 4
     debug && @info "readheader: $(Char(mt)), $len"
+    (len < 0 || len > MAX_MESSAGE_LEN) && _bad_message_length(len)
     return mt, len
 end
 
@@ -674,8 +686,11 @@ function connect(host::String, port::Integer, dbname::String, user::String, @nos
         elseif mt == UInt8('N')
             (sslmode_str == "require" || sslmode_str == "verify-full") && throw(Error("server does not support SSL"))
         elseif mt == UInt8('E')
-            # server may answer SSLRequest with a full ErrorResponse
+            # server may answer SSLRequest with a full ErrorResponse. This is
+            # pre-TLS and pre-auth, so bound the length like readheader does
+            # before handing it to the allocating read.
             len = ntoh(read(socket, Int32)) - 4
+            (len < 0 || len > MAX_MESSAGE_LEN) && close_and_throw(socket, Error("invalid message length $len from server"))
             close_and_throw_error_response(socket, len, debug)
         else
             close_and_throw(socket, Error("unexpected response to SSLRequest: $(Char(mt))"))
@@ -1128,9 +1143,13 @@ function cancel_request(host::String, port::Int, pid::Int32, skey::Int32, debug:
                         @nospecialize(connect_timeout::Union{Int, Nothing}=nothing))
     sslmode_v = sslmode::Union{String, Nothing}
     connect_timeout_v = connect_timeout::Union{Int, Nothing}
+    sslmode_str = sslmode_v === nothing ? "prefer" : lowercase(String(sslmode_v))
+    tls_required = sslmode_str == "require" || sslmode_str == "verify-full"
     socket = connectsocket(host, port, connect_timeout_v)
+    refused_cleartext = false
+    sent = false
     try
-        sslmode_str = sslmode_v === nothing ? "prefer" : lowercase(String(sslmode_v))
+        send_key = true
         if sslmode_str != "disable"
             writemessage(socket, debug, '\0', Int32(80877103))
             mt = read(socket, UInt8)
@@ -1140,24 +1159,31 @@ function cancel_request(host::String, port::Int, pid::Int32, skey::Int32, debug:
                                     sslmode_str == "verify-full",
                                     sslcert::Union{String, Nothing}, sslkey::Union{String, Nothing},
                                     sslrootcert::Union{String, Nothing}, sslcapath::Union{String, Nothing})
-            elseif sslmode_str == "require" || sslmode_str == "verify-full"
+            elseif tls_required
                 # never send the cancel key in the clear when TLS was required
-                return false
+                refused_cleartext = true
+                send_key = false
             end
         end
-        buf = IOBuffer(Vector{UInt8}(undef, 16); write=true)
-        write(buf, hton(Int32(16)))
-        write(buf, hton(Int32(80877102)))  # CancelRequest code
-        write(buf, hton(pid))
-        write(buf, hton(skey))
-        write(socket, take!(buf))
-        flush(socket)
-        return true
+        if send_key
+            buf = IOBuffer(Vector{UInt8}(undef, 16); write=true)
+            write(buf, hton(Int32(16)))
+            write(buf, hton(Int32(80877102)))  # CancelRequest code
+            write(buf, hton(pid))
+            write(buf, hton(skey))
+            write(socket, take!(buf))
+            flush(socket)
+            sent = true
+        end
     catch
-        return false
+        sent = false
     finally
         close(socket)
     end
+    # refusing to send is a hard failure the caller must hear about, not a
+    # silent no-op: the query they asked to cancel is still running
+    refused_cleartext && throw(PostgresInterfaceError("server refused TLS on the cancel connection; not sending the cancel key in cleartext under sslmode=$sslmode_str"))
+    return sent
 end
 
 include("../array_parsing.jl")

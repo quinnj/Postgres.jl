@@ -55,7 +55,9 @@ options):
   connection is found dead (default `false`; never reconnects mid-transaction)
 - `style`: a custom [`AbstractPostgresStyle`](@ref Postgres.API.AbstractPostgresStyle)
   for query logging / notice / notification behavior
-- `debug`: log wire protocol messages
+- `debug`: log wire protocol messages. Authentication messages are redacted,
+  but bind parameter values are not — treat a debug log as sensitive as the
+  data the connection carries.
 
 Connections are safe for concurrent use from multiple tasks: operations are
 serialized on an internal lock. Close with `DBInterface.close!(conn)` or
@@ -568,7 +570,10 @@ The cancelled query fails with a [`Postgres.Error`](@ref Postgres.API.Error)
 with SQLSTATE `57014`.
 
 The cancel connection uses the same TLS settings as `conn`, since the cancel
-key it carries is a credential.
+key it carries is a credential: if `conn` itself is on TLS, the cancel
+connection requires TLS too. Throws a `PostgresInterfaceError` if the cancel
+request could not be delivered (rather than failing silently, which would
+leave the query running).
 """
 function cancel_query!(conn::Connection)
     host = conn.host
@@ -576,16 +581,23 @@ function cancel_query!(conn::Connection)
     pid = conn.pid
     skey = conn.skey
     debug = conn.debug
+    sslmode = conn.sslmode
     if trylock(conn.lock)
         try
             !isopen(conn.socket) && throw(PostgresInterfaceError("cannot cancel query: connection not open"))
             pid = conn.pid
             skey = conn.skey
+            # the connection actually negotiated TLS, so require it for the
+            # cancel connection too even under the permissive default
+            if conn.socket isa Reseau.TLS.Conn && (sslmode === nothing || lowercase(sslmode) == "prefer")
+                sslmode = "require"
+            end
         finally
             unlock(conn.lock)
         end
     end
-    API.cancel_request(host, port, pid, skey, debug, conn.sslmode, conn.sslrootcert, conn.sslcert, conn.sslkey, conn.sslcapath, conn.sslservername, conn.connect_timeout)
+    ok = API.cancel_request(host, port, pid, skey, debug, sslmode, conn.sslrootcert, conn.sslcert, conn.sslkey, conn.sslcapath, conn.sslservername, conn.connect_timeout)
+    ok || throw(PostgresInterfaceError("failed to deliver the cancel request to $(host):$(port)"))
     return conn
 end
 
