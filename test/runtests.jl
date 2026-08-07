@@ -1,6 +1,7 @@
 using Test
 using Aqua
 using Dates
+using Distributed
 using UUIDs
 using DBInterface
 using Tables
@@ -68,6 +69,17 @@ end
 struct Int8Row
     x::Int8
     s::String
+end
+
+# A third-party-style task macro the driver has never heard of: it wraps its
+# body in a Task and fetches it. @transaction must leave the body's `return`
+# with its plain meaning (the task's result) — no allowlist involved.
+macro local_task(body)
+    quote
+        local t = Task(() -> $(esc(body)))
+        schedule(t)
+        fetch(t)
+    end
 end
 
 # user-IO failure injection for the COPY hardening tests
@@ -1587,41 +1599,89 @@ end
                     @test !Postgres.in_transaction(conn)
                     @test escaped_helper(-5) === :neg
 
-                    # unit-level pins for the rewrite skip list: short-form
-                    # definitions in every syntactic shape, and task macros
-                    let tok = gensym(:tok)
-                        for def in (:(h(x) = return x),
-                                    :(h(x)::Int = return x),
-                                    :(h(x) where {T} = return x),
-                                    :(Base.getindex(a::MyT, i) = return i))
-                            @test Postgres.rewrite_transaction_returns(def, tok) == def
+                    # The body keeps plain Julia semantics with no AST rewrite,
+                    # so a return inside ANY closure-forming construct behaves
+                    # exactly as it does outside the macro — including
+                    # third-party task macros no allowlist could cover.
+                    local_task_result = (function(c)
+                        Postgres.@transaction c begin
+                            DBInterface.execute(c, "INSERT INTO macro_test (value) VALUES (20)")
+                            @local_task begin
+                                return :local_task_value
+                            end
                         end
-                        for taskex in (:(Threads.@spawn begin return 1 end),
-                                       :(Distributed.@spawnat 1 begin return 1 end),
-                                       :(@async begin return 1 end),
-                                       :(Distributed.@fetch begin return 1 end),
-                                       :(@fetchfrom 1 begin return 1 end))
-                            @test Postgres.rewrite_transaction_returns(taskex, tok) == taskex
-                        end
-                        # ordinary assignments whose RHS contains a return ARE
-                        # rewritten (x[i] = ..., x.f = ..., plain x = ...)
-                        for assign in (:(x = f() && return 1),
-                                       :(x[i] = f() && return 1),
-                                       :(x.f = f() && return 1))
-                            @test Postgres.rewrite_transaction_returns(assign, tok) != assign
-                        end
-                        # a return in a comprehension/generator body is a
-                        # lowering error in plain Julia (the rewrite must not
-                        # legalize it), and the iterator-expression shapes
-                        # lowering does accept behave correctly un-rewritten
-                        # (they commit through the expansion's finally)
-                        for comp in (:([(return i) for i in 1:3]),
-                                     :(Int[(return i) for i in 1:3]),
-                                     :(sum(x for x in (f() ? (return 1) : [1]))),
-                                     :([x for x in xs for y in (return x)]))
-                            @test Postgres.rewrite_transaction_returns(comp, tok) == comp
-                        end
+                    end)(conn)
+                    @test local_task_result === :local_task_value
+                    @test !Postgres.in_transaction(conn)
+                    @test only(Tables.rowtable(DBInterface.execute(conn, "SELECT count(*)::int AS n FROM macro_test WHERE value = 20"))).n == 1
+
+                    # Distributed task macros: with no workers added, worker 1
+                    # is this process, so these run locally end to end.
+                    for distributed_case in (
+                        (c) -> Postgres.@transaction(c, fetch(Distributed.@spawnat 1 begin
+                            return :spawnat_value
+                        end)),
+                        (c) -> Postgres.@transaction(c, Distributed.@fetchfrom 1 begin
+                            return :fetchfrom_value
+                        end),
+                        (c) -> Postgres.@transaction(c, Distributed.@fetch begin
+                            return :fetch_value
+                        end),
+                    )
+                        val = distributed_case(conn)
+                        @test val in (:spawnat_value, :fetchfrom_value, :fetch_value)
+                        @test !Postgres.in_transaction(conn)
                     end
+
+                    # A return in a flattened-iterator expression is legal
+                    # plain Julia: it returns from the generated per-element
+                    # closure, so its value becomes the inner iterator (an Int
+                    # yields itself once) and the enclosing function continues.
+                    # Wrapped in @transaction the behavior must be identical,
+                    # and the block commits on normal completion.
+                    plain_flatten = function()
+                        vals = [x for x in 1:2 for y in (return x)]
+                        (:reached, vals)
+                    end
+                    wrapped_flatten = function(c)
+                        vals = Postgres.@transaction c begin
+                            DBInterface.execute(c, "INSERT INTO macro_test (value) VALUES (21)")
+                            [x for x in 1:2 for y in (return x)]
+                        end
+                        (:reached, vals)
+                    end
+                    @test plain_flatten() == (:reached, [1, 2])
+                    @test wrapped_flatten(conn) == plain_flatten()
+                    @test !Postgres.in_transaction(conn)
+                    @test only(Tables.rowtable(DBInterface.execute(conn, "SELECT count(*)::int AS n FROM macro_test WHERE value = 21"))).n == 1
+
+                    # A commit that fails in the finally (break out of a nested
+                    # level whose savepoint was aborted by a swallowed server
+                    # error) must roll back ITS level before propagating, so
+                    # every enclosing level can unwind its own — nothing may be
+                    # left open, client- or server-side.
+                    nested_break_err = try
+                        for _ in 1:1
+                            Postgres.@transaction conn begin
+                                DBInterface.execute(conn, "INSERT INTO macro_test (value) VALUES (22)")
+                                Postgres.@transaction conn begin
+                                    try
+                                        DBInterface.execute(conn, "SELECT 1/0")
+                                    catch
+                                        # swallowed: the savepoint is now aborted
+                                    end
+                                    break
+                                end
+                            end
+                        end
+                        nothing
+                    catch e
+                        e
+                    end
+                    @test nested_break_err isa Postgres.API.Error
+                    @test !Postgres.in_transaction(conn)
+                    @test !conn.server_in_transaction
+                    @test isempty(Tables.rowtable(DBInterface.execute(conn, "SELECT * FROM macro_test WHERE value = 22")))
 
                     # Recursion re-enters the SAME expansion: an inner frame's
                     # return exits only that frame, and each frame commits.

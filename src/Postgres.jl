@@ -1218,86 +1218,6 @@ function DBInterface.transaction(f::F, conn::Connection) where {F}
     end
 end
 
-# `token` identifies the @transaction expansion that rewrote the `return`.
-# Without it, a lexically nested @transaction intercepts the outer expansion's
-# marker, commits only its own savepoint, and its plain `return` then skips
-# every enclosing commit — silently rolling back all levels.
-struct TransactionReturn{T} <: Exception
-    token::Symbol
-    value::T
-end
-
-# Macros that wrap their body in a closure or task: a `return` inside them
-# belongs to that closure (it becomes the task's result), so it must not be
-# rewritten into a transaction-return marker.
-const _TASK_MACROS = (Symbol("@spawn"), Symbol("@async"), Symbol("@task"),
-                      Symbol("@threads"), Symbol("@distributed"), Symbol("@spawnat"),
-                      Symbol("@fetch"), Symbol("@fetchfrom"))
-
-_macro_name(x) = x isa Symbol ? x :
-    x isa GlobalRef ? x.name :
-    (x isa Expr && x.head === :. && x.args[2] isa QuoteNode) ? x.args[2].value :
-    nothing
-
-# Short-form function definitions — `h(x) = ...`, `h(x)::T = ...`,
-# `h(x) where {T} = ...` — parse as `:(=)` with a call-shaped left-hand side.
-# A return inside one belongs to that function, exactly like the long
-# `function` form the rewrite already skips.
-_is_callish_lhs(x) = x isa Expr && (x.head === :call ||
-    ((x.head === :where || x.head === :(::)) && !isempty(x.args) && _is_callish_lhs(x.args[1])))
-
-function rewrite_transaction_returns(expr, token::Symbol)
-    expr isa Expr || return expr
-    if expr.head === :return
-        value = (isempty(expr.args) || expr.args[1] === nothing) ? nothing :
-            rewrite_transaction_returns(expr.args[1], token)
-        marker = GlobalRef(@__MODULE__, :TransactionReturn)
-        return Expr(:call, GlobalRef(Core, :throw), Expr(:call, marker, QuoteNode(token), value))
-    elseif expr.head === :function || expr.head === :(->) || expr.head === :quote ||
-           (expr.head === :(=) && _is_callish_lhs(expr.args[1]))
-        # A return in a nested function (long form, arrow, or short form)
-        # belongs to that function, not to the scope that contains this
-        # transaction macro.
-        return expr
-    elseif expr.head === :comprehension || expr.head === :typed_comprehension ||
-           expr.head === :generator || expr.head === :flatten
-        # A `return` in a comprehension/generator body is a lowering error in
-        # plain Julia; rewriting it into a throw would silently legalize code
-        # that breaks the moment the @transaction wrapper is removed. The
-        # shapes plain lowering does accept (a return in an iterator
-        # expression evaluated in the enclosing scope) exit the block
-        # non-exceptionally and commit through the finally below, exactly as
-        # they behave outside the macro — so leaving the whole construct
-        # untouched is right in both cases.
-        return expr
-    elseif expr.head === :macrocall && _macro_name(expr.args[1]) in _TASK_MACROS
-        return expr
-    elseif expr.head === :try
-        return _rewrite_transaction_try(expr, token)
-    end
-    return Expr(expr.head, map(a -> rewrite_transaction_returns(a, token), expr.args)...)
-end
-
-# A user `catch` inside the body would intercept the transaction-return marker
-# (it is thrown as an exception) and silently produce the catch's value instead
-# of returning. The marker is a private type no user handler can mean to catch,
-# so re-throwing it at the top of every user catch is always correct.
-function _rewrite_transaction_try(expr::Expr, token::Symbol)
-    args = Any[rewrite_transaction_returns(a, token) for a in expr.args]
-    if length(args) >= 3 && args[3] !== false
-        var = args[2]
-        if var === false
-            var = gensym(:transaction_err)
-            args[2] = var
-        end
-        marker = GlobalRef(@__MODULE__, :TransactionReturn)
-        guard = Expr(:&&, Expr(:call, GlobalRef(Core, :isa), var, marker),
-                     Expr(:call, GlobalRef(Base, :rethrow)))
-        args[3] = Expr(:block, guard, args[3])
-    end
-    return Expr(:try, args...)
-end
-
 """
     Postgres.@transaction conn expr
 
@@ -1305,11 +1225,14 @@ Run `expr` inside a transaction. Any non-exceptional exit commits: normal
 completion, `return` (which then returns from the enclosing function),
 `break`, or `continue`. Only a thrown exception rolls back. Evaluates to
 `expr`'s value. Nested `@transaction` blocks use savepoints, and an early
-`return` commits every enclosing level.
+`return` commits every enclosing level on its way out.
+
+The body keeps plain Julia semantics: a `return` inside a nested function,
+closure, `do`-block, or any task-forming macro (`Threads.@spawn`, `@async`,
+`Distributed.@spawnat`, third-party equivalents) belongs to that function or
+task, exactly as it would outside the macro.
 """
 macro transaction(conn, expr)
-    token = gensym(:transaction_return)
-    body = rewrite_transaction_returns(expr, token)
     quote
         # bind once: the connection expression may have side effects
         # (`@transaction acquire(pool) ...` would otherwise take a different
@@ -1319,27 +1242,7 @@ macro transaction(conn, expr)
         local completed = false
         start_transaction(c)
         try
-            local result
-            try
-                result = $(esc(body))
-            catch err
-                if err isa TransactionReturn
-                    # an early return is the success path for every enclosing
-                    # transaction level: commit this level either way, then
-                    # return here only if this expansion owns the marker —
-                    # otherwise keep unwinding to the owning expansion.
-                    # (Returning unconditionally would be observationally
-                    # equivalent today because every enclosing expansion's
-                    # finally also commits on a non-exceptional exit; the
-                    # token check is kept as the semantic guarantee rather
-                    # than leaning on that structural accident.)
-                    commit(c)
-                    success = true
-                    completed = true
-                    err.token === $(QuoteNode(token)) && return err.value
-                end
-                rethrow()
-            end
+            local result = $(esc(expr))
             commit(c)
             success = true
             completed = true
@@ -1351,10 +1254,24 @@ macro transaction(conn, expr)
             completed = true
             rethrow()
         finally
-            # break/continue exit the block without passing the commit above,
-            # any catch, or a return: a deliberate non-exceptional exit, so it
-            # commits like the others
-            completed || commit(c)
+            # A non-exceptional, non-local exit — return, break, continue —
+            # reaches here without passing the commit above or the catch:
+            # commit this level on the way out. `return` unwinds through every
+            # enclosing expansion's finally, so each level commits exactly
+            # once, innermost first; no AST rewriting is needed, and returns
+            # inside closures or task-forming macros keep their plain-Julia
+            # meaning untouched. If the commit fails, roll back THIS level
+            # before propagating (commit at savepoint depth leaves the depth
+            # unchanged on failure), so every enclosing level — macro
+            # expansion or plain catch — can then unwind its own.
+            if !completed
+                try
+                    commit(c)
+                catch
+                    rollback_for_failed_transaction!(c)
+                    rethrow()
+                end
+            end
         end
     end
 end
