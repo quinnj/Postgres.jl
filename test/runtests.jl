@@ -1571,6 +1571,45 @@ end
                     @test !Postgres.in_transaction(conn)
                     @test only(Tables.rowtable(DBInterface.execute(conn, "SELECT count(*)::int AS n FROM macro_test WHERE value = 14"))).n == 2
 
+                    # A return inside a short-form function defined in the body
+                    # belongs to that function: it must not early-return the
+                    # enclosing function, and the helper must stay callable
+                    # after the block without leaking the marker.
+                    local escaped_helper
+                    shortform_result = (function(c)
+                        Postgres.@transaction c begin
+                            helper(x) = (x < 0 && return :neg; :pos)
+                            escaped_helper = helper
+                            (helper(-1), helper(1))
+                        end
+                    end)(conn)
+                    @test shortform_result == (:neg, :pos)
+                    @test !Postgres.in_transaction(conn)
+                    @test escaped_helper(-5) === :neg
+
+                    # unit-level pins for the rewrite skip list: short-form
+                    # definitions in every syntactic shape, and task macros
+                    let tok = gensym(:tok)
+                        for def in (:(h(x) = return x),
+                                    :(h(x)::Int = return x),
+                                    :(h(x) where {T} = return x),
+                                    :(Base.getindex(a::MyT, i) = return i))
+                            @test Postgres.rewrite_transaction_returns(def, tok) == def
+                        end
+                        for taskex in (:(Threads.@spawn begin return 1 end),
+                                       :(Distributed.@spawnat 1 begin return 1 end),
+                                       :(@async begin return 1 end))
+                            @test Postgres.rewrite_transaction_returns(taskex, tok) == taskex
+                        end
+                        # ordinary assignments whose RHS contains a return ARE
+                        # rewritten (x[i] = ..., x.f = ..., plain x = ...)
+                        for assign in (:(x = f() && return 1),
+                                       :(x[i] = f() && return 1),
+                                       :(x.f = f() && return 1))
+                            @test Postgres.rewrite_transaction_returns(assign, tok) != assign
+                        end
+                    end
+
                     # Recursion re-enters the SAME expansion: an inner frame's
                     # return exits only that frame, and each frame commits.
                     recursive_txn = function f(c, n)

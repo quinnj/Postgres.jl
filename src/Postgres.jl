@@ -1231,12 +1231,19 @@ end
 # belongs to that closure (it becomes the task's result), so it must not be
 # rewritten into a transaction-return marker.
 const _TASK_MACROS = (Symbol("@spawn"), Symbol("@async"), Symbol("@task"),
-                      Symbol("@threads"), Symbol("@distributed"))
+                      Symbol("@threads"), Symbol("@distributed"), Symbol("@spawnat"))
 
 _macro_name(x) = x isa Symbol ? x :
     x isa GlobalRef ? x.name :
     (x isa Expr && x.head === :. && x.args[2] isa QuoteNode) ? x.args[2].value :
     nothing
+
+# Short-form function definitions — `h(x) = ...`, `h(x)::T = ...`,
+# `h(x) where {T} = ...` — parse as `:(=)` with a call-shaped left-hand side.
+# A return inside one belongs to that function, exactly like the long
+# `function` form the rewrite already skips.
+_is_callish_lhs(x) = x isa Expr && (x.head === :call ||
+    ((x.head === :where || x.head === :(::)) && !isempty(x.args) && _is_callish_lhs(x.args[1])))
 
 function rewrite_transaction_returns(expr, token::Symbol)
     expr isa Expr || return expr
@@ -1245,9 +1252,11 @@ function rewrite_transaction_returns(expr, token::Symbol)
             rewrite_transaction_returns(expr.args[1], token)
         marker = GlobalRef(@__MODULE__, :TransactionReturn)
         return Expr(:call, GlobalRef(Core, :throw), Expr(:call, marker, QuoteNode(token), value))
-    elseif expr.head === :function || expr.head === :(->) || expr.head === :quote
-        # A return in a nested function belongs to that function, not to the
-        # scope that contains this transaction macro.
+    elseif expr.head === :function || expr.head === :(->) || expr.head === :quote ||
+           (expr.head === :(=) && _is_callish_lhs(expr.args[1]))
+        # A return in a nested function (long form, arrow, or short form)
+        # belongs to that function, not to the scope that contains this
+        # transaction macro.
         return expr
     elseif expr.head === :macrocall && _macro_name(expr.args[1]) in _TASK_MACROS
         return expr
