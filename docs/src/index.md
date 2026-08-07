@@ -3,6 +3,7 @@
 Postgres.jl is a PostgreSQL client that speaks the v3 wire protocol with `DBInterface` and `Tables` integration.
 
 See the [Manual](@ref) for a guided walk through connections, queries, prepared statements, transactions, cancellation, notifications, and type translation.
+See the [1.0 Support Policy](@ref) for tested versions and explicit limits.
 
 ## Installation
 
@@ -17,10 +18,13 @@ Postgres.jl accepts DSN strings or PostgreSQL URIs and supports:
 
 - libpq-style keyword strings such as `host=127.0.0.1 port=5432 user=postgres dbname=postgres`.
 - Environment defaults from `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGAPPNAME`, `PGCONNECT_TIMEOUT`, and TLS-related `PGSSL*` variables.
-- `sslmode` values: `disable`, `prefer`, `require`, `verify-full` (only `verify-full` verifies certificates).
-- TLS files: `sslrootcert`, `sslcert`, `sslkey`, `sslcapath`.
+- `sslmode` values: `disable`, `prefer` (the default), `require`, `verify-full`. Only `verify-full` verifies the server's certificate; `require` encrypts without authenticating the server, and the default `prefer` falls back to an unencrypted connection if the server declines TLS. Use `verify-full` with `sslrootcert` when the connection needs to be authenticated.
+- TLS files: `sslrootcert`, `sslcert`, `sslkey`, and `sslcapath` (`sslcapath` is a fallback CA bundle or directory, used only when `sslrootcert` is unset and ignored otherwise). `sslservername` overrides the TLS server name when connecting to a pre-resolved address; under `verify-full` it is also the name the certificate is verified against, so it must name the server you intend to authenticate.
 - `connect_timeout` (seconds), `statement_timeout` (milliseconds).
 - `application_name` and `statement_cache_maxsize`.
+
+Options that request unsupported security or server-selection behavior are
+rejected. They are not silently ignored.
 
 ```julia
 using Postgres, DBInterface
@@ -33,7 +37,7 @@ DBInterface.close!(conn)
 ```julia
 using Postgres, DBInterface, Tables
 conn = DBInterface.connect(Postgres.Connection, "host=127.0.0.1;user=postgres;password=postgres;dbname=postgres")
-rows = Tables.rowtable(DBInterface.execute(conn, "SELECT $1::int AS val", (42,)))
+rows = Tables.rowtable(DBInterface.execute(conn, raw"SELECT $1::int AS val", (42,)))
 @show rows[1].val
 DBInterface.close!(conn)
 ```
@@ -65,7 +69,7 @@ StructUtils.@tags struct ProfileSummary
     createdAt::DateTime &(postgres=(name=:created_at,),)
 end
 
-profile = DBInterface.execute(conn, """
+profile = DBInterface.execute(conn, raw"""
     SELECT profile_id, first_name, last_name, created_at
     FROM profiles
     WHERE profile_id = $1
@@ -79,12 +83,12 @@ profiles = DBInterface.execute(conn, """
     """, (), Vector{ProfileSummary})
 ```
 
-Prepared statements are cached with LRU eviction; disable caching via `statement_cache_maxsize=0`.
+Explicit named prepared statements use an LRU backend cache; disable it via `statement_cache_maxsize=0`.
 
 ```julia
 using Postgres, DBInterface, Tables
 conn = DBInterface.connect(Postgres.Connection, "host=127.0.0.1;user=postgres;password=postgres;dbname=postgres"; statement_cache_maxsize=5)
-stmt = DBInterface.prepare(conn, "SELECT $1::int AS val")
+stmt = DBInterface.prepare(conn, raw"SELECT $1::int AS val")
 rows = Tables.rowtable(DBInterface.execute(stmt, (7,)))
 DBInterface.close!(stmt)
 DBInterface.close!(conn)
@@ -162,12 +166,16 @@ DBInterface.close!(conn)
 
 ## Query logging
 
+Query logging (and other driver behavior) is customized with a driver style; see the [Manual](@ref) for details.
+
 ```julia
 using Postgres, DBInterface
-conn = DBInterface.connect(Postgres.Connection, "host=127.0.0.1;user=postgres;password=postgres;dbname=postgres")
-Postgres.set_query_logger!(conn) do event, info
-    @show event info.success info.duration_ns
-end
+
+struct LoggingStyle <: Postgres.AbstractPostgresStyle end
+Postgres.query_logging_enabled(::LoggingStyle) = true
+Postgres.query_logger(::LoggingStyle, event::Symbol, info::NamedTuple) = @info "query" event info.success info.duration_ns
+
+conn = DBInterface.connect(Postgres.Connection, "host=127.0.0.1;user=postgres;password=postgres;dbname=postgres"; style=LoggingStyle())
 DBInterface.execute(conn, "SELECT 1")
 DBInterface.close!(conn)
 ```
@@ -187,6 +195,17 @@ DBInterface.close!(pool)
 
 `Postgres.Error` includes SQLSTATE information. Use `Postgres.cancel_query!(conn)` to cancel a running query.
 
+## Reference
+
 ```@autodocs
 Modules = [Postgres]
+```
+
+```@docs
+Postgres.Error
+Postgres.Notification
+Postgres.Numeric
+Postgres.PostgresRange
+Postgres.ConnectionParams
+Postgres.parse_dsn
 ```

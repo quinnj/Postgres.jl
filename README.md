@@ -1,6 +1,10 @@
 # Postgres.jl
 
-Postgres.jl is a PostgreSQL client that implements the v3 wire protocol with `DBInterface` and `Tables` integration.
+[![CI](https://github.com/JuliaDatabases/Postgres.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/JuliaDatabases/Postgres.jl/actions/workflows/CI.yml)
+[![docs](https://img.shields.io/badge/docs-dev-blue.svg)](https://JuliaDatabases.github.io/Postgres.jl/dev/)
+[![codecov](https://codecov.io/gh/JuliaDatabases/Postgres.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/JuliaDatabases/Postgres.jl)
+
+Postgres.jl is a PostgreSQL client written in Julia that implements the v3 wire protocol with `DBInterface` and `Tables` integration.
 
 ## Installation
 
@@ -12,10 +16,10 @@ Pkg.add("Postgres")
 ## Quick start
 
 ```julia
-using Postgres, DBInterface, Tables
+using Postgres
 DBInterface.connect(Postgres.Connection, "host=127.0.0.1;port=5432;user=postgres;password=postgres;dbname=postgres") do conn
-    rows = Tables.rowtable(DBInterface.execute(conn, "SELECT 1 AS a"))
-    @show rows[1].a
+    row = only(DBInterface.execute(conn, "SELECT 1 AS a"))
+    @show row.a
 end
 ```
 
@@ -32,10 +36,14 @@ Connection options support:
 - libpq-style keyword strings such as `host=127.0.0.1 port=5432 user=postgres dbname=postgres`.
 - PostgreSQL URIs such as `postgresql://postgres:postgres@127.0.0.1:5432/postgres`.
 - Environment defaults: `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGAPPNAME`, `PGCONNECT_TIMEOUT`, and TLS-related `PGSSL*` variables.
-- `sslmode` values: `disable`, `prefer`, `require`, `verify-full` (only `verify-full` enforces certificate verification).
-- TLS files: `sslrootcert`, `sslcert`, `sslkey`, `sslcapath`.
+- `sslmode` values: `disable`, `prefer` (the default), `require`, `verify-full`. Only `verify-full` verifies the server's certificate; `require` encrypts without authenticating the server, and the default `prefer` falls back to an unencrypted connection if the server declines TLS. Use `verify-full` with `sslrootcert` when the connection needs to be authenticated.
+- TLS files: `sslrootcert`, `sslcert`, `sslkey`, and `sslcapath` (`sslcapath` is a fallback CA bundle or directory, used only when `sslrootcert` is unset and ignored otherwise). `sslservername` overrides the TLS server name when connecting to a pre-resolved address; under `verify-full` it is also the name the certificate is verified against, so it must name the server you intend to authenticate.
 - `connect_timeout` (seconds) and `statement_timeout` (milliseconds).
 - `application_name` and `statement_cache_maxsize`.
+
+See the [1.0 support policy](https://JuliaDatabases.github.io/Postgres.jl/dev/support/)
+for tested Julia and PostgreSQL versions, TLS limits, and transaction-pooler
+requirements.
 
 You can also use `ConnectionParams`:
 
@@ -51,9 +59,9 @@ DBInterface.close!(conn)
 ```julia
 using Postgres, DBInterface, Tables
 conn = DBInterface.connect(Postgres.Connection, "host=127.0.0.1;user=postgres;password=postgres;dbname=postgres")
-rows = Tables.rowtable(DBInterface.execute(conn, "SELECT $1::int AS val", (42,)))
+rows = Tables.rowtable(DBInterface.execute(conn, raw"SELECT $1::int AS val", (42,)))
 @show rows[1].val
-stmt = DBInterface.prepare(conn, "SELECT $1::int AS val")
+stmt = DBInterface.prepare(conn, raw"SELECT $1::int AS val")
 rows = Tables.rowtable(DBInterface.execute(stmt, (7,)))
 DBInterface.close!(stmt)
 DBInterface.close!(conn)
@@ -87,7 +95,7 @@ StructUtils.@tags struct ProfileSummary
     createdAt::DateTime &(postgres=(name=:created_at,),)
 end
 
-profile = DBInterface.execute(conn, """
+profile = DBInterface.execute(conn, raw"""
     SELECT profile_id, first_name, last_name, created_at
     FROM profiles
     WHERE profile_id = $1
@@ -103,7 +111,8 @@ profiles = DBInterface.execute(conn, """
 
 `Postgres.command_tag(result)` and `Postgres.rows_affected(result)` expose PostgreSQL command completion metadata.
 
-Statement caching is LRU-based. Set `statement_cache_maxsize=0` to disable caching.
+Explicit named prepared statements use an LRU backend cache. Caller handles are
+independent. Set `statement_cache_maxsize=0` to disable this cache.
 
 ```julia
 using Postgres, DBInterface
@@ -183,15 +192,22 @@ DBInterface.close!(conn)
 ```
 
 `Numeric` values are returned as `Postgres.Numeric`, `interval` values as `Dates.Period` or `Dates.CompoundPeriod`, and range types as `Postgres.PostgresRange{T}`.
+Custom enum, composite, and range registration controls result decoding. Those
+custom Julia values are not accepted as direct query parameters in 1.0; bind a
+PostgreSQL text representation with an explicit SQL cast instead.
 
-## Query logging
+## Query logging and driver styles
+
+Driver behavior — query logging, server notices, asynchronous notifications — is customized by defining a driver "style": subtype `Postgres.AbstractPostgresStyle`, overload the behavior hooks for it, and pass an instance via the `style` connection keyword.
 
 ```julia
 using Postgres, DBInterface
-conn = DBInterface.connect(Postgres.Connection, "host=127.0.0.1;user=postgres;password=postgres;dbname=postgres")
-Postgres.set_query_logger!(conn) do event, info
-    @show event info.success info.duration_ns
-end
+
+struct LoggingStyle <: Postgres.AbstractPostgresStyle end
+Postgres.query_logging_enabled(::LoggingStyle) = true
+Postgres.query_logger(::LoggingStyle, event::Symbol, info::NamedTuple) = @info "query" event info.success info.duration_ns
+
+conn = DBInterface.connect(Postgres.Connection, "host=127.0.0.1;user=postgres;password=postgres;dbname=postgres"; style=LoggingStyle())
 DBInterface.execute(conn, "SELECT 1")
 DBInterface.close!(conn)
 ```
@@ -210,3 +226,10 @@ DBInterface.close!(pool)
 ## Errors and cancellation
 
 `Postgres.Error` represents server errors and includes SQLSTATE codes; `Postgres.PostgresInterfaceError` covers client-side failures. Use `Postgres.cancel_query!(conn)` to send a CancelRequest to the server.
+
+## Development disclosure
+
+The 1.0 release preparation used Claude Code and OpenAI Codex for implementation
+assistance and adversarial review. Maintainer decisions, source history, review
+discussion, and validation results are recorded in
+[pull request #5](https://github.com/JuliaDatabases/Postgres.jl/pull/5).
