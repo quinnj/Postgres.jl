@@ -1598,7 +1598,9 @@ end
                         end
                         for taskex in (:(Threads.@spawn begin return 1 end),
                                        :(Distributed.@spawnat 1 begin return 1 end),
-                                       :(@async begin return 1 end))
+                                       :(@async begin return 1 end),
+                                       :(Distributed.@fetch begin return 1 end),
+                                       :(@fetchfrom 1 begin return 1 end))
                             @test Postgres.rewrite_transaction_returns(taskex, tok) == taskex
                         end
                         # ordinary assignments whose RHS contains a return ARE
@@ -1608,10 +1610,11 @@ end
                                        :(x.f = f() && return 1))
                             @test Postgres.rewrite_transaction_returns(assign, tok) != assign
                         end
-                        # a return inside a comprehension or generator is a
-                        # lowering error in plain Julia; the rewrite must not
-                        # legalize it into a throw that works only while the
-                        # @transaction wrapper is present
+                        # a return in a comprehension/generator body is a
+                        # lowering error in plain Julia (the rewrite must not
+                        # legalize it), and the iterator-expression shapes
+                        # lowering does accept behave correctly un-rewritten
+                        # (they commit through the expansion's finally)
                         for comp in (:([(return i) for i in 1:3]),
                                      :(Int[(return i) for i in 1:3]),
                                      :(sum(x for x in (f() ? (return 1) : [1]))),

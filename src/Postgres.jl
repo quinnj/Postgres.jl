@@ -1231,7 +1231,8 @@ end
 # belongs to that closure (it becomes the task's result), so it must not be
 # rewritten into a transaction-return marker.
 const _TASK_MACROS = (Symbol("@spawn"), Symbol("@async"), Symbol("@task"),
-                      Symbol("@threads"), Symbol("@distributed"), Symbol("@spawnat"))
+                      Symbol("@threads"), Symbol("@distributed"), Symbol("@spawnat"),
+                      Symbol("@fetch"), Symbol("@fetchfrom"))
 
 _macro_name(x) = x isa Symbol ? x :
     x isa GlobalRef ? x.name :
@@ -1260,11 +1261,14 @@ function rewrite_transaction_returns(expr, token::Symbol)
         return expr
     elseif expr.head === :comprehension || expr.head === :typed_comprehension ||
            expr.head === :generator || expr.head === :flatten
-        # `return` anywhere inside a comprehension or generator (body or
-        # iterator expression) is a lowering error in plain Julia; rewriting
-        # it into a throw would silently legalize code that breaks the moment
-        # the @transaction wrapper is removed. Leave it to error as it always
-        # does.
+        # A `return` in a comprehension/generator body is a lowering error in
+        # plain Julia; rewriting it into a throw would silently legalize code
+        # that breaks the moment the @transaction wrapper is removed. The
+        # shapes plain lowering does accept (a return in an iterator
+        # expression evaluated in the enclosing scope) exit the block
+        # non-exceptionally and commit through the finally below, exactly as
+        # they behave outside the macro — so leaving the whole construct
+        # untouched is right in both cases.
         return expr
     elseif expr.head === :macrocall && _macro_name(expr.args[1]) in _TASK_MACROS
         return expr
@@ -1323,7 +1327,12 @@ macro transaction(conn, expr)
                     # an early return is the success path for every enclosing
                     # transaction level: commit this level either way, then
                     # return here only if this expansion owns the marker —
-                    # otherwise keep unwinding to the owning expansion
+                    # otherwise keep unwinding to the owning expansion.
+                    # (Returning unconditionally would be observationally
+                    # equivalent today because every enclosing expansion's
+                    # finally also commits on a non-exceptional exit; the
+                    # token check is kept as the semantic guarantee rather
+                    # than leaning on that structural accident.)
                     commit(c)
                     success = true
                     completed = true
