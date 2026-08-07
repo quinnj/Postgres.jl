@@ -161,10 +161,11 @@ mkdir -p "\$certdir"
 cp /certs/server.crt "\$certdir/server.crt"
 cp /certs/server.key "\$certdir/server.key"
 cp /certs/root.crt "\$certdir/root.crt"
-chown postgres:postgres "\$certdir/server.crt" "\$certdir/server.key" "\$certdir/root.crt"
-chmod 0644 "\$certdir/server.crt" "\$certdir/root.crt"
+cp /certs/pg_hba.conf "\$certdir/pg_hba.conf"
+chown postgres:postgres "\$certdir/server.crt" "\$certdir/server.key" "\$certdir/root.crt" "\$certdir/pg_hba.conf"
+chmod 0644 "\$certdir/server.crt" "\$certdir/root.crt" "\$certdir/pg_hba.conf"
 chmod 0600 "\$certdir/server.key"
-exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file="\$certdir/server.crt" -c ssl_key_file="\$certdir/server.key" -c ssl_ca_file="\$certdir/root.crt" -c hba_file=/certs/pg_hba.conf
+exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file="\$certdir/server.crt" -c ssl_key_file="\$certdir/server.key" -c ssl_ca_file="\$certdir/root.crt" -c hba_file="\$certdir/pg_hba.conf"
 """
     return ["sh", "-c", setup_script]
 end
