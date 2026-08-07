@@ -1218,38 +1218,84 @@ function DBInterface.transaction(f::F, conn::Connection) where {F}
     end
 end
 
+# `token` identifies the @transaction expansion that rewrote the `return`.
+# Without it, a lexically nested @transaction intercepts the outer expansion's
+# marker, commits only its own savepoint, and its plain `return` then skips
+# every enclosing commit — silently rolling back all levels.
 struct TransactionReturn{T} <: Exception
+    token::Symbol
     value::T
 end
 
-function rewrite_transaction_returns(expr)
+# Macros that wrap their body in a closure or task: a `return` inside them
+# belongs to that closure (it becomes the task's result), so it must not be
+# rewritten into a transaction-return marker.
+const _TASK_MACROS = (Symbol("@spawn"), Symbol("@async"), Symbol("@task"),
+                      Symbol("@threads"), Symbol("@distributed"))
+
+_macro_name(x) = x isa Symbol ? x :
+    x isa GlobalRef ? x.name :
+    (x isa Expr && x.head === :. && x.args[2] isa QuoteNode) ? x.args[2].value :
+    nothing
+
+function rewrite_transaction_returns(expr, token::Symbol)
     expr isa Expr || return expr
     if expr.head === :return
-        value = isempty(expr.args) ? nothing : rewrite_transaction_returns(only(expr.args))
+        value = (isempty(expr.args) || expr.args[1] === nothing) ? nothing :
+            rewrite_transaction_returns(expr.args[1], token)
         marker = GlobalRef(@__MODULE__, :TransactionReturn)
-        return Expr(:call, GlobalRef(Core, :throw), Expr(:call, marker, value))
+        return Expr(:call, GlobalRef(Core, :throw), Expr(:call, marker, QuoteNode(token), value))
     elseif expr.head === :function || expr.head === :(->) || expr.head === :quote
         # A return in a nested function belongs to that function, not to the
         # scope that contains this transaction macro.
         return expr
+    elseif expr.head === :macrocall && _macro_name(expr.args[1]) in _TASK_MACROS
+        return expr
+    elseif expr.head === :try
+        return _rewrite_transaction_try(expr, token)
     end
-    return Expr(expr.head, map(rewrite_transaction_returns, expr.args)...)
+    return Expr(expr.head, map(a -> rewrite_transaction_returns(a, token), expr.args)...)
+end
+
+# A user `catch` inside the body would intercept the transaction-return marker
+# (it is thrown as an exception) and silently produce the catch's value instead
+# of returning. The marker is a private type no user handler can mean to catch,
+# so re-throwing it at the top of every user catch is always correct.
+function _rewrite_transaction_try(expr::Expr, token::Symbol)
+    args = Any[rewrite_transaction_returns(a, token) for a in expr.args]
+    if length(args) >= 3 && args[3] !== false
+        var = args[2]
+        if var === false
+            var = gensym(:transaction_err)
+            args[2] = var
+        end
+        marker = GlobalRef(@__MODULE__, :TransactionReturn)
+        guard = Expr(:&&, Expr(:call, GlobalRef(Core, :isa), var, marker),
+                     Expr(:call, GlobalRef(Base, :rethrow)))
+        args[3] = Expr(:block, guard, args[3])
+    end
+    return Expr(:try, args...)
 end
 
 """
     Postgres.@transaction conn expr
 
-Run `expr` inside a transaction: committed if it completes, rolled back if it
-throws. Evaluates to `expr`'s value.
+Run `expr` inside a transaction. Any non-exceptional exit commits: normal
+completion, `return` (which then returns from the enclosing function),
+`break`, or `continue`. Only a thrown exception rolls back. Evaluates to
+`expr`'s value. Nested `@transaction` blocks use savepoints, and an early
+`return` commits every enclosing level.
 """
 macro transaction(conn, expr)
-    body = rewrite_transaction_returns(expr)
+    token = gensym(:transaction_return)
+    body = rewrite_transaction_returns(expr, token)
     quote
         # bind once: the connection expression may have side effects
         # (`@transaction acquire(pool) ...` would otherwise take a different
         # connection for the BEGIN, the COMMIT and the ROLLBACK)
         local c = $(esc(conn))
         local success = false
+        local completed = false
         start_transaction(c)
         try
             local result
@@ -1257,18 +1303,32 @@ macro transaction(conn, expr)
                 result = $(esc(body))
             catch err
                 if err isa TransactionReturn
+                    # an early return is the success path for every enclosing
+                    # transaction level: commit this level either way, then
+                    # return here only if this expansion owns the marker —
+                    # otherwise keep unwinding to the owning expansion
                     commit(c)
                     success = true
-                    return err.value
+                    completed = true
+                    err.token === $(QuoteNode(token)) && return err.value
                 end
                 rethrow()
             end
             commit(c)
             success = true
+            completed = true
             result
         catch
-            !success && rollback_for_failed_transaction!(c)
+            if !success
+                rollback_for_failed_transaction!(c)
+            end
+            completed = true
             rethrow()
+        finally
+            # break/continue exit the block without passing the commit above,
+            # any catch, or a return: a deliberate non-exceptional exit, so it
+            # commits like the others
+            completed || commit(c)
         end
     end
 end

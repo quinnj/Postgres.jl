@@ -1494,6 +1494,95 @@ end
                     @test early_return(conn) === :early
                     @test !Postgres.in_transaction(conn)
                     @test only(Tables.rowtable(DBInterface.execute(conn, "SELECT count(*)::int AS n FROM macro_test"))).n == 3
+
+                    # An early return from a NESTED @transaction must commit
+                    # every level — the inner expansion must not intercept the
+                    # outer's marker and skip the outer commit — and must not
+                    # leave the connection inside a transaction.
+                    nested_return = function(c)
+                        Postgres.@transaction c begin
+                            DBInterface.execute(c, "INSERT INTO macro_test (value) VALUES (10)")
+                            Postgres.@transaction c begin
+                                DBInterface.execute(c, "INSERT INTO macro_test (value) VALUES (11)")
+                                return :nested_early
+                            end
+                        end
+                        return :late
+                    end
+                    @test nested_return(conn) === :nested_early
+                    @test !Postgres.in_transaction(conn)
+                    @test only(Tables.rowtable(DBInterface.execute(conn, "SELECT count(*)::int AS n FROM macro_test WHERE value IN (10, 11)"))).n == 2
+
+                    # A user catch inside the body must not intercept the
+                    # return marker and turn the return into its own value.
+                    catch_return = function(c)
+                        Postgres.@transaction c begin
+                            try
+                                DBInterface.execute(c, "INSERT INTO macro_test (value) VALUES (12)")
+                                return :from_try
+                            catch
+                                return :from_catch
+                            end
+                        end
+                        return :late
+                    end
+                    @test catch_return(conn) === :from_try
+                    @test !Postgres.in_transaction(conn)
+                    catch_var_return = function(c)
+                        Postgres.@transaction c begin
+                            try
+                                return :from_try2
+                            catch err
+                                return err
+                            end
+                        end
+                    end
+                    @test catch_var_return(conn) === :from_try2
+
+                    # A return inside a task-forming macro is that task's
+                    # result, not a transaction return.
+                    spawn_return = function(c)
+                        Postgres.@transaction c begin
+                            t = Threads.@spawn begin
+                                return :task_value
+                            end
+                            fetch(t)
+                        end
+                    end
+                    @test spawn_return(conn) === :task_value
+                    @test !Postgres.in_transaction(conn)
+
+                    # break and continue are deliberate non-exceptional exits:
+                    # they commit, like return, and leave no transaction open.
+                    for _ in 1:1
+                        Postgres.@transaction conn begin
+                            DBInterface.execute(conn, "INSERT INTO macro_test (value) VALUES (13)")
+                            break
+                        end
+                    end
+                    @test !Postgres.in_transaction(conn)
+                    @test only(Tables.rowtable(DBInterface.execute(conn, "SELECT count(*)::int AS n FROM macro_test WHERE value = 13"))).n == 1
+                    for _ in 1:2
+                        Postgres.@transaction conn begin
+                            DBInterface.execute(conn, "INSERT INTO macro_test (value) VALUES (14)")
+                            continue
+                        end
+                    end
+                    @test !Postgres.in_transaction(conn)
+                    @test only(Tables.rowtable(DBInterface.execute(conn, "SELECT count(*)::int AS n FROM macro_test WHERE value = 14"))).n == 2
+
+                    # Recursion re-enters the SAME expansion: an inner frame's
+                    # return exits only that frame, and each frame commits.
+                    recursive_txn = function f(c, n)
+                        Postgres.@transaction c begin
+                            DBInterface.execute(c, raw"INSERT INTO macro_test (value) VALUES ($1)", (100 + n,))
+                            n == 0 && return :bottom
+                            f(c, n - 1)
+                        end
+                    end
+                    @test recursive_txn(conn, 2) === :bottom
+                    @test !Postgres.in_transaction(conn)
+                    @test only(Tables.rowtable(DBInterface.execute(conn, "SELECT count(*)::int AS n FROM macro_test WHERE value IN (100, 101, 102)"))).n == 3
                 end
 
                 @testset "Nested Transactions" begin
