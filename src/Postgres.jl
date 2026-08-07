@@ -1218,57 +1218,60 @@ function DBInterface.transaction(f::F, conn::Connection) where {F}
     end
 end
 
-struct TransactionReturn{T} <: Exception
-    value::T
-end
-
-function rewrite_transaction_returns(expr)
-    expr isa Expr || return expr
-    if expr.head === :return
-        value = isempty(expr.args) ? nothing : rewrite_transaction_returns(only(expr.args))
-        marker = GlobalRef(@__MODULE__, :TransactionReturn)
-        return Expr(:call, GlobalRef(Core, :throw), Expr(:call, marker, value))
-    elseif expr.head === :function || expr.head === :(->) || expr.head === :quote
-        # A return in a nested function belongs to that function, not to the
-        # scope that contains this transaction macro.
-        return expr
-    end
-    return Expr(expr.head, map(rewrite_transaction_returns, expr.args)...)
-end
-
 """
     Postgres.@transaction conn expr
 
-Run `expr` inside a transaction: committed if it completes, rolled back if it
-throws. Evaluates to `expr`'s value.
+Run `expr` inside a transaction. Any non-exceptional exit commits: normal
+completion, `return` (which then returns from the enclosing function),
+`break`, or `continue`. Only a thrown exception rolls back. Evaluates to
+`expr`'s value. Nested `@transaction` blocks use savepoints, and an early
+`return` commits every enclosing level on its way out.
+
+The body keeps plain Julia semantics: a `return` inside a nested function,
+closure, `do`-block, or any task-forming macro (`Threads.@spawn`, `@async`,
+`Distributed.@spawnat`, third-party equivalents) belongs to that function or
+task, exactly as it would outside the macro.
 """
 macro transaction(conn, expr)
-    body = rewrite_transaction_returns(expr)
     quote
         # bind once: the connection expression may have side effects
         # (`@transaction acquire(pool) ...` would otherwise take a different
         # connection for the BEGIN, the COMMIT and the ROLLBACK)
         local c = $(esc(conn))
         local success = false
+        local completed = false
         start_transaction(c)
         try
-            local result
-            try
-                result = $(esc(body))
-            catch err
-                if err isa TransactionReturn
-                    commit(c)
-                    success = true
-                    return err.value
-                end
-                rethrow()
-            end
+            local result = $(esc(expr))
             commit(c)
             success = true
+            completed = true
             result
         catch
-            !success && rollback_for_failed_transaction!(c)
+            if !success
+                rollback_for_failed_transaction!(c)
+            end
+            completed = true
             rethrow()
+        finally
+            # A non-exceptional, non-local exit — return, break, continue —
+            # reaches here without passing the commit above or the catch:
+            # commit this level on the way out. `return` unwinds through every
+            # enclosing expansion's finally, so each level commits exactly
+            # once, innermost first; no AST rewriting is needed, and returns
+            # inside closures or task-forming macros keep their plain-Julia
+            # meaning untouched. If the commit fails, roll back THIS level
+            # before propagating (commit at savepoint depth leaves the depth
+            # unchanged on failure), so every enclosing level — macro
+            # expansion or plain catch — can then unwind its own.
+            if !completed
+                try
+                    commit(c)
+                catch
+                    rollback_for_failed_transaction!(c)
+                    rethrow()
+                end
+            end
         end
     end
 end

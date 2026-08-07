@@ -22,6 +22,7 @@ Aqua = "0.8"
 ConcurrentUtilities = "2.1"
 DBInterface = "2.5"
 Dates = "1.10"
+Distributed = "1.10"
 Harbor = "1"
 JSON = "1"
 MD5 = "0.2"
@@ -39,9 +40,10 @@ julia = "1.10"
 
 [extras]
 Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
+Distributed = "8ba89e20-285c-5b6f-9357-94700520ee1b"
 Harbor = "af79dbb9-1a80-47ad-8928-192a4af69376"
 Sockets = "6462fe0b-24de-5631-8697-dd941f90decc"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Aqua", "Harbor", "Sockets", "Test"]
+test = ["Aqua", "Distributed", "Harbor", "Sockets", "Test"]

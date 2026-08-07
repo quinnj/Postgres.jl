@@ -1,6 +1,7 @@
 using Test
 using Aqua
 using Dates
+using Distributed
 using UUIDs
 using DBInterface
 using Tables
@@ -68,6 +69,17 @@ end
 struct Int8Row
     x::Int8
     s::String
+end
+
+# A third-party-style task macro the driver has never heard of: it wraps its
+# body in a Task and fetches it. @transaction must leave the body's `return`
+# with its plain meaning (the task's result) — no allowlist involved.
+macro local_task(body)
+    quote
+        local t = Task(() -> $(esc(body)))
+        schedule(t)
+        fetch(t)
+    end
 end
 
 # user-IO failure injection for the COPY hardening tests
@@ -1494,6 +1506,195 @@ end
                     @test early_return(conn) === :early
                     @test !Postgres.in_transaction(conn)
                     @test only(Tables.rowtable(DBInterface.execute(conn, "SELECT count(*)::int AS n FROM macro_test"))).n == 3
+
+                    # An early return from a NESTED @transaction must commit
+                    # every level — the inner expansion must not intercept the
+                    # outer's marker and skip the outer commit — and must not
+                    # leave the connection inside a transaction.
+                    nested_return = function(c)
+                        Postgres.@transaction c begin
+                            DBInterface.execute(c, "INSERT INTO macro_test (value) VALUES (10)")
+                            Postgres.@transaction c begin
+                                DBInterface.execute(c, "INSERT INTO macro_test (value) VALUES (11)")
+                                return :nested_early
+                            end
+                        end
+                        return :late
+                    end
+                    @test nested_return(conn) === :nested_early
+                    @test !Postgres.in_transaction(conn)
+                    @test only(Tables.rowtable(DBInterface.execute(conn, "SELECT count(*)::int AS n FROM macro_test WHERE value IN (10, 11)"))).n == 2
+
+                    # A user catch inside the body must not intercept the
+                    # return marker and turn the return into its own value.
+                    catch_return = function(c)
+                        Postgres.@transaction c begin
+                            try
+                                DBInterface.execute(c, "INSERT INTO macro_test (value) VALUES (12)")
+                                return :from_try
+                            catch
+                                return :from_catch
+                            end
+                        end
+                        return :late
+                    end
+                    @test catch_return(conn) === :from_try
+                    @test !Postgres.in_transaction(conn)
+                    catch_var_return = function(c)
+                        Postgres.@transaction c begin
+                            try
+                                return :from_try2
+                            catch err
+                                return err
+                            end
+                        end
+                    end
+                    @test catch_var_return(conn) === :from_try2
+
+                    # A return inside a task-forming macro is that task's
+                    # result, not a transaction return.
+                    spawn_return = function(c)
+                        Postgres.@transaction c begin
+                            t = Threads.@spawn begin
+                                return :task_value
+                            end
+                            fetch(t)
+                        end
+                    end
+                    @test spawn_return(conn) === :task_value
+                    @test !Postgres.in_transaction(conn)
+
+                    # break and continue are deliberate non-exceptional exits:
+                    # they commit, like return, and leave no transaction open.
+                    for _ in 1:1
+                        Postgres.@transaction conn begin
+                            DBInterface.execute(conn, "INSERT INTO macro_test (value) VALUES (13)")
+                            break
+                        end
+                    end
+                    @test !Postgres.in_transaction(conn)
+                    @test only(Tables.rowtable(DBInterface.execute(conn, "SELECT count(*)::int AS n FROM macro_test WHERE value = 13"))).n == 1
+                    for _ in 1:2
+                        Postgres.@transaction conn begin
+                            DBInterface.execute(conn, "INSERT INTO macro_test (value) VALUES (14)")
+                            continue
+                        end
+                    end
+                    @test !Postgres.in_transaction(conn)
+                    @test only(Tables.rowtable(DBInterface.execute(conn, "SELECT count(*)::int AS n FROM macro_test WHERE value = 14"))).n == 2
+
+                    # A return inside a short-form function defined in the body
+                    # belongs to that function: it must not early-return the
+                    # enclosing function, and the helper must stay callable
+                    # after the block without leaking the marker.
+                    local escaped_helper
+                    shortform_result = (function(c)
+                        Postgres.@transaction c begin
+                            helper(x) = (x < 0 && return :neg; :pos)
+                            escaped_helper = helper
+                            (helper(-1), helper(1))
+                        end
+                    end)(conn)
+                    @test shortform_result == (:neg, :pos)
+                    @test !Postgres.in_transaction(conn)
+                    @test escaped_helper(-5) === :neg
+
+                    # The body keeps plain Julia semantics with no AST rewrite,
+                    # so a return inside ANY closure-forming construct behaves
+                    # exactly as it does outside the macro — including
+                    # third-party task macros no allowlist could cover.
+                    local_task_result = (function(c)
+                        Postgres.@transaction c begin
+                            DBInterface.execute(c, "INSERT INTO macro_test (value) VALUES (20)")
+                            @local_task begin
+                                return :local_task_value
+                            end
+                        end
+                    end)(conn)
+                    @test local_task_result === :local_task_value
+                    @test !Postgres.in_transaction(conn)
+                    @test only(Tables.rowtable(DBInterface.execute(conn, "SELECT count(*)::int AS n FROM macro_test WHERE value = 20"))).n == 1
+
+                    # Distributed task macros: with no workers added, worker 1
+                    # is this process, so these run locally end to end.
+                    for distributed_case in (
+                        (c) -> Postgres.@transaction(c, fetch(Distributed.@spawnat 1 begin
+                            return :spawnat_value
+                        end)),
+                        (c) -> Postgres.@transaction(c, Distributed.@fetchfrom 1 begin
+                            return :fetchfrom_value
+                        end),
+                        (c) -> Postgres.@transaction(c, Distributed.@fetch begin
+                            return :fetch_value
+                        end),
+                    )
+                        val = distributed_case(conn)
+                        @test val in (:spawnat_value, :fetchfrom_value, :fetch_value)
+                        @test !Postgres.in_transaction(conn)
+                    end
+
+                    # A return in a flattened-iterator expression is legal
+                    # plain Julia: it returns from the generated per-element
+                    # closure, so its value becomes the inner iterator (an Int
+                    # yields itself once) and the enclosing function continues.
+                    # Wrapped in @transaction the behavior must be identical,
+                    # and the block commits on normal completion.
+                    plain_flatten = function()
+                        vals = [x for x in 1:2 for y in (return x)]
+                        (:reached, vals)
+                    end
+                    wrapped_flatten = function(c)
+                        vals = Postgres.@transaction c begin
+                            DBInterface.execute(c, "INSERT INTO macro_test (value) VALUES (21)")
+                            [x for x in 1:2 for y in (return x)]
+                        end
+                        (:reached, vals)
+                    end
+                    @test plain_flatten() == (:reached, [1, 2])
+                    @test wrapped_flatten(conn) == plain_flatten()
+                    @test !Postgres.in_transaction(conn)
+                    @test only(Tables.rowtable(DBInterface.execute(conn, "SELECT count(*)::int AS n FROM macro_test WHERE value = 21"))).n == 1
+
+                    # A commit that fails in the finally (break out of a nested
+                    # level whose savepoint was aborted by a swallowed server
+                    # error) must roll back ITS level before propagating, so
+                    # every enclosing level can unwind its own — nothing may be
+                    # left open, client- or server-side.
+                    nested_break_err = try
+                        for _ in 1:1
+                            Postgres.@transaction conn begin
+                                DBInterface.execute(conn, "INSERT INTO macro_test (value) VALUES (22)")
+                                Postgres.@transaction conn begin
+                                    try
+                                        DBInterface.execute(conn, "SELECT 1/0")
+                                    catch
+                                        # swallowed: the savepoint is now aborted
+                                    end
+                                    break
+                                end
+                            end
+                        end
+                        nothing
+                    catch e
+                        e
+                    end
+                    @test nested_break_err isa Postgres.API.Error
+                    @test !Postgres.in_transaction(conn)
+                    @test !conn.server_in_transaction
+                    @test isempty(Tables.rowtable(DBInterface.execute(conn, "SELECT * FROM macro_test WHERE value = 22")))
+
+                    # Recursion re-enters the SAME expansion: an inner frame's
+                    # return exits only that frame, and each frame commits.
+                    recursive_txn = function f(c, n)
+                        Postgres.@transaction c begin
+                            DBInterface.execute(c, raw"INSERT INTO macro_test (value) VALUES ($1)", (100 + n,))
+                            n == 0 && return :bottom
+                            f(c, n - 1)
+                        end
+                    end
+                    @test recursive_txn(conn, 2) === :bottom
+                    @test !Postgres.in_transaction(conn)
+                    @test only(Tables.rowtable(DBInterface.execute(conn, "SELECT count(*)::int AS n FROM macro_test WHERE value IN (100, 101, 102)"))).n == 3
                 end
 
                 @testset "Nested Transactions" begin
