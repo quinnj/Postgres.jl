@@ -1608,6 +1608,16 @@ end
                                        :(x.f = f() && return 1))
                             @test Postgres.rewrite_transaction_returns(assign, tok) != assign
                         end
+                        # a return inside a comprehension or generator is a
+                        # lowering error in plain Julia; the rewrite must not
+                        # legalize it into a throw that works only while the
+                        # @transaction wrapper is present
+                        for comp in (:([(return i) for i in 1:3]),
+                                     :(Int[(return i) for i in 1:3]),
+                                     :(sum(x for x in (f() ? (return 1) : [1]))),
+                                     :([x for x in xs for y in (return x)]))
+                            @test Postgres.rewrite_transaction_returns(comp, tok) == comp
+                        end
                     end
 
                     # Recursion re-enters the SAME expansion: an inner frame's

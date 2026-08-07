@@ -1258,6 +1258,14 @@ function rewrite_transaction_returns(expr, token::Symbol)
         # belongs to that function, not to the scope that contains this
         # transaction macro.
         return expr
+    elseif expr.head === :comprehension || expr.head === :typed_comprehension ||
+           expr.head === :generator || expr.head === :flatten
+        # `return` anywhere inside a comprehension or generator (body or
+        # iterator expression) is a lowering error in plain Julia; rewriting
+        # it into a throw would silently legalize code that breaks the moment
+        # the @transaction wrapper is removed. Leave it to error as it always
+        # does.
+        return expr
     elseif expr.head === :macrocall && _macro_name(expr.args[1]) in _TASK_MACROS
         return expr
     elseif expr.head === :try
