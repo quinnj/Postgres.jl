@@ -1,6 +1,6 @@
 name = "Postgres"
 uuid = "8f23287e-300e-4f50-bc2b-9f1dfe95da84"
-version = "1.0.0"
+version = "1.0.1"
 
 [deps]
 Reseau = "802f3686-a58f-41ce-bb0c-3c43c75bba36"
